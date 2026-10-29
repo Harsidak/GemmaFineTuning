@@ -1,6 +1,9 @@
 # Supervised Fine-Tuning (SFT) Configuration for Gemma 4 LoRA
 model:
-  base_model_name_or_path: "google/gemma-4-12b-it" # Or gemma-4-31b-it-qat-w4a16-ct
+  # Train on the bf16 weights the served w4a16-ct model was quantized from, e.g. the Kaggle model
+  # google/gemma-4/transformers/gemma-4-e4b-it-qat-q4_0-unquantized/2. Pass the attached path with
+  # --base-model / PipelineRunner.train(base_model=...).
+  base_model_name_or_path: "google/gemma-4-e4b-it-qat-q4_0-unquantized"
   torch_dtype: "bfloat16"
   use_4bit_quantization: true
   bnb_4bit_compute_dtype: "bfloat16"
@@ -9,9 +12,14 @@ model:
   device_map: "auto"
 
 dataset:
+  # Public placeholder; real trajectories come from the private dataset via --train-data.
   train_data_path: "data/train_trajectories.jsonl"
   val_data_path: "data/val_tasks.jsonl"
-  max_seq_length: 8192
+  # Longer trajectories are dropped, not truncated. Serving compacts context at ~14k tokens.
+  max_seq_length: 16384
+  # chat_template.jinja of the *served* model; null uses the training checkpoint's own template.
+  chat_template_path: null
+  chat_template_kwargs: {}  # e.g. {enable_thinking: true}; must match how the agent is served
   packing: false # Set true if packing short trajectories into fixed-size windows
 
 lora:
@@ -37,11 +45,10 @@ training:
   gradient_accumulation_steps: 8
   learning_rate: 2.0e-5
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.05
+  warmup_steps: 0.05 # float in [0, 1) = ratio of total steps
   weight_decay: 0.01
   logging_steps: 10
   save_strategy: "epoch"
-  evaluation_strategy: "epoch"
   save_total_limit: 2
   gradient_checkpointing: true
   bf16: true

@@ -75,3 +75,7 @@ resources/repos/*
 # Scratch scripts & temporary workspaces
 scratch/
 build/gemma-4-developer-agent/wheels/*.whl
+
+# Mined / generated training data: private, never public (see DataMining/README.md)
+DataMining/
+kaggle/.push/

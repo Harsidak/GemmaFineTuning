@@ -82,9 +82,16 @@ class PipelineRunner:
     def train(
         self,
         mode: str = "sft",
-        config_path: Optional[str | Path] = None
+        config_path: Optional[str | Path] = None,
+        train_data: Optional[str | Path] = None,
+        base_model: Optional[str | Path] = None,
+        output_dir: Optional[str | Path] = None,
     ):
-        """Runs Supervised Fine-Tuning (SFT) or Direct Preference Optimization (DPO)."""
+        """Runs Supervised Fine-Tuning (SFT) or Direct Preference Optimization (DPO).
+
+        train_data, base_model and output_dir override the config (SFT only), so private datasets and
+        attached models are passed per run instead of being hardcoded in the public repo.
+        """
         if not config_path:
             default_name = "train_lora_sft.yaml" if mode == "sft" else "train_dpo_rl.yaml"
             config_path = self.pipeline_dir / "configs" / default_name
@@ -98,7 +105,9 @@ class PipelineRunner:
 
         if mode == "sft":
             from pipeline.src.training.sft_trainer import run_sft_training
-            run_sft_training(cfg_path)
+            return run_sft_training(
+                cfg_path, train_data_path=train_data, base_model=base_model, output_dir=output_dir
+            )
         elif mode == "dpo":
             from pipeline.src.training.dpo_trainer import run_dpo_training
             run_dpo_training(cfg_path)
@@ -168,8 +177,10 @@ class PipelineRunner:
 def status(root_dir=None):
     return PipelineRunner(root_dir).status()
 
-def train(mode="sft", config_path=None, root_dir=None):
-    return PipelineRunner(root_dir).train(mode=mode, config_path=config_path)
+def train(mode="sft", config_path=None, root_dir=None, train_data=None, base_model=None, output_dir=None):
+    return PipelineRunner(root_dir).train(
+        mode=mode, config_path=config_path, train_data=train_data, base_model=base_model, output_dir=output_dir
+    )
 
 def evaluate(tasks_path=None, max_tasks=None, root_dir=None):
     return PipelineRunner(root_dir).evaluate(tasks_path=tasks_path, max_tasks=max_tasks)
@@ -192,6 +203,9 @@ def main():
     )
     parser.add_argument("--mode", choices=["sft", "dpo"], default="sft", help="Training mode")
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
+    parser.add_argument("--train-data", type=str, default=None, help="Training JSONL (overrides config)")
+    parser.add_argument("--base-model", type=str, default=None, help="Base model path or id (overrides config)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Checkpoint output dir (overrides config)")
     parser.add_argument("--tasks", type=str, default=None, help="Tasks JSONL file for eval")
     parser.add_argument("--model", type=str, default="gemma-4-12b-it", help="Target model variant")
     parser.add_argument("--output-zip", type=str, default="submission.zip", help="Target zip file")
@@ -203,7 +217,13 @@ def main():
     if args.action == "status":
         runner.status()
     elif args.action == "train":
-        runner.train(mode=args.mode, config_path=args.config)
+        runner.train(
+            mode=args.mode,
+            config_path=args.config,
+            train_data=args.train_data,
+            base_model=args.base_model,
+            output_dir=args.output_dir,
+        )
     elif args.action == "evaluate":
         runner.evaluate(tasks_path=args.tasks)
     elif args.action == "package":

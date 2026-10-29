@@ -1,0 +1,19 @@
+{
+  "_comment": "Read by scripts/kaggle_push.py. Each key under 'pipelines' becomes a -<name> flag. No secrets here: credentials come from ~/.kaggle/kaggle.json or KAGGLE_* env vars.",
+  "username": "banwait13",
+  "competition": "gemma-4-developer-agent",
+  "repo_dataset": "banwait13/gemmafinetuning",
+  "pipelines": {
+    "training": {
+      "notebook": "kaggle/training_pipeline.ipynb",
+      "kernel_slug": "gemmafinetuning-training",
+      "kernel_title": "GemmaFineTuning Training",
+      "wheelhouses": [],
+      "private_datasets": [],
+      "model_sources": ["google/gemma-4/transformers/gemma-4-e4b-it-qat-q4_0-unquantized/2"],
+      "machine_shape": "NvidiaTeslaT4",
+      "enable_internet": true,
+      "is_private": true
+    }
+  }
+}
