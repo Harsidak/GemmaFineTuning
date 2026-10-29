@@ -1,0 +1,90 @@
+# Experiment Metadata & Configuration Schema
+# Copy this file to experiments/exp_<ID>_<name>/config.yaml for each experiment run.
+
+experiment:
+  id: "EXP-001"
+  name: "baseline_gemma4_lora_sft"
+  date: "2026-10-16"
+  author: "Research Team"
+  status: "PLANNED" # Options: PLANNED, RUNNING, COMPLETED, FAILED, ABANDONED
+
+objective:
+  description: "Evaluate baseline LoRA fine-tuning on SWE-bench trajectories with Gemma 4 12B"
+  target_metric: "Pass@1"
+  baseline_score: 0.185
+  expected_score: 0.230
+
+base_model:
+  name: "google/gemma-4-12b-it" # Or gemma-4-31b-it-qat-w4a16-ct
+  variant: "12B-IT"
+  quantization: "4bit" # Options: None, 4bit, 8bit, qat-w4a16
+  max_context_length: 32768
+  rope_scaling: null
+
+dataset:
+  train_data_path: "data/train_trajectories.jsonl"
+  val_data_path: "data/val_tasks.jsonl"
+  num_train_samples: 5000
+  num_val_samples: 100
+  data_filtering: "successful_trajectories_only"
+
+lora_configuration:
+  enabled: true
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+training_hyperparameters:
+  learning_rate: 2.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  batch_size_per_device: 2
+  gradient_accumulation_steps: 8
+  effective_batch_size: 16
+  num_train_epochs: 3
+  max_seq_length: 8192
+  weight_decay: 0.01
+  gradient_checkpointing: true
+  fp16: false
+  bf16: true
+  optim: "adamw_torch"
+
+agent_architecture:
+  mode: "multi_agent" # Options: single_agent, multi_agent
+  sub_agents:
+    - name: "code_localizer"
+      role: "Fault localization and AST symbol exploration"
+    - name: "patch_engineer"
+      role: "Surgical patch generation"
+    - name: "test_verifier"
+      role: "Regression test runner and patch validator"
+  max_turns_per_task: 25
+  sampling:
+    temperature: 0.1
+    top_p: 0.95
+    max_output_tokens: 4096
+
+evaluation_results:
+  pass_at_1: null # e.g. 0.245
+  total_tasks_evaluated: null
+  tasks_passed: null
+  tasks_failed: null
+  tasks_timed_out: null
+  avg_turns_per_task: null
+  avg_seconds_per_task: null
+  total_cost_or_tokens: null
+
+verdict:
+  decision: "PENDING" # Options: ADOPT, ITERATE, REJECT
+  key_findings: ""
+  recommended_next_step: ""

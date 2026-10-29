@@ -1,0 +1,54 @@
+# Default ADK Declarative Agent Configuration Blueprint
+version: "1.0"
+name: "gemma-developer-agent-orchestrator"
+
+model:
+  name: "gemma-4-12b-it" # Must match ModelRegistry across orchestrator and all sub-agents!
+  temperature: 0.1
+  top_p: 0.95
+  max_tokens: 4096
+
+system_prompt: "!include prompts/system.md"
+
+tools:
+  - run_command
+  - read_file
+  - edit_file
+  - write_file
+  - get_status
+  - code_graph_search
+  - submit_patch
+  - name: code_localizer_tool
+    agent_tool:
+      config_path: "sub_agents/code_localizer.yaml"
+      skip_summarization: true
+  - name: test_verifier_tool
+    agent_tool:
+      config_path: "sub_agents/test_verifier.yaml"
+      skip_summarization: true
+
+sub_agents:
+  - name: "code_localizer"
+    file: "sub_agents/code_localizer.yaml"
+    description: "Specialized sub-agent for AST navigation, symbol lookup, and fault localization."
+    tools:
+      - read_file
+      - get_status
+      - code_graph_search
+    system_prompt: "!include prompts/sub_agents/localizer.md"
+
+  - name: "test_verifier"
+    file: "sub_agents/test_verifier.yaml"
+    description: "Specialized sub-agent for executing unit tests, diagnosing test regressions, and verifying fixes."
+    tools:
+      - run_command
+      - read_file
+      - get_status
+    system_prompt: "!include prompts/sub_agents/verifier.md"
+
+sampling:
+  temperature: 0.1
+  top_p: 0.95
+  max_output_tokens: 4096
+  frequency_penalty: 0.1
+  presence_penalty: 0.0

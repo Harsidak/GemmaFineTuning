@@ -1,0 +1,51 @@
+experiment:
+  id: "EXP-000"
+  name: "baseline_zero_shot"
+  date: "2026-10-16"
+  author: "Research Team"
+  status: "COMPLETED"
+
+objective:
+  description: "Establish zero-shot baseline using un-tuned Gemma 4 12B with ADK standard tools"
+  target_metric: "Pass@1"
+  baseline_score: 0.0
+  expected_score: 0.150
+
+base_model:
+  name: "google/gemma-4-12b-it"
+  variant: "12B-IT"
+  quantization: "4bit"
+  max_context_length: 32768
+
+dataset:
+  train_data_path: null
+  val_data_path: "data/val_tasks.jsonl"
+  num_train_samples: 0
+  num_val_samples: 50
+
+lora_configuration:
+  enabled: false
+
+training_hyperparameters: null
+
+agent_architecture:
+  mode: "single_agent"
+  max_turns_per_task: 20
+  sampling:
+    temperature: 0.0
+    top_p: 0.95
+    max_output_tokens: 4096
+
+evaluation_results:
+  pass_at_1: 0.140
+  total_tasks_evaluated: 50
+  tasks_passed: 7
+  tasks_failed: 38
+  tasks_timed_out: 5
+  avg_turns_per_task: 14.8
+  avg_seconds_per_task: 185.2
+
+verdict:
+  decision: "ADOPT"
+  key_findings: "Base model has strong code reasoning but frequently misplaces edits or gets stuck in repetitive file reading loops."
+  recommended_next_step: "Train LoRA adapter on successful tool trajectories and separate localization from code editing."

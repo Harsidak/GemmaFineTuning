@@ -1,0 +1,33 @@
+# Direct Preference Optimization (DPO) Configuration for Gemma 4
+model:
+  base_model_name_or_path: "google/gemma-4-12b-it"
+  adapter_model_path: "models/checkpoints/gemma4_lora_sft/checkpoint-best"
+  torch_dtype: "bfloat16"
+  use_4bit_quantization: true
+
+dataset:
+  dpo_data_path: "data/dpo_preference_pairs.jsonl"
+  max_prompt_length: 4096
+  max_length: 8192
+
+dpo:
+  beta: 0.1 # DPO temperature regularization
+  loss_type: "sigmoid"
+
+training:
+  output_dir: "models/checkpoints/gemma4_lora_dpo"
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 5.0e-6
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  logging_steps: 5
+  save_strategy: "steps"
+  save_steps: 100
+  evaluation_strategy: "steps"
+  eval_steps: 100
+  bf16: true
+  gradient_checkpointing: true
+  optim: "adamw_torch"
+  seed: 42

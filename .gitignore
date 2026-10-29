@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Lock files
+*.lock
+uv.lock
+.lock
+
+# Jupyter
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Internal Planning (local only)
+planning/
+
+# Checkpoints, Adapters & Large Binaries
+models/checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.npz
+*.pkl
+submission/adapters/*
+build/submission_staging/adapters/*
+
+# Generated Submission Archives & Evaluation Runs
+submission.zip
+runs/
+logs/
+scorecards/
+*.log
+
+# Third-party research: read locally, never committed to Git (see resources/INDEX.md)
+resources/papers/*
+!resources/papers/.gitkeep
+resources/web/*
+!resources/web/.gitkeep
+resources/repos/*
+!resources/repos/.gitkeep
+*.pdf
+
+# Scratch scripts & temporary workspaces
+scratch/
+build/gemma-4-developer-agent/wheels/*.whl

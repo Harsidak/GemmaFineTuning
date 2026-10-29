@@ -1,0 +1,11 @@
+# Copy beside every local paper, blog or repo. Name it <artefact-filename>.meta.yaml
+source_url:          # exact URL, or "local" / "generated"
+retrieved:           # YYYY-MM-DD
+kind:                # paper | blog | repo | official | leaderboard | benchmark
+title:
+authors:             # optional
+why:                 # one line: what specific problem or design question this answers
+relates_to:          # experiment ID (e.g. EXP-001) or module name
+licence:             # required for any code under repos/
+verified: false      # true if a human verified key findings or benchmark scores
+

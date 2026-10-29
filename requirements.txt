@@ -1,0 +1,14 @@
+pyyaml>=6.0.1
+pydantic>=2.7.0
+pandas>=2.2.0
+numpy>=1.26.0
+torch>=2.4.0
+transformers>=4.48.0
+peft>=0.14.0
+accelerate>=1.2.0
+datasets>=3.2.0
+trl>=0.14.0
+bitsandbytes>=0.45.0
+tqdm>=4.66.0
+pytest>=8.0.0
+ipykernel>=6.29.0

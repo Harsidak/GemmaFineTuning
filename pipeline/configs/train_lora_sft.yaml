@@ -1,0 +1,50 @@
+# Supervised Fine-Tuning (SFT) Configuration for Gemma 4 LoRA
+model:
+  base_model_name_or_path: "google/gemma-4-12b-it" # Or gemma-4-31b-it-qat-w4a16-ct
+  torch_dtype: "bfloat16"
+  use_4bit_quantization: true
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_quant_type: "nf4"
+  use_nested_quant: true
+  device_map: "auto"
+
+dataset:
+  train_data_path: "data/train_trajectories.jsonl"
+  val_data_path: "data/val_tasks.jsonl"
+  max_seq_length: 8192
+  packing: false # Set true if packing short trajectories into fixed-size windows
+
+lora:
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  bias: "none"
+  task_type: "CAUSAL_LM"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+training:
+  output_dir: "models/checkpoints/gemma4_lora_sft"
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  logging_steps: 10
+  save_strategy: "epoch"
+  evaluation_strategy: "epoch"
+  save_total_limit: 2
+  gradient_checkpointing: true
+  bf16: true
+  fp16: false
+  optim: "adamw_torch"
+  seed: 42
