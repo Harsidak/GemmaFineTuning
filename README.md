@@ -146,3 +146,13 @@ runner.status()                                    # Inspect environment & datas
 runner.evaluate(tasks_path="data/val_tasks.jsonl") # Test agent and calculate Pass@1
 runner.package(model_name="gemma-4-12b-it")       # Generate validated submission.zip
 ```
+
+## Citation:
+@misc{harsidak_singh_2026,
+	title={GemmaFineTuning},
+	url={https://www.kaggle.com/dsv/21381276},
+	DOI={10.34740/KAGGLE/DSV/21381276},
+	publisher={Kaggle},
+	author={Harsidak Singh},
+	year={2026}
+}
