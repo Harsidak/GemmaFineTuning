@@ -35,19 +35,18 @@ from transformers import (
     TrainingArguments,
 )
 
+from ..shared.checkpoints import (  # noqa: F401 - re-exported: the orchestrator, export phase and tests import them from here
+    checkpoint_is_loadable,
+    find_latest_checkpoint,
+    list_checkpoints,
+    write_checkpoint,
+)
+from ..shared.guards import NonFiniteGuard, NonFiniteLossError  # noqa: F401
 from .device import capture_rng_state, cpu_state_dict, peak_memory_mb, save_object
 from .loss import unwrap_causal_lm
 from .schedule import WSDScheduleController
 
 logger = logging.getLogger(__name__)
-
-
-class NonFiniteLossError(RuntimeError):
-    """Training produced NaN/Inf loss or gradients for several consecutive logging windows."""
-
-
-def _dir_size_bytes(path: Path) -> int:
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
 def save_adapter_weights(model: Any, out_dir: Path, accelerator: str = "cpu") -> None:
@@ -117,50 +116,28 @@ def save_wallclock_checkpoint(
     accelerator: str = "cpu",
     min_free_disk_gib: float = 0.0,
     reason: str = "wallclock",
+    extra_meta: dict[str, Any] | None = None,
+    progress_fn: Callable[[Path], None] | None = None,
 ) -> Path | None:
     """Writes a self-contained resumable checkpoint directory `step_<n>/` and prunes old ones (§7.8).
 
-    Disk safety (Kaggle `/kaggle/working` is ~20 GiB): before writing, the expected size (the previous
-    checkpoint's size, else 4x the adapter) is compared with free space. Older checkpoints beyond the newest
-    one are pruned first if needed; if space is still short the save is skipped with a warning instead of
-    crashing training with `ENOSPC`. Returns None when nothing was written.
+    Publishing (temp dir, post-write verification, atomic rename, pruning, disk-space guard) is the shared
+    `write_checkpoint`; this function only supplies the PyTorch-specific state. `extra_meta` is merged into
+    `trainer_resume.json` (fingerprints, best-loss state) and `progress_fn(tmp_dir)` writes the task ledger.
+    Returns None when nothing was written (not the main process, or the disk is too full).
     """
     if not is_main_process:
         return None
 
-    checkpoint_root.mkdir(parents=True, exist_ok=True)
-    existing = list_checkpoints(checkpoint_root)
-    expected = _dir_size_bytes(existing[-1]) if existing else 0
-    if not expected:
-        expected = 4 * sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
-    floor = int(min_free_disk_gib * 1024**3)
-    if shutil.disk_usage(checkpoint_root).free - expected < floor:
-        for old in existing[:-1]:
-            shutil.rmtree(old, ignore_errors=True)
-        if shutil.disk_usage(checkpoint_root).free - expected < floor:
-            logger.warning(
-                "Skipping %s checkpoint at step %d: %.2f GiB free, need ~%.2f GiB + %.1f GiB floor",
-                reason,
-                step,
-                shutil.disk_usage(checkpoint_root).free / 1024**3,
-                expected / 1024**3,
-                min_free_disk_gib,
-            )
-            return None
-
-    ckpt_dir = checkpoint_root / f"step_{step:06d}"
-    tmp_dir = checkpoint_root / f".tmp_step_{step:06d}"
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
+    def _write(tmp_dir: Path) -> None:
         save_adapter_weights(model, tmp_dir / "adapter", accelerator)
         if optimizer is not None:
             save_object(optimizer.state_dict(), tmp_dir / "optimizer.pt", accelerator)
         if scheduler is not None:
             torch.save(scheduler.state_dict(), tmp_dir / "scheduler.pt")
         torch.save(capture_rng_state(accelerator), tmp_dir / "rng_state.pt")
-
+        if progress_fn is not None:
+            progress_fn(tmp_dir)
         meta = {
             "step": int(step),
             "epoch": float(epoch),
@@ -170,53 +147,20 @@ def save_wallclock_checkpoint(
             "saved_at_ts": time.time(),
             "reason": reason,
             "accelerator": accelerator,
+            **(extra_meta or {}),
         }
         (tmp_dir / "trainer_resume.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    except Exception:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
 
-    # Atomic publish: the step dir only ever exists in complete form.
-    shutil.rmtree(ckpt_dir, ignore_errors=True)
-    tmp_dir.rename(ckpt_dir)
-
-    existing = list_checkpoints(checkpoint_root)
-    while len(existing) > max(1, int(keep_checkpoints)):
-        shutil.rmtree(existing.pop(0), ignore_errors=True)
-
-    return ckpt_dir
-
-
-def list_checkpoints(checkpoint_root: Path) -> list[Path]:
-    """Complete `step_*` checkpoints sorted oldest -> newest by global step."""
-    if not checkpoint_root.exists():
-        return []
-    candidates = [
-        d
-        for d in checkpoint_root.glob("step_*")
-        if d.is_dir()
-        and (d / "trainer_resume.json").is_file()
-        and (d / "adapter" / "adapter_model.safetensors").is_file()
-    ]
-    return sorted(candidates, key=lambda d: int(d.name.split("_", 1)[1]))
-
-
-def find_latest_checkpoint(checkpoint_root: Path) -> Path | None:
-    found = list_checkpoints(checkpoint_root)
-    return found[-1] if found else None
-
-
-def checkpoint_is_loadable(ckpt: Path) -> bool:
-    """Cheap integrity check: resume metadata parses and the safetensors header is readable."""
-    try:
-        json.loads((ckpt / "trainer_resume.json").read_text(encoding="utf-8"))
-        from safetensors import safe_open
-
-        with safe_open(str(ckpt / "adapter" / "adapter_model.safetensors"), framework="pt") as fh:
-            return len(list(fh.keys())) > 0
-    except Exception as exc:  # noqa: BLE001 - any failure means "do not resume from this one"
-        logger.warning("Checkpoint %s is unreadable (%s); skipping it", ckpt, exc)
-        return False
+    trainable_bytes = 4 * sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
+    return write_checkpoint(
+        checkpoint_root,
+        step,
+        _write,
+        keep=keep_checkpoints,
+        min_free_disk_gib=min_free_disk_gib,
+        fallback_expected_bytes=trainable_bytes,
+        reason=reason,
+    )
 
 
 class MultiLoraTrainingCallback(TrainerCallback):
@@ -245,14 +189,17 @@ class MultiLoraTrainingCallback(TrainerCallback):
         min_free_disk_gib: float = 0.0,
         max_nonfinite_logs: int = 3,
         stop_requested: Callable[[], bool] | None = None,
+        session: Any | None = None,
     ) -> None:
+        self.session = session
         self.adapter_name = adapter_name
         self.step_offset = max(0, int(step_offset))
         self.accelerator = accelerator
         self.min_free_disk_gib = float(min_free_disk_gib)
         self.max_nonfinite_logs = max(1, int(max_nonfinite_logs))
         self.stop_requested = stop_requested
-        self.nonfinite_streak = 0
+        # One guard implementation for every backend: the session's when there is one, else a private instance.
+        self._guard = session.nonfinite if session is not None else NonFiniteGuard(self.max_nonfinite_logs, f"[{adapter_name}]")
         self.stopped_by_signal = False
         self.wsd = wsd_controller
         self.metrics_jsonl_path = metrics_jsonl_path
@@ -286,8 +233,27 @@ class MultiLoraTrainingCallback(TrainerCallback):
         self.train_losses: list[dict[str, float]] = []
         self._trainer_ref: Any = None
 
+    @property
+    def nonfinite_streak(self) -> int:
+        return self._guard.streak
+
     def bind_trainer(self, trainer: Any) -> None:
         self._trainer_ref = trainer
+
+    def _save_best(self, tmp_dir: Path) -> None:
+        save_adapter_weights(self._trainer_ref.model, tmp_dir, self.accelerator)
+
+    def _progress_writer(self, state: TrainerState) -> Callable[[Path], None] | None:
+        """Writes the task ledger (which examples this epoch has consumed) next to a checkpoint."""
+        sess, smp = self.session, self.sampler
+        if sess is None or smp is None or not hasattr(smp, "consumed_indices"):
+            return None
+
+        def _write(tmp_dir: Path) -> None:
+            consumed = [sess.keys[i] for i in smp.consumed_indices(self.samples_in_epoch) if i < len(sess.keys)]
+            sess.write_progress(tmp_dir, epoch=smp._order_epoch, consumed_keys=consumed)
+
+        return _write
 
     def global_step(self, state: TrainerState) -> int:
         return self.step_offset + int(state.global_step)
@@ -311,6 +277,8 @@ class MultiLoraTrainingCallback(TrainerCallback):
             accelerator=self.accelerator,
             min_free_disk_gib=self.min_free_disk_gib,
             reason=reason,
+            extra_meta=self.session.checkpoint_meta() if self.session is not None else None,
+            progress_fn=self._progress_writer(state),
         )
 
     def on_epoch_begin(
@@ -416,33 +384,23 @@ class MultiLoraTrainingCallback(TrainerCallback):
         if not logs:
             return
 
-        # NaN/Inf guard runs on every rank so all ranks abort together (requires logging_nan_inf_filter=False).
+        # NaN/Inf + divergence guards run on every rank so all ranks abort together (requires logging_nan_inf_filter=False).
         if "loss" in logs:
-            loss_val = float(logs["loss"])
             gn = logs.get("grad_norm")
-            bad = not math.isfinite(loss_val) or (gn is not None and not math.isfinite(float(gn)))
-            self.nonfinite_streak = self.nonfinite_streak + 1 if bad else 0
-            if bad:
-                logger.warning(
-                    "[%s] Non-finite loss/grad_norm at step %d (loss=%s, grad_norm=%s) [%d/%d]",
-                    self.adapter_name,
-                    self.global_step(state),
-                    loss_val,
-                    gn,
-                    self.nonfinite_streak,
-                    self.max_nonfinite_logs,
-                )
-            if self.nonfinite_streak >= self.max_nonfinite_logs:
-                raise NonFiniteLossError(
-                    f"[{self.adapter_name}] {self.nonfinite_streak} consecutive non-finite loss/grad-norm logs at "
-                    f"step {self.global_step(state)}; aborting so the run restarts from the last good checkpoint. "
-                    "Lower train.lr, raise schedule.warmup_steps, or check data for empty supervision."
-                )
+            gn_val = float(gn) if gn is not None else None
+            if self.session is not None:
+                self.session.check_health(self.global_step(state), float(logs["loss"]), gn_val)
+            else:
+                self._guard.observe(float(logs["loss"]), gn_val, self.global_step(state))
 
         if not state.is_world_process_zero:
             return
 
         now = self.wsd.now()
+        if "eval_loss" in logs and self.session is not None:
+            decision = self.session.on_eval(self.global_step(state), float(logs["eval_loss"]), self._save_best)
+            if decision.should_stop:
+                control.should_training_stop = True
         if "eval_loss" in logs:
             self.val_losses.append(
                 {
@@ -478,6 +436,12 @@ class MultiLoraTrainingCallback(TrainerCallback):
             "peak_gpu_mem_mb": gpu_peak_mb,
         }
         self.train_losses.append({"step": state.global_step, "train_loss": entry["train_loss"]})
+        if self.session is not None:
+            self.session.log_metrics(
+                entry["step"],
+                {"train/loss": entry["train_loss"], "train/grad_norm": entry["grad_norm"], "train/lr": entry["lr"],
+                 "perf/tokens_per_sec": entry["tokens_per_sec"], "perf/peak_mem_mb": entry["peak_gpu_mem_mb"]},
+            )
         self.metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.metrics_jsonl_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")

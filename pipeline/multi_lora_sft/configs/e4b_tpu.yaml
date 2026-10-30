@@ -1,4 +1,5 @@
-# Gemma 4 E4B LoRA SFT on a TPU VM (e.g. Kaggle "TPU VM v5e-8": 8 chips x 16 GiB HBM) via torch_xla.
+# Gemma 4 E4B LoRA SFT on a TPU VM (e.g. Kaggle "TPU VM v5e-8": 8 chips x 16 GiB HBM). With `train.backend: auto` this
+# runs on Tunix (JAX; tpu_training/); `--set train.backend=trl` selects the older torch_xla path described below.
 #
 # - bf16 weights (no bitsandbytes on TPU), sharded across all chips with XLA SPMD FSDPv2 (`parallelism: spmd`).
 #   E4B's ~8B raw parameters (incl. per-layer embeddings) do not fit one 16 GiB chip unsharded.
@@ -47,7 +48,7 @@ lora:
   exclude_kv_shared: true
 
 train:
-  backend: trl
+  backend: auto                          # E4B on a TPU -> tunix (JAX, tpu_training/); trl is the PyTorch/XLA fallback
   accelerator: tpu
   parallelism: spmd
   lr: 1.0e-4

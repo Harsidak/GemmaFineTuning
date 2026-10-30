@@ -27,6 +27,7 @@ from ..runctx import (
     sha256_file,
     utc_iso,
 )
+from ..shared.adapter_contract import check_adapter_contract
 from ..training.callbacks import find_latest_checkpoint
 
 EXPORT_KEY_RE = re.compile(
@@ -260,6 +261,18 @@ def run_export_phase(
                 eff_adapter=eff,
             )
             info["source_kind"] = src_kind
+            served_dir = cfg.model.served_path if cfg.model.served_path not in {None, "__tiny__"} else None
+            contract = check_adapter_contract(
+                info["output_dir"],
+                served_model_dir=served_dir if served_dir and Path(served_dir).is_dir() else None,
+                expected_rank=eff.lora.r,
+            )
+            info["contract"] = contract.to_dict()
+            if not contract.ok:
+                shutil.rmtree(info["output_dir"], ignore_errors=True)  # never let a broken adapter reach the zip
+                raise ExportValidationError(f"adapter contract failed for {spec.name!r}: " + "; ".join(contract.errors[:4]))
+            for w in contract.warnings:
+                notes.append(f"{spec.name}: {w}")
             exported[spec.name] = info
             if src_kind != "final_adapter":
                 notes.append(f"Adapter {spec.name!r} exported from fallback {src_kind}")

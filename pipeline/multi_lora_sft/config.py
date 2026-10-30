@@ -56,6 +56,11 @@ class RunSection:
 @dataclass
 class ResumeSection:
     extend: bool = False
+    strict: bool = True  # refuse to resume when the checkpoint was made with a different model / LoRA rank / alpha / targets
+    on_data_change: str = "continue_unseen"  # "continue_unseen" | "restart_epoch" - what to do when the dataset grew or changed
+    auto_discover: bool = True  # pick up an attached checkpoint-bundle dataset (bundle.json) under `input_root`
+    input_root: str = "/kaggle/input"
+    bundle_dirs: list[str] = field(default_factory=list)  # explicit bundle directories (searched before auto-discovery)
 
 
 @dataclass
@@ -118,7 +123,7 @@ class LoraSection:
 
 @dataclass
 class TrainSection:
-    backend: str = "trl"
+    backend: str = "auto"  # "auto" | "trl" (PyTorch) | "tunix" (JAX); auto = tunix for E4B/E2B on a TPU, trl otherwise
     accelerator: str = "auto"  # "auto" | "cuda" | "tpu" | "cpu"
     parallelism: str = "model_split"  # "ddp" | "model_split" | "single" | "spmd" (TPU FSDPv2)
     num_processes: int | None = None
@@ -145,6 +150,10 @@ class TrainSection:
     sigterm_grace_sec: float = 60.0  # time a train subprocess gets after SIGTERM to save and exit
     min_free_disk_gib: float = 2.0  # skip (not crash) a wall-clock checkpoint when free disk would drop below this
     emergency_checkpoint: bool = True  # save adapter + state when training crashes mid-run (never on NaN)
+    select_best: bool = True  # final adapter = lowest-validation-loss checkpoint when it beats the last one
+    early_stop_patience: int = 0  # stop after this many validations without improvement (0 = never)
+    early_stop_min_delta: float = 0.0
+    loss_spike_factor: float = 8.0  # abort to the last checkpoint after 5 logs above factor x running loss (0 = off)
     oom_fallbacks: list[dict[str, Any]] = field(
         default_factory=lambda: [{"max_seq_length": 12288}, {"max_seq_length": 8192}]
     )
@@ -245,6 +254,47 @@ class EvalSection:
 
 
 @dataclass
+class TrackingSection:
+    """Weights & Biases policy (see shared/tracking.py). The key is only ever read from WANDB_API_KEY."""
+
+    wandb: str = "auto"  # "off" | "offline" | "online" | "auto" (online only with a key AND internet, else offline)
+    project: str = "gemma4-developer-agent"
+    group: str | None = None
+    run_name: str | None = None
+    disable_during_tuning: bool = True  # Optuna trials never log to W&B
+
+
+@dataclass
+class TuningSection:
+    """Optuna hyper-parameter search (shared/tuning.py); the same code drives the TRL and the Tunix backend."""
+
+    enabled: bool = False
+    active: bool = False  # set by the tuner inside trial runs: forces W&B off, skips export/package/bundle
+    trials: int = 12
+    adapter: str | None = None  # adapter to tune (default: the first one)
+    trial_minutes: float = 12.0
+    trial_max_steps: int | None = None
+    total_minutes: float | None = None  # wall-clock cap for the whole study
+    seed: int = 1234
+    sampler: str = "tpe"  # "tpe" | "random"
+    pruner: str = "median"  # "median" | "none"
+    n_startup_trials: int = 3
+    storage_dir: str | None = None
+    space: dict[str, Any] = field(default_factory=dict)  # {} = built-in space; {"train.lr": {"type": "float", "low": 3e-5, "high": 3e-4, "log": true}}
+    use_best_params: bool = True  # a normal run applies tuning/best_params.json found in an attached bundle
+
+
+@dataclass
+class OutputSection:
+    """Where the cross-session checkpoint bundle goes (shared/bundle.py)."""
+
+    bundle_dir: str | None = "/kaggle/working/lora_checkpoints"  # null disables the bundle
+    dataset_id: str | None = None  # '<user>/<slug>' of the private dataset the bundle is uploaded to
+    dataset_title: str = "GemmaFineTuning LoRA checkpoints"
+    scan_secrets: bool = True
+
+
+@dataclass
 class EffectiveAdapterConfig:
     """Resolved per-adapter configuration after deep-merging `AdapterSpec.overrides`."""
 
@@ -279,6 +329,9 @@ class PipelineConfig:
     parity: ParitySection = field(default_factory=ParitySection)
     submission: SubmissionSection = field(default_factory=SubmissionSection)
     eval: EvalSection = field(default_factory=EvalSection)
+    tracking: TrackingSection = field(default_factory=TrackingSection)
+    tuning: TuningSection = field(default_factory=TuningSection)
+    output: OutputSection = field(default_factory=OutputSection)
 
     def effective_served_model_id(self) -> str:
         return self.submission.served_model_id or self.model.served_model_id
@@ -350,6 +403,7 @@ _FREEFORM_DICT_PATHS: frozenset[str] = frozenset(
     {
         "data.template_kwargs",
         "submission.adapter_map",
+        "tuning.space",
     }
 )
 
@@ -471,6 +525,9 @@ _SECTION_CLASSES: dict[str, type] = {
     "EvalBudgetSection": EvalBudgetSection,
     "EvalSection": EvalSection,
     "VllmEvalSection": VllmEvalSection,
+    "TrackingSection": TrackingSection,
+    "TuningSection": TuningSection,
+    "OutputSection": OutputSection,
 }
 
 
@@ -556,8 +613,18 @@ def _validate_lora_section(lora: LoraSection, label: str) -> None:
 
 
 def _validate_train_section(train: TrainSection, label: str, quantization: str | None = None) -> None:
-    if train.backend not in {"trl"}:
-        raise ConfigError(f"{label}.backend {train.backend!r} is not supported in v1 (expected 'trl')")
+    if train.backend not in {"auto", "trl", "tunix"}:
+        raise ConfigError(f"{label}.backend must be 'auto', 'trl' or 'tunix', got {train.backend!r}")
+    if train.backend == "tunix":
+        if train.accelerator == "cuda" or train.parallelism in {"ddp", "model_split"}:
+            raise ConfigError(
+                f"{label}: backend 'tunix' is the JAX path for TPU (JAX-CPU for tests); use accelerator 'tpu'/'auto'/'cpu' with "
+                "parallelism 'spmd' or 'single', or backend 'trl' for GPUs"
+            )
+        if quantization == "nf4":
+            raise ConfigError(f"{label}: backend 'tunix' trains in bf16/fp32; 'nf4' needs bitsandbytes + CUDA")
+    if train.early_stop_patience < 0 or train.early_stop_min_delta < 0 or train.loss_spike_factor < 0:
+        raise ConfigError(f"{label}.early_stop_patience, early_stop_min_delta and loss_spike_factor must be >= 0")
     if train.accelerator not in {"auto", "cuda", "tpu", "cpu"}:
         raise ConfigError(
             f"{label}.accelerator must be 'auto', 'cuda', 'tpu', or 'cpu', got {train.accelerator!r}"
@@ -692,6 +759,26 @@ def validate_config(cfg: PipelineConfig) -> None:
             f"model.attn_implementation must be 'sdpa', 'eager', or 'flash_attention_2', "
             f"got {cfg.model.attn_implementation!r}"
         )
+
+    if cfg.resume.on_data_change not in {"continue_unseen", "restart_epoch"}:
+        raise ConfigError(f"resume.on_data_change must be 'continue_unseen' or 'restart_epoch', got {cfg.resume.on_data_change!r}")
+    if cfg.tracking.wandb not in {"off", "offline", "online", "auto"}:
+        raise ConfigError(f"tracking.wandb must be 'off', 'offline', 'online' or 'auto', got {cfg.tracking.wandb!r}")
+    tu = cfg.tuning
+    if tu.sampler not in {"tpe", "random"} or tu.pruner not in {"median", "none"}:
+        raise ConfigError("tuning.sampler must be 'tpe'|'random' and tuning.pruner 'median'|'none'")
+    if tu.trials < 1 or tu.trial_minutes <= 0 or tu.n_startup_trials < 0:
+        raise ConfigError("tuning.trials must be >= 1, tuning.trial_minutes > 0, tuning.n_startup_trials >= 0")
+    if tu.trial_max_steps is not None and tu.trial_max_steps < 1:
+        raise ConfigError("tuning.trial_max_steps must be >= 1 when set")
+    if tu.total_minutes is not None and tu.total_minutes <= 0:
+        raise ConfigError("tuning.total_minutes must be > 0 when set")
+    if tu.adapter is not None and tu.adapter not in {a.name for a in cfg.adapters}:
+        raise ConfigError(f"tuning.adapter {tu.adapter!r} is not one of the configured adapters")
+    if not isinstance(tu.space, dict):
+        raise ConfigError("tuning.space must be a mapping")
+    if cfg.output.dataset_id is not None and not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", cfg.output.dataset_id):
+        raise ConfigError(f"output.dataset_id must look like '<user>/<slug>', got {cfg.output.dataset_id!r}")
 
     # Data validation
     if not isinstance(cfg.data.train_files, list) or not all(

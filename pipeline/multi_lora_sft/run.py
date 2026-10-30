@@ -27,6 +27,7 @@ from typing import Any
 
 from .clock import SessionClock
 from .config import AdapterSpec, PipelineConfig, load_config
+from .shared.bundle import discover_bundles, previous_session_count, sync_bundle
 from .runctx import (
     PhaseStatus,
     RunContext,
@@ -302,6 +303,38 @@ class Orchestrator:
         self.ctx.write_status(status)
         return status.to_dict()
 
+    def _sync_bundle(self, why: str) -> None:
+        """Copies the newest checkpoint / best / final adapter / ledger of every adapter into the cross-session bundle.
+
+        Called after each adapter and again in the `finally` block, so a later crash or timeout cannot lose finished
+        work. It is backend-agnostic (it only copies files) and never raises.
+        """
+        out = self.cfg.output.bundle_dir
+        if not out or self.cfg.tuning.active:
+            return
+        try:
+            previous = previous_session_count(
+                [Path(p) for p in self.cfg.resume.bundle_dirs]
+                + (discover_bundles([self.cfg.resume.input_root]) if self.cfg.resume.auto_discover else [])
+            )
+            meta = sync_bundle(
+                out,
+                run_checkpoints_dir=self.ctx.checkpoints_dir,
+                adapters=[a.name for a in self.cfg.adapters],
+                served_model_id=self.cfg.effective_served_model_id(),
+                dataset_id=self.cfg.output.dataset_id,
+                dataset_title=self.cfg.output.dataset_title,
+                run_id=self.ctx.run_id,
+                git_sha=self.cfg.run.git_sha or os.environ.get("GIT_SHA"),
+                tuning_dir=Path(self.cfg.tuning.storage_dir) if self.cfg.tuning.storage_dir else None,
+                previous_sessions=previous,
+                scan_secrets=self.cfg.output.scan_secrets,
+            )
+            self.logger.info("Checkpoint bundle synced to %s (%s): %s", out, why, {k: v.get("status") for k, v in meta["adapters"].items()})
+            self.ctx.update_manifest({"bundle_dir": out, "bundle_dataset_id": self.cfg.output.dataset_id})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Bundle sync failed (%s): %s", why, exc)
+
     def _write_skipped_status(self, phase: str, reason: str) -> dict[str, Any]:
         now = self.clock.now()
         st = PhaseStatus(
@@ -438,17 +471,29 @@ class Orchestrator:
                             )
                             continue
                         self._run_adapter_with_retries(spec, adapter_deadline)
+                        self._sync_bundle(f"after {spec.name}")
 
-                    # 4. Export
-                    self._run_subprocess_phase("export", self.clock.phase_deadline("export"))
+                    # 4. Export (an Optuna trial only needs the validation loss)
+                    if self.cfg.tuning.active:
+                        self._write_skipped_status("export", "Optuna trial: export skipped")
+                    else:
+                        self._run_subprocess_phase("export", self.clock.phase_deadline("export"))
 
         finally:
-            # 5. Package — ALWAYS runs (§6.2 Goal G4: "Always ship")
-            pkg_st = self._run_subprocess_phase("package", self.clock.phase_deadline("package"))
-            pkg_ok = pkg_st.get("state") == "ok" and self.ctx.submission_zip_path.is_file()
+            self._sync_bundle("final")
+
+            # 5. Package — ALWAYS runs (§6.2 Goal G4: "Always ship"), except inside an Optuna trial
+            if self.cfg.tuning.active:
+                self._write_skipped_status("package", "Optuna trial: package skipped")
+                pkg_ok = True
+            else:
+                pkg_st = self._run_subprocess_phase("package", self.clock.phase_deadline("package"))
+                pkg_ok = pkg_st.get("state") == "ok" and self.ctx.submission_zip_path.is_file()
 
             # 6. Eval — runs only if setup succeeded, package succeeded, and eval is enabled
-            if not self.cfg.eval.enabled:
+            if self.cfg.tuning.active:
+                self._write_skipped_status("eval", "Optuna trial: eval skipped")
+            elif not self.cfg.eval.enabled:
                 self._write_skipped_status("eval", "eval.enabled is False")
             elif not setup_ok:
                 self._write_skipped_status("eval", "Skipped because setup failed")
@@ -479,7 +524,7 @@ class Orchestrator:
             exit_code=exit_code,
             run_id=self.ctx.run_id,
             run_dir=self.ctx.run_dir,
-            submission_zip_path=self.ctx.submission_zip_path if pkg_ok else None,
+            submission_zip_path=self.ctx.submission_zip_path if (pkg_ok and not self.cfg.tuning.active) else None,
             report_path=self.ctx.report_path,
         )
 

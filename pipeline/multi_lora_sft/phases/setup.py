@@ -37,6 +37,18 @@ REQUIRED_CORE_IMPORTS: tuple[str, ...] = (
     "yaml",
 )
 
+TUNIX_CORE_IMPORTS: tuple[str, ...] = (
+    "transformers",
+    "safetensors",
+    "pyarrow",
+    "yaml",
+    "jax",
+    "flax",
+    "optax",
+    "qwix",
+    "tunix",
+)
+
 OPTIONAL_EVAL_IMPORTS: tuple[str, ...] = (
     "vllm",
     "swegemma",
@@ -109,8 +121,23 @@ def run_setup_phase(ctx: RunContext, cfg: PipelineConfig | None = None, deadline
             )
             outputs["installed_wheelhouses"] = installed_from
 
+        from ..shared.backend import resolve_backend
+
+        backends = {
+            spec.name: resolve_backend(
+                cfg.resolve_adapter(spec).train.backend,
+                served_model_id=cfg.effective_served_model_id(),
+                accelerator=cfg.resolve_adapter(spec).train.accelerator,
+            )
+            for spec in cfg.adapters
+        }
+        outputs["backends"] = backends
+        uses_tunix = "tunix" in backends.values()
+        uses_trl = "trl" in backends.values()
+        required = tuple(dict.fromkeys([*(REQUIRED_CORE_IMPORTS if uses_trl else ()), *(TUNIX_CORE_IMPORTS if uses_tunix else ())]))
+
         missing_core: list[str] = []
-        for mod_name in REQUIRED_CORE_IMPORTS:
+        for mod_name in required:
             try:
                 importlib.import_module(mod_name)
             except Exception as exc:  # noqa: BLE001
@@ -139,7 +166,12 @@ def run_setup_phase(ctx: RunContext, cfg: PipelineConfig | None = None, deadline
         accelerators: dict[str, str] = {}
         for spec in cfg.adapters:
             requested = cfg.resolve_adapter(spec).train.accelerator
-            accelerators[spec.name] = resolve_accelerator(requested)  # raises with an install hint if missing
+            if backends[spec.name] == "tunix":
+                from tpu_training.runtime import resolve_platform
+
+                accelerators[spec.name] = resolve_platform(requested)  # JAX view: tpu | cpu (raises if a TPU was demanded)
+            else:
+                accelerators[spec.name] = resolve_accelerator(requested)  # raises with an install hint if missing
         outputs["accelerator_inventory"] = inventory
         outputs["resolved_accelerators"] = accelerators
         uses_tpu = "tpu" in accelerators.values()

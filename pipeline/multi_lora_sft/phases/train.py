@@ -32,11 +32,13 @@ from typing import Any
 
 from ..config import EffectiveAdapterConfig, PipelineConfig, load_config
 from ..runctx import PhaseStatus, RunContext, configure_phase_logging, utc_iso
+from ..shared.backend import resolve_backend
+from ..shared.bundle import discover_bundles, resume_candidates as shared_resume_candidates
+from ..shared.session import TrainingSession
 from ..training.callbacks import (
     MultiLoraTrainingCallback,
     NonFiniteLossError,
     checkpoint_is_loadable,
-    list_checkpoints,
     save_adapter_weights,
 )
 from ..training.data import (
@@ -103,17 +105,11 @@ def apply_oom_override(eff: EffectiveAdapterConfig, override: dict[str, Any] | N
 
 
 def resume_candidates(ctx: RunContext, cfg: PipelineConfig, adapter_name: str) -> list[Path]:
-    """Resumable `step_<n>/` checkpoints, newest first: this run's (crash restart) before `run.resume_from`."""
-    found: list[Path] = list(reversed(list_checkpoints(ctx.checkpoints_dir / adapter_name)))
-    if cfg.run.resume_from:
-        rp = Path(cfg.run.resume_from)
-        if (rp / "trainer_resume.json").is_file():
-            found.append(rp)
-        for root in (rp / "checkpoints" / adapter_name, rp / adapter_name, rp):
-            for cand in reversed(list_checkpoints(root)):
-                if cand not in found:
-                    found.append(cand)
-    return found
+    """Resumable `step_<n>/` checkpoints, newest first: this run's (crash restart), `run.resume_from`, attached bundles."""
+    bundles = [Path(p) for p in cfg.resume.bundle_dirs]
+    if cfg.resume.auto_discover:
+        bundles += [b for b in discover_bundles([cfg.resume.input_root]) if b not in bundles]
+    return shared_resume_candidates(ctx.checkpoints_dir, adapter_name, resume_from=cfg.run.resume_from, bundle_dirs=bundles)
 
 
 def resolve_resume_checkpoint(ctx: RunContext, cfg: PipelineConfig, adapter_name: str) -> Path | None:
@@ -178,6 +174,15 @@ def run_train_adapter_phase(
     t_start = time.time()
     cfg = cfg or load_config(ctx.resolved_config_path)
     eff = apply_oom_override(cfg.resolve_adapter(adapter_name), oom_override)
+
+    backend = resolve_backend(
+        eff.train.backend, served_model_id=cfg.effective_served_model_id(), accelerator=eff.train.accelerator
+    )
+    if backend == "tunix":  # JAX trainer for E4B/E2B on TPU: same session, same checkpoints, same adapter format
+        from tpu_training.phase import run_tunix_adapter_phase
+
+        logger.info("[%s] backend=tunix (train.backend=%s)", adapter_name, eff.train.backend)
+        return run_tunix_adapter_phase(ctx, adapter_name, deadline=deadline, cfg=cfg, eff=eff, oom_override=oom_override)
 
     notes: list[str] = []
     if oom_override:
@@ -299,12 +304,30 @@ def run_train_adapter_phase(
             deadline=soft_deadline,
         )
 
+        # Shared session: resume compatibility, task ledger, guards, best-checkpoint selection, tracking.
+        session = TrainingSession(
+            run_checkpoints_dir=ctx.checkpoints_dir,
+            run_dir=ctx.run_dir,
+            cfg=cfg,
+            eff=eff,
+            adapter_name=adapter_name,
+            backend="trl",
+            accelerator=accelerator,
+            is_main=is_main,
+            train_rows=train_rows,
+            tokenizer_sha=ctx.read_manifest().get("tokenizer_sha256"),
+            template_sha=ctx.read_manifest().get("template_sha256"),
+            train_base_name="/".join(Path(cfg.model.train_base_path or "").parts[-2:]) or None,
+        )
+
         # Resume checkpoint restoration (§7.8)
-        resume_ckpt = resolve_resume_checkpoint(ctx, cfg, adapter_name)
+        resume_info = session.resolve_resume()
+        resume_ckpt = resume_info.checkpoint if resume_info else None
+        resume_plan = session.plan_data(resume_info)
         resumed_step = 0
         resume_meta: dict[str, Any] = {}
         if resume_ckpt is not None:
-            resume_meta = json.loads((resume_ckpt / "trainer_resume.json").read_text(encoding="utf-8"))
+            resume_meta = resume_info.meta
             resumed_step = int(resume_meta.get("step", 0))
             adapter_st = load_safetensors(str(resume_ckpt / "adapter" / "adapter_model.safetensors"), device="cpu")
             load_result = set_peft_model_state_dict(peft_model, adapter_st)
@@ -314,7 +337,11 @@ def run_train_adapter_phase(
                     f"Checkpoint {resume_ckpt} does not match this LoRA config ({len(unexpected)} unexpected keys, "
                     f"first {unexpected[:3]}); was lora.r / target_regex changed since it was written?"
                 )
-            if resume_meta.get("sampler_state"):
+            if resume_plan is not None:  # task-level resume: skip what was trained on, whatever the data looks like now
+                if resume_plan.mode in {"continue", "next_epoch"}:
+                    sampler.set_exclusion(resume_plan.exclude_indices, resume_plan.epoch)
+                notes.append(f"Data resume: {resume_plan.note}")
+            elif resume_meta.get("sampler_state"):
                 sampler.load_state_dict(resume_meta["sampler_state"])
             if resume_meta.get("schedule_state"):
                 wsd.load_resume_state(
@@ -337,7 +364,7 @@ def run_train_adapter_phase(
             if not params:
                 raise ValueError("No trainable parameters after attaching LoRA (all adapters frozen?)")
             opt = torch.optim.AdamW(params, lr=eff.train.lr, weight_decay=eff.train.weight_decay)
-            if resume_ckpt is not None and (resume_ckpt / "optimizer.pt").is_file():
+            if resume_ckpt is not None and (resume_ckpt / "optimizer.pt").is_file() and resume_info.optimizer_compatible:
                 try:
                     opt.load_state_dict(_load_torch(resume_ckpt / "optimizer.pt"))
                 except Exception as exc:  # noqa: BLE001
@@ -427,6 +454,7 @@ def run_train_adapter_phase(
             min_free_disk_gib=eff.train.min_free_disk_gib,
             max_nonfinite_logs=eff.train.max_nonfinite_logs,
             stop_requested=_STOP_EVENT.is_set,
+            session=session,
         )
 
         collator = WeightedLanguageModelingCollator(pad_token_id=tokenizer.pad_token_id, pad_to_multiple_of=pad_multiple)
@@ -449,6 +477,10 @@ def run_train_adapter_phase(
             tuple_outputs=use_fsdp_xla,
         )
         cb.bind_trainer(trainer)
+        session.start_tracking(
+            {"fingerprint": session.fingerprint, "data": session.data_fp, "train": dataclasses.asdict(eff.train),
+             "lora": dataclasses.asdict(eff.lora), "resumed_step": resumed_step}
+        )
 
         segment_steps = 0
         final_train_loss: float | None = None
@@ -532,6 +564,13 @@ def run_train_adapter_phase(
                 )
 
         steps_completed = resumed_step + segment_steps
+        session_out: dict[str, Any] = {}
+        if is_main:
+            session_out = session.finalize(
+                final_adapter_dir,
+                steps_completed=steps_completed,
+                summary={"final_val_loss": final_val_loss, "final_train_loss": final_train_loss, "steps_completed": steps_completed},
+            )
         if not wsd.ever_decayed and eff.schedule.decay_frac > 0.0 and steps_completed > 1 and not already_done:
             notes.append("Training ended before entering WSD decay phase")
 
@@ -556,6 +595,14 @@ def run_train_adapter_phase(
             "oom_override": oom_override,
             "resumed_from": str(resume_ckpt) if resume_ckpt else None,
             "stopped_by_signal": cb.stopped_by_signal,
+            "backend": "trl",
+            "session": session_out,
+            "resume": {
+                "checkpoint": str(resume_ckpt) if resume_ckpt else None,
+                "optimizer_restored": bool(resume_info and resume_info.optimizer_compatible),
+                "data_plan": resume_plan.note if resume_plan else None,
+                "notes": session.notes,
+            },
         }
 
         if is_main:

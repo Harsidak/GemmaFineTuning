@@ -814,9 +814,27 @@ class LengthGroupedLongestFirstSampler:
         self.seed = int(seed)
         self.epoch: int = 0
         self.resume_offset: int = 0
+        # Ledger-based resume: indices already trained on in `exclude_epoch` are skipped (order of the rest is kept).
+        self.exclude: set[int] = set()
+        self.exclude_epoch: int | None = None
+        self._order: list[int] = []
+        self._order_epoch: int = 0
+
+    def set_exclusion(self, indices: Any, epoch: int) -> None:
+        """Resume at `epoch` skipping `indices` (examples a previous session already consumed in that epoch)."""
+        self.epoch = int(epoch)
+        self.exclude = {int(i) for i in indices}
+        self.exclude_epoch = int(epoch)
+        self.resume_offset = 0
 
     def __len__(self) -> int:
-        return max(0, self.n - self.resume_offset)
+        skipped = len(self.exclude) if self.epoch == self.exclude_epoch else 0
+        return max(0, self.n - skipped - self.resume_offset)
+
+    def consumed_indices(self, samples_consumed_in_epoch: int) -> list[int]:
+        """Every index trained on in the epoch being iterated: earlier sessions' exclusions + the first N of this order."""
+        prior = self.exclude if self._order_epoch == self.exclude_epoch else set()
+        return sorted(prior | set(self._order[: max(0, int(samples_consumed_in_epoch))]))
 
     def build_epoch_order(self, epoch: int) -> list[int]:
         import random
@@ -845,10 +863,13 @@ class LengthGroupedLongestFirstSampler:
 
     def __iter__(self):
         order = self.build_epoch_order(self.epoch)
+        if self.epoch == self.exclude_epoch and self.exclude:
+            order = [i for i in order if i not in self.exclude]
         start = min(len(order), max(0, self.resume_offset))
         # Reset one-shot resume offset once consumed; advance epoch counter on next iteration
         self.resume_offset = 0
         current_epoch = self.epoch
+        self._order, self._order_epoch = order, current_epoch
         self.epoch = current_epoch + 1
         return iter(order[start:])
 
