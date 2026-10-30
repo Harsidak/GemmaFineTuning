@@ -53,12 +53,8 @@ GemmaFineTuning/
 │   ├── main.py                           # Unified pipeline coordinator & CLI entrypoint
 │   ├── configs/                          # Training & evaluation configuration files
 │   │   ├── train_lora_sft.yaml           # SFT LoRA fine-tuning hyperparameters
-│   │   ├── train_dpo_rl.yaml             # Trajectory preference optimization config
-│   │   └── agent_defaults.yaml           # ADK declarative agent blueprint
-│   ├── scripts/                          # Pipeline runner CLI entrypoints
-│   │   ├── train.py                      # Training CLI runner (SFT / DPO)
-│   │   ├── evaluate.py                   # Benchmark evaluator CLI runner
-│   │   └── package_submission.py         # Automated submission.zip packager & validator
+│   │   └── train_dpo_rl.yaml             # Trajectory preference optimization config
+│   ├── multi_lora_sft/                   # Time-budgeted multi-LoRA SFT pipeline (see design_doc.md)
 │   └── src/                              # Core engine implementation
 │       ├── agent/                        # Declarative ADK builder, prompts & tool interfaces
 │       ├── data/                         # Trajectory loaders, task samplers & processors

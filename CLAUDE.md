@@ -20,7 +20,7 @@ uv run python pipeline/main.py --action package --model <model> --adapter-path <
 uv run ruff check pipeline
 ```
 
-`pipeline/scripts/{train,evaluate,package_submission}.py` are thin standalone CLIs over the same modules. There is no test suite yet (pytest is installed but no tests exist).
+`pipeline/main.py` is the only CLI. There is no test suite yet (pytest is installed but no tests exist).
 
 Real end-to-end evaluation uses the official `swegemma` harness (not installed in `.venv`; offline wheels live in `build/gemma-4-developer-agent/wheels/`):
 
@@ -42,7 +42,7 @@ swegemma eval --tasks tasks.jsonl --snapshots-dir snapshots --submission-dir <di
 `build/gemma-4-developer-agent/HARNESS_README.md` (official harness docs) and `build/gemma-4-developer-agent/sample_submission/` are authoritative. `.agents/rules.md` and `README.md` are older summaries and disagree with the harness in places:
 
 - **Allowed submission models** are only the quantized `gemma-4-{31b,12b,e4b,e2b}-it-qat-w4a16-ct`. The pipeline's default `gemma-4-12b-it` is CLI-eval-only and would be rejected at Kaggle scoring. All agents must declare the same single model.
-- **Tools** are the 9 in `tools.py`: `run_command, submit_patch, get_status, read_file, edit_file, write_file, search_similar_code, get_code_neighbors, get_code_subgraph`. `code_graph_search` (used in `pipeline/configs/agent_defaults.yaml` and README) does not exist in the harness.
+- **Tools** are the 9 in `tools.py`: `run_command, submit_patch, get_status, read_file, edit_file, write_file, search_similar_code, get_code_neighbors, get_code_subgraph`. `code_graph_search` (mentioned in the README) does not exist in the harness.
 - Root agent YAML schema follows the sample: `model:` string, `adapter:`, `instruction: !include …`, `generate_content_config: !include configs/sampling.yaml`, sub-agents via `agent_tool: {config_path, skip_summarization: true}`.
 - Limits: unpacked submission < 3 GiB; allowed extensions `.yaml/.yml/.md/.txt/.py(skills only)/.json/.safetensors` (no `.bin/.pt`); `max_output_tokens` and `thinking_budget` ≤ 32,768 (vLLM `max_model_len` on 4×L4).
 - Agent prompt gotchas: `submit_patch` diffs everything untracked in `/workspace` (put scratch scripts in `/tmp`), never touch the harness-written `/workspace/pytest.ini` / `conftest.py`, keep `edit_file` payloads small to avoid truncated tool calls.
