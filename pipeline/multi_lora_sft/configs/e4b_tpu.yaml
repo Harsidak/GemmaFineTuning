@@ -1,0 +1,103 @@
+# Gemma 4 E4B LoRA SFT on a TPU VM (e.g. Kaggle "TPU VM v5e-8": 8 chips x 16 GiB HBM) via torch_xla.
+#
+# - bf16 weights (no bitsandbytes on TPU), sharded across all chips with XLA SPMD FSDPv2 (`parallelism: spmd`).
+#   E4B's ~8B raw parameters (incl. per-layer embeddings) do not fit one 16 GiB chip unsharded.
+# - In SPMD mode `per_device_batch` is the GLOBAL batch and must be a multiple of the chip count (8).
+# - Sequences are padded to multiples of `pad_to_multiple_of` so XLA compiles a bounded set of graphs
+#   (max_seq_length / pad_to_multiple_of shapes); the first steps of each new length are slow (compilation).
+# - Eval (vLLM + swegemma) needs CUDA GPUs, so it is disabled here; the packaged submission.zip is still built.
+# - Untested on real TPU hardware at the time of writing: run a short calibration (run.mode=calibration) first.
+
+run:
+  name: e4b_tpu
+  mode: full
+  seed: 1234
+  output_root: /kaggle/working/runs
+
+budget:
+  session_hours: 9.0                     # Kaggle TPU sessions are shorter than GPU ones; set to your quota
+  safety_margin_min: 20.0
+  eval_min: 0.0
+  package_min: 5.0
+  export_min: 10.0
+  setup_max_min: 10.0
+  preflight_max_min: 15.0
+
+setup:
+  require_gpu: false
+
+model:
+  served_model_id: gemma-4-e4b-it-qat-w4a16-ct
+  quantization: bf16
+  attn_implementation: eager             # most robust attention path under XLA
+  skip_multimodal_towers: true
+
+data:
+  train_files: []                        # supply at launch via --set data.train_files=[...]
+  tasks_file: /kaggle/input/gemma-4-developer-agent/tasks.jsonl
+  successful_only: true
+  val_fraction: 0.05
+  val_max_examples: 64
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.0
+  target_regex: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+  exclude_kv_shared: true
+
+train:
+  backend: trl
+  accelerator: tpu
+  parallelism: spmd
+  lr: 1.0e-4
+  max_epochs: 2.0
+  max_seq_length: 8192
+  per_device_batch: 8                    # global batch in SPMD; one sequence per chip
+  grad_accum: 2                          # effective batch 16 (same as e4b_full on 4 GPUs)
+  pad_to_multiple_of: 512
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  longest_first_steps: 2                 # compile + OOM-probe the biggest shape first
+  checkpoint_every_min: 30.0
+  keep_checkpoints: 2
+  val_every_min: 60.0
+  log_every_steps: 5
+  sigterm_grace_sec: 90.0
+  oom_fallbacks:
+    - {max_seq_length: 6144}
+    - {max_seq_length: 4096}
+
+schedule:
+  warmup_steps: 20
+  decay_frac: 0.15
+  final_lr_ratio: 0.1
+
+loss:
+  impl: static                           # no data-dependent shapes (selective indexing recompiles on XLA)
+  chunk_rows: 2048
+  checkpoint_chunks: true
+
+adapters:
+  - name: main_lora
+    roles: [root]
+    time_share: null
+  - name: tool_lora
+    roles: [code_analyzer]
+    time_share: null
+    overrides:
+      lora: {r: 16, alpha: 32}
+      train: {max_seq_length: 4096}
+
+parity:
+  enabled: false                         # HF token-by-token generate recompiles per step on XLA
+
+submission:
+  served_model_id: gemma-4-e4b-it-qat-w4a16-ct
+  adapter_map:
+    main_lora: main_lora
+    tool_lora: tool_lora
+  working_zip_path: /kaggle/working/submission.zip
+
+eval:
+  enabled: false

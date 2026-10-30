@@ -12,6 +12,7 @@ Implements design_doc.md §3.4, §7.4, and §11:
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import re
@@ -19,8 +20,99 @@ from pathlib import Path
 from typing import Any
 
 from ..config import EffectiveAdapterConfig, LoraSection, PipelineConfig
+from .device import empty_cache, resolve_accelerator
 
 logger = logging.getLogger(__name__)
+
+
+class ModelLoadError(RuntimeError):
+    """Raised with an actionable message when a base or served checkpoint cannot be used."""
+
+
+_WEIGHT_SUFFIXES: tuple[str, ...] = (".safetensors", ".bin")
+
+
+def validate_model_dir(path: str | Path, label: str, *, for_training: bool) -> dict[str, Any]:
+    """Checks a local HF checkpoint before any expensive load and returns its parsed `config.json`.
+
+    Catches the failure modes that otherwise surface minutes into a run as an opaque traceback:
+    a wrong/partial Kaggle mount, a missing or truncated weight shard, a non-Gemma-4 checkpoint, and
+    pointing training at the served compressed-tensors (`-w4a16-ct`) checkpoint, which cannot be fine-tuned.
+    """
+    p = Path(path)
+    if not p.exists():
+        parent = p.parent
+        siblings = sorted(x.name for x in parent.iterdir())[:20] if parent.is_dir() else []
+        raise ModelLoadError(f"{label} does not exist: {p}" + (f" (parent contains: {siblings})" if siblings else ""))
+    if not p.is_dir():
+        raise ModelLoadError(f"{label} must be a checkpoint directory, got a file: {p}")
+
+    cfg_file = p / "config.json"
+    if not cfg_file.is_file():
+        found = sorted(x.name for x in p.iterdir())[:20]
+        raise ModelLoadError(
+            f"{label} has no config.json: {p} (contains {found}). Point it at the directory holding "
+            "config.json, e.g. .../transformers/<variant>/<version>"
+        )
+    try:
+        hf_cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ModelLoadError(f"{label}/config.json is unreadable or invalid JSON: {exc}") from exc
+
+    model_type = str(hf_cfg.get("model_type", ""))
+    if not model_type.startswith("gemma4"):
+        logger.warning("%s model_type is %r (expected gemma4*); continuing", label, model_type)
+
+    if not for_training:
+        return hf_cfg
+
+    quant = hf_cfg.get("quantization_config") or {}
+    quant_method = str(quant.get("quant_method", "")).lower()
+    if quant_method in {"compressed-tensors", "compressed_tensors", "gptq", "awq"}:
+        raise ModelLoadError(
+            f"{label} is a {quant_method} quantized serving checkpoint ({p}); LoRA training needs the unquantized "
+            "base (e.g. gemma-4-*-it-qat-q4_0-unquantized). Keep the -w4a16-ct checkpoint for model.served_path."
+        )
+
+    index_files = sorted(p.glob("*.safetensors.index.json")) + sorted(p.glob("pytorch_model*.bin.index.json"))
+    if index_files:
+        try:
+            index = json.loads(index_files[0].read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ModelLoadError(f"{label} weight index {index_files[0].name} is unreadable: {exc}") from exc
+        shards = sorted(set((index.get("weight_map") or {}).values()))
+        missing = [s for s in shards if not (p / s).is_file()]
+        empty = [s for s in shards if (p / s).is_file() and (p / s).stat().st_size == 0]
+        if missing or empty:
+            raise ModelLoadError(
+                f"{label} is incomplete: {len(missing)} missing and {len(empty)} empty shard(s) of {len(shards)} "
+                f"(first: {(missing or empty)[:3]}). The Kaggle model mount or download is partial."
+            )
+    elif not any(f.suffix in _WEIGHT_SUFFIXES and f.stat().st_size > 0 for f in p.iterdir() if f.is_file()):
+        raise ModelLoadError(f"{label} contains no non-empty weight files (*.safetensors / *.bin): {p}")
+
+    return hf_cfg
+
+
+def _text_dims(hf_cfg: dict[str, Any]) -> dict[str, Any]:
+    text = hf_cfg.get("text_config") or hf_cfg
+    return {k: text.get(k) for k in ("hidden_size", "num_hidden_layers", "num_attention_heads", "vocab_size")}
+
+
+def check_train_served_compat(train_cfg: dict[str, Any], served_cfg: dict[str, Any]) -> None:
+    """Adapters trained on one Gemma 4 size cannot load on another; fail before hours of training."""
+    t_dims, s_dims = _text_dims(train_cfg), _text_dims(served_cfg)
+    mismatched = {
+        k: (t_dims[k], s_dims[k])
+        for k in t_dims
+        if t_dims[k] is not None and s_dims[k] is not None and t_dims[k] != s_dims[k]
+    }
+    if mismatched:
+        raise ModelLoadError(
+            "model.train_base_path and model.served_path are different model sizes "
+            f"({ {k: f'train={a}, served={b}' for k, (a, b) in mismatched.items()} }); "
+            "LoRA adapters trained on one will fail to load on the other at scoring time."
+        )
 
 GEMMA4_SPECIAL_TOKENS: list[str] = [
     "<pad>",
@@ -269,19 +361,29 @@ def load_base_model_for_training(
     model_path = cfg.model.train_base_path
     if model_path in {None, "__tiny__"}:
         if tiny_fallback_dir is None:
-            raise ValueError("model.train_base_path is not set")
+            raise ModelLoadError("model.train_base_path is not set")
         model_path = str(save_tiny_gemma4_checkpoint(tiny_fallback_dir))
+    else:
+        validate_model_dir(model_path, "model.train_base_path", for_training=True)
 
+    accelerator = resolve_accelerator(eff_adapter.train.accelerator)
     quant = eff_adapter.model_quantization
-    has_cuda = torch.cuda.is_available()
+    has_cuda = accelerator == "cuda"
     torch_dtype = torch.float32 if quant == "fp32" else torch.bfloat16
 
     quant_config = None
     if quant == "nf4":
         if not has_cuda:
-            logger.warning("quantization='nf4' requested without CUDA; falling back to bfloat16 on CPU")
+            logger.warning("quantization='nf4' needs CUDA + bitsandbytes; falling back to bfloat16 on %s", accelerator)
             quant = "bf16"
         else:
+            try:
+                import bitsandbytes  # noqa: F401
+            except ImportError as exc:
+                raise ModelLoadError(
+                    "quantization='nf4' requires bitsandbytes, which is not installed; add it to the wheelhouse "
+                    "or use model.quantization=bf16"
+                ) from exc
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
@@ -290,17 +392,25 @@ def load_base_model_for_training(
                 llm_int8_skip_modules=["lm_head", "vision_tower", "audio_tower", "embed_vision", "embed_audio"],
             )
 
-    hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    local_only = Path(model_path).is_dir()
+    hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=local_only)
     if cfg.model.skip_multimodal_towers:
         if hasattr(hf_cfg, "vision_config"):
             hf_cfg.vision_config = None
         if hasattr(hf_cfg, "audio_config"):
             hf_cfg.audio_config = None
 
+    attn_impl = cfg.model.attn_implementation
+    if attn_impl == "flash_attention_2" and not has_cuda:
+        logger.warning("flash_attention_2 is CUDA-only; using sdpa on %s", accelerator)
+        attn_impl = "sdpa"
+
     load_kwargs: dict[str, Any] = {
         "config": hf_cfg,
         "dtype": torch_dtype,
-        "attn_implementation": cfg.model.attn_implementation,
+        "attn_implementation": attn_impl,
+        "local_files_only": local_only,
+        "low_cpu_mem_usage": True,
     }
     if quant_config is not None:
         load_kwargs["quantization_config"] = quant_config
@@ -318,8 +428,18 @@ def load_base_model_for_training(
             load_kwargs["device_map"] = {"": local_rank}
         else:
             load_kwargs["device_map"] = {"": 0}
+    # TPU/CPU: load on host; the Trainer moves (TPU single) or shards (TPU spmd) the model onto XLA devices.
 
-    model = Gemma4ForConditionalGeneration.from_pretrained(model_path, **load_kwargs)
+    try:
+        model = Gemma4ForConditionalGeneration.from_pretrained(model_path, **load_kwargs)
+    except Exception as exc:
+        # Keep the original text (an OOM stays recognisable to the orchestrator's fallback logic).
+        raise ModelLoadError(
+            f"Failed to load base model from {model_path} (quantization={quant}, accelerator={accelerator}, "
+            f"parallelism={parallelism}): {type(exc).__name__}: {exc}"
+        ) from exc
+
+    _assert_fully_materialised(model, parallelism)
     model.config.use_cache = False
     if hasattr(model.config, "text_config") and model.config.text_config is not None:
         model.config.text_config.use_cache = False
@@ -339,15 +459,40 @@ def load_base_model_for_training(
             use_gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": False},
         )
+    elif parallelism == "spmd":
+        # XLA FSDPv2 applies its own per-layer checkpointing (`xla_fsdp_grad_ckpt`); HF checkpointing on top
+        # would add a redundant all-gather in backward.
+        model.enable_input_require_grads()
     else:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
 
     gc.collect()
-    if has_cuda:
-        torch.cuda.empty_cache()
+    empty_cache(accelerator)
 
     return model
+
+
+def _assert_fully_materialised(model: Any, parallelism: str) -> None:
+    """Fails fast when `device_map="auto"` silently offloaded layers or weights stayed on `meta`.
+
+    Offload makes QLoRA training 10-100x slower (or crash in backward), so it is reported as an
+    out-of-memory condition to trigger the orchestrator's OOM fallback chain instead.
+    """
+    device_map = getattr(model, "hf_device_map", None) or {}
+    offloaded = sorted({k for k, v in device_map.items() if str(v) in {"cpu", "disk"}})
+    if offloaded and parallelism == "model_split":
+        raise ModelLoadError(
+            f"Insufficient accelerator memory (out of memory): device_map offloaded {len(offloaded)} module(s) to "
+            f"cpu/disk (first: {offloaded[:3]}). Lower model.max_memory_gib headroom, use nf4, or shorten "
+            "train.max_seq_length."
+        )
+    meta = [n for n, p in model.named_parameters() if p.device.type == "meta"]
+    if meta:
+        raise ModelLoadError(
+            f"{len(meta)} parameter(s) were never loaded (still on 'meta', first: {meta[:3]}); "
+            "the checkpoint does not match the model class or is missing shards."
+        )
 
 
 def attach_lora_adapter(model: Any, lora_cfg: LoraSection) -> tuple[Any, str, list[str]]:

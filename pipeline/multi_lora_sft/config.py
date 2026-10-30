@@ -50,6 +50,7 @@ class RunSection:
     resume_from: str | None = None
     session_start_env: str = "SESSION_T0"
     git_sha: str | None = None
+    hf_offline: bool = True  # sets HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE in phase subprocesses (no hub hangs)
 
 
 @dataclass
@@ -118,7 +119,8 @@ class LoraSection:
 @dataclass
 class TrainSection:
     backend: str = "trl"
-    parallelism: str = "model_split"  # "ddp" | "model_split" | "single"
+    accelerator: str = "auto"  # "auto" | "cuda" | "tpu" | "cpu"
+    parallelism: str = "model_split"  # "ddp" | "model_split" | "single" | "spmd" (TPU FSDPv2)
     num_processes: int | None = None
     lr: float = 1.0e-4
     max_epochs: float = 2.0
@@ -138,6 +140,11 @@ class TrainSection:
     throughput_project_step: int = 10
     max_restarts: int = 2
     min_restart_min: float = 20.0
+    pad_to_multiple_of: int | None = None  # static shapes; TPU uses 512 when unset
+    max_nonfinite_logs: int = 3  # consecutive NaN/Inf loss or grad-norm logs before aborting to the last checkpoint
+    sigterm_grace_sec: float = 60.0  # time a train subprocess gets after SIGTERM to save and exit
+    min_free_disk_gib: float = 2.0  # skip (not crash) a wall-clock checkpoint when free disk would drop below this
+    emergency_checkpoint: bool = True  # save adapter + state when training crashes mid-run (never on NaN)
     oom_fallbacks: list[dict[str, Any]] = field(
         default_factory=lambda: [{"max_seq_length": 12288}, {"max_seq_length": 8192}]
     )
@@ -153,9 +160,10 @@ class ScheduleSection:
 
 @dataclass
 class LossSection:
-    impl: str = "selective"  # "selective" | "liger"
+    impl: str = "selective"  # "selective" | "static" (XLA-friendly) | "liger" (alias of selective)
     chunk_rows: int = 4096
     tool_call_weight: float = 1.0
+    checkpoint_chunks: bool = True  # recompute per-chunk logits in backward instead of storing [N, vocab] fp32
 
 
 @dataclass
@@ -176,6 +184,29 @@ class ParitySection:
 
 
 @dataclass
+class GenerationSection:
+    """`configs/sampling.yaml` written into the submission: the served agent's decoding settings."""
+
+    temperature: float = 0.2
+    top_p: float = 0.95
+    top_k: int | None = None
+    seed: int | None = None
+    max_output_tokens: int = 16384
+    thinking_budget: int = 4096
+    include_thoughts: bool = True
+
+
+@dataclass
+class EvalBudgetSection:
+    """`eval_config.yaml` written into the submission: per-task scorer budgets (HARNESS §7.1)."""
+
+    timeout_seconds: int = 300
+    max_tool_calls: int = 100
+    max_time_minutes: float = 60.0
+    max_turns: int = 500
+
+
+@dataclass
 class SubmissionSection:
     template_dir: str | None = None
     served_model_id: str | None = None
@@ -184,6 +215,10 @@ class SubmissionSection:
     )
     fallback_adapters_dir: str | None = None
     working_zip_path: str | None = "/kaggle/working/submission.zip"
+    write_generation_config: bool = True  # overwrite the template's configs/sampling.yaml with `generation`
+    write_eval_config: bool = True  # overwrite the template's eval_config.yaml (the sample ships 1 min / 10 calls)
+    generation: GenerationSection = field(default_factory=GenerationSection)
+    eval_budget: EvalBudgetSection = field(default_factory=EvalBudgetSection)
 
 
 @dataclass
@@ -432,6 +467,8 @@ _SECTION_CLASSES: dict[str, type] = {
     "LossSection": LossSection,
     "ParitySection": ParitySection,
     "SubmissionSection": SubmissionSection,
+    "GenerationSection": GenerationSection,
+    "EvalBudgetSection": EvalBudgetSection,
     "EvalSection": EvalSection,
     "VllmEvalSection": VllmEvalSection,
 }
@@ -518,13 +555,40 @@ def _validate_lora_section(lora: LoraSection, label: str) -> None:
             )
 
 
-def _validate_train_section(train: TrainSection, label: str) -> None:
+def _validate_train_section(train: TrainSection, label: str, quantization: str | None = None) -> None:
     if train.backend not in {"trl"}:
         raise ConfigError(f"{label}.backend {train.backend!r} is not supported in v1 (expected 'trl')")
-    if train.parallelism not in {"ddp", "model_split", "single"}:
+    if train.accelerator not in {"auto", "cuda", "tpu", "cpu"}:
         raise ConfigError(
-            f"{label}.parallelism must be 'ddp', 'model_split', or 'single', got {train.parallelism!r}"
+            f"{label}.accelerator must be 'auto', 'cuda', 'tpu', or 'cpu', got {train.accelerator!r}"
         )
+    if train.parallelism not in {"ddp", "model_split", "single", "spmd"}:
+        raise ConfigError(
+            f"{label}.parallelism must be 'ddp', 'model_split', 'single', or 'spmd', got {train.parallelism!r}"
+        )
+    if train.parallelism == "spmd" and train.accelerator not in {"tpu", "auto"}:
+        raise ConfigError(f"{label}.parallelism='spmd' (XLA FSDPv2) requires accelerator 'tpu'")
+    if train.accelerator == "tpu":
+        if train.parallelism in {"ddp", "model_split"}:
+            raise ConfigError(
+                f"{label}.parallelism={train.parallelism!r} is CUDA-only; with accelerator 'tpu' use 'spmd' "
+                "(shard over all TPU cores) or 'single' (one core)"
+            )
+        if quantization == "nf4":
+            raise ConfigError(f"{label}: quantization 'nf4' needs bitsandbytes + CUDA and cannot run on TPU; use 'bf16'")
+        for idx, fb in enumerate(train.oom_fallbacks):
+            if isinstance(fb, dict) and fb.get("quantization") == "nf4":
+                raise ConfigError(f"{label}.oom_fallbacks[{idx}] switches to nf4, which is unavailable on TPU")
+    if train.pad_to_multiple_of is not None and train.pad_to_multiple_of < 1:
+        raise ConfigError(f"{label}.pad_to_multiple_of must be >= 1 when set, got {train.pad_to_multiple_of}")
+    if train.max_nonfinite_logs < 1:
+        raise ConfigError(f"{label}.max_nonfinite_logs must be >= 1")
+    if train.sigterm_grace_sec < 0 or train.min_free_disk_gib < 0:
+        raise ConfigError(f"{label}.sigterm_grace_sec and min_free_disk_gib must be >= 0")
+    if train.checkpoint_every_min <= 0 or train.val_every_min <= 0:
+        raise ConfigError(f"{label}.checkpoint_every_min and val_every_min must be > 0")
+    if train.weight_decay < 0 or train.max_grad_norm <= 0:
+        raise ConfigError(f"{label}.weight_decay must be >= 0 and max_grad_norm > 0")
     if train.lr <= 0:
         raise ConfigError(f"{label}.lr must be > 0, got {train.lr}")
     if train.max_epochs <= 0:
@@ -566,8 +630,8 @@ def _validate_schedule_section(sched: ScheduleSection, label: str) -> None:
 
 
 def _validate_loss_section(loss: LossSection, label: str) -> None:
-    if loss.impl not in {"selective", "liger"}:
-        raise ConfigError(f"{label}.impl must be 'selective' or 'liger', got {loss.impl!r}")
+    if loss.impl not in {"selective", "static", "liger"}:
+        raise ConfigError(f"{label}.impl must be 'selective', 'static', or 'liger', got {loss.impl!r}")
     if loss.chunk_rows < 1:
         raise ConfigError(f"{label}.chunk_rows must be >= 1, got {loss.chunk_rows}")
     if loss.tool_call_weight <= 0.0:
@@ -641,7 +705,7 @@ def validate_config(cfg: PipelineConfig) -> None:
 
     # Global sections
     _validate_lora_section(cfg.lora, "lora")
-    _validate_train_section(cfg.train, "train")
+    _validate_train_section(cfg.train, "train", cfg.model.quantization)
     _validate_schedule_section(cfg.schedule, "schedule")
     _validate_loss_section(cfg.loss, "loss")
 
@@ -669,7 +733,7 @@ def validate_config(cfg: PipelineConfig) -> None:
 
         eff = cfg.resolve_adapter(spec)
         _validate_lora_section(eff.lora, f"adapters[{spec.name}].lora")
-        _validate_train_section(eff.train, f"adapters[{spec.name}].train")
+        _validate_train_section(eff.train, f"adapters[{spec.name}].train", eff.model_quantization)
         _validate_schedule_section(eff.schedule, f"adapters[{spec.name}].schedule")
         _validate_loss_section(eff.loss, f"adapters[{spec.name}].loss")
         if eff.model_quantization not in {"bf16", "nf4", "fp32"}:
@@ -688,6 +752,35 @@ def validate_config(cfg: PipelineConfig) -> None:
             raise ConfigError(f"Invalid submission.adapter_map key {slot_name!r}")
         if not isinstance(target_name, str) or not ADAPTER_NAME_RE.match(target_name):
             raise ConfigError(f"Invalid submission.adapter_map target {target_name!r}")
+
+    # Served-agent generation + scorer budget validation (HARNESS §2.4, §7.1)
+    gen = cfg.submission.generation
+    if gen.temperature < 0.0:
+        raise ConfigError(f"submission.generation.temperature must be >= 0, got {gen.temperature}")
+    if not (0.0 < gen.top_p <= 1.0):
+        raise ConfigError(f"submission.generation.top_p must be in (0.0, 1.0], got {gen.top_p}")
+    if gen.top_k is not None and gen.top_k < 1:
+        raise ConfigError(f"submission.generation.top_k must be >= 1 when set, got {gen.top_k}")
+    if not (1 <= gen.max_output_tokens <= MAX_CONTEXT_TOKENS):
+        raise ConfigError(
+            f"submission.generation.max_output_tokens must be in 1..{MAX_CONTEXT_TOKENS}, got {gen.max_output_tokens}"
+        )
+    if not (0 <= gen.thinking_budget <= MAX_CONTEXT_TOKENS):
+        raise ConfigError(
+            f"submission.generation.thinking_budget must be in 0..{MAX_CONTEXT_TOKENS}, got {gen.thinking_budget}"
+        )
+    if gen.thinking_budget >= gen.max_output_tokens:
+        raise ConfigError(
+            "submission.generation.thinking_budget must be < max_output_tokens; otherwise thinking can use the whole "
+            "output and truncate the tool call (HARNESS §10.1)"
+        )
+    eb = cfg.submission.eval_budget
+    if eb.timeout_seconds < 1 or eb.max_tool_calls < 1 or eb.max_time_minutes <= 0:
+        raise ConfigError(
+            "submission.eval_budget: timeout_seconds and max_tool_calls must be >= 1, max_time_minutes > 0"
+        )
+    if not (1 <= eb.max_turns <= 500):
+        raise ConfigError(f"submission.eval_budget.max_turns must be in 1..500, got {eb.max_turns}")
 
     # Eval validation
     if cfg.eval.vllm.max_model_len > MAX_CONTEXT_TOKENS or cfg.eval.vllm.max_model_len < 512:

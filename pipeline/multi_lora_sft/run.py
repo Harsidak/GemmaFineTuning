@@ -34,15 +34,11 @@ from .runctx import (
     configure_phase_logging,
     utc_iso,
 )
+from .training.device import OOM_SIGNATURES, is_oom_text
 
 CommandBuilder = Callable[[str, RunContext, float, dict[str, Any] | None], list[str]]
 
-OOM_SIGNATURES: tuple[str, ...] = (
-    "out of memory",
-    "cuda error: out of memory",
-    "cublas_status_alloc_failed",
-    "hip out of memory",
-)
+__all__ = ["OOM_SIGNATURES", "Orchestrator", "OrchestratorResult", "main"]
 
 
 @dataclass
@@ -146,15 +142,37 @@ def default_phase_command_builder(
 
 
 def _detect_oom(log_file: Path, status_dict: dict[str, Any] | None) -> bool:
-    if status_dict and status_dict.get("error"):
-        err_low = str(status_dict["error"]).lower()
-        if any(sig in err_low for sig in OOM_SIGNATURES):
-            return True
+    if status_dict and is_oom_text(str(status_dict.get("error") or "")):
+        return True
     if log_file.is_file():
-        tail = log_file.read_text(encoding="utf-8", errors="replace")[-16384:].lower()
-        if any(sig in tail for sig in OOM_SIGNATURES):
+        # Only this attempt's output: earlier attempts in the same log already triggered their own fallback.
+        text = log_file.read_text(encoding="utf-8", errors="replace")
+        last_launch = text.rfind("--- [")
+        if is_oom_text(text[max(last_launch, 0):][-16384:]):
             return True
     return False
+
+
+def phase_subprocess_env(cfg: PipelineConfig, repo_root: str) -> dict[str, str]:
+    """Environment for phase subprocesses: offline hub, allocator tuning, and TPU runtime selection."""
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    existing_pp = env.get("PYTHONPATH", "")
+    if repo_root not in existing_pp.split(os.pathsep):
+        env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+    if cfg.run.hf_offline:
+        # Kaggle scoring/training sessions have no internet: never let from_pretrained stall on hub lookups.
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
+        env.setdefault("HF_DATASETS_OFFLINE", "1")
+    # Fewer fragmentation OOMs on long, variable-length sequences.
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    accelerators = {cfg.train.accelerator} | {cfg.resolve_adapter(a).train.accelerator for a in cfg.adapters}
+    if "tpu" in accelerators:
+        env.setdefault("PJRT_DEVICE", "TPU")
+    return env
 
 
 class Orchestrator:
@@ -188,13 +206,11 @@ class Orchestrator:
         log_file = self.ctx.log_path(phase)
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
-        env = dict(os.environ)
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUNBUFFERED"] = "1"
         repo_root = str(Path(__file__).resolve().parents[2])
-        existing_pp = env.get("PYTHONPATH", "")
-        if repo_root not in existing_pp.split(os.pathsep):
-            env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+        env = phase_subprocess_env(self.cfg, repo_root)
+        grace_sec = 3.0
+        if phase.startswith("train:"):
+            grace_sec = max(3.0, self.cfg.resolve_adapter(phase.split(":", 1)[1]).train.sigterm_grace_sec)
 
         popen_kwargs: dict[str, Any] = {
             "cwd": repo_root,
@@ -228,8 +244,10 @@ class Orchestrator:
             while proc.poll() is None:
                 if self.clock.now() >= deadline:
                     timed_out = True
-                    self.logger.warning("Phase %s reached hard deadline; terminating process tree", phase)
-                    _terminate_process_tree(proc)
+                    self.logger.warning(
+                        "Phase %s reached hard deadline; terminating process tree (grace %.0fs)", phase, grace_sec
+                    )
+                    _terminate_process_tree(proc, grace_sec=grace_sec)
                     break
                 time.sleep(self.poll_interval_sec)
 

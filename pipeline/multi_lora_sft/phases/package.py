@@ -128,6 +128,60 @@ def remove_yaml_adapter_line(yaml_path: Path, slot_name: str) -> bool:
     return removed
 
 
+def write_generation_and_eval_configs(cfg: PipelineConfig, submission_dir: Path) -> list[str]:
+    """Writes `configs/sampling.yaml` and `eval_config.yaml` from the run config; returns notes.
+
+    The bundled sample template ships `eval_config.yaml` with `max_time_minutes: 1` and `max_tool_calls: 10`,
+    which would cap every scored task at one minute; it must never reach a real submission unchanged.
+    """
+    notes: list[str] = []
+    sub = cfg.submission
+    if sub.write_generation_config:
+        gen = sub.generation
+        sampling: dict[str, Any] = {"temperature": float(gen.temperature), "top_p": float(gen.top_p)}
+        if gen.top_k is not None:
+            sampling["top_k"] = int(gen.top_k)
+        if gen.seed is not None:
+            sampling["seed"] = int(gen.seed)
+        sampling["max_output_tokens"] = int(gen.max_output_tokens)
+        # `thinking_level` is deliberately never written: it breaks vLLM LoRA serving (HARNESS §2.4).
+        sampling["thinking_config"] = {
+            "thinking_budget": int(gen.thinking_budget),
+            "include_thoughts": bool(gen.include_thoughts),
+        }
+        samp_path = submission_dir / "configs" / "sampling.yaml"
+        samp_path.parent.mkdir(parents=True, exist_ok=True)
+        samp_path.write_text(yaml.safe_dump(sampling, sort_keys=False), encoding="utf-8")
+        referenced = any(
+            "configs/sampling.yaml" in f.read_text(encoding="utf-8") for f in _agent_yaml_files(submission_dir)
+        )
+        if not referenced:
+            notes.append("configs/sampling.yaml written but no agent YAML !includes it; generation settings unused")
+    if sub.write_eval_config:
+        eb = sub.eval_budget
+        eval_cfg = {
+            "evaluation": {
+                "timeout_seconds": int(eb.timeout_seconds),
+                "max_tool_calls": int(eb.max_tool_calls),
+                "max_time_minutes": float(eb.max_time_minutes),
+                "max_turns": int(eb.max_turns),
+            }
+        }
+        (submission_dir / "eval_config.yaml").write_text(
+            "# Per-task scorer budgets written by pipeline.multi_lora_sft (submission.eval_budget).\n"
+            + yaml.safe_dump(eval_cfg, sort_keys=False),
+            encoding="utf-8",
+        )
+    else:
+        existing = submission_dir / "eval_config.yaml"
+        if existing.is_file():
+            data = yaml.safe_load(existing.read_text(encoding="utf-8")) or {}
+            minutes = float((data.get("evaluation") or {}).get("max_time_minutes") or 60)
+            if minutes < 5:
+                notes.append(f"Template eval_config.yaml caps tasks at {minutes} min; scored runs will be crippled")
+    return notes
+
+
 def _agent_yaml_files(submission_dir: Path) -> list[Path]:
     files: list[Path] = []
     for root_name in ("agent.yaml", "agent.yml", "root_agent.yaml", "root_agent.yml"):
@@ -433,6 +487,11 @@ def run_package_phase(
         adapters_dir = ctx.submission_dir / "adapters"
         if adapters_dir.is_dir() and not any(adapters_dir.iterdir()):
             adapters_dir.rmdir()
+
+        # Served-agent decoding + per-task scorer budgets from the run config
+        for msg in write_generation_and_eval_configs(cfg, ctx.submission_dir):
+            notes.append(msg)
+            logger.warning(msg)
 
         # 3. Validate staged submission
         validation_info = validate_staged_submission(ctx.submission_dir, expected_served_model=served_id)

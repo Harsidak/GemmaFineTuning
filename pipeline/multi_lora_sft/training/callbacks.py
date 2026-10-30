@@ -7,21 +7,26 @@ Implements design_doc.md §7.8 and §7.9:
 - Triggers validation every `val_every_min` wall-clock minutes.
 - Saves resumable wall-clock checkpoints every `checkpoint_every_min` minutes under
   `runs/<run_id>/checkpoints/<adapter>/step_<n>/`, retaining the last `keep_checkpoints`.
+  Step numbers are *global* (resumed offset + segment step), so checkpoints written after a resume sort
+  after the ones they resumed from.
+- Aborts with `NonFiniteLossError` after `max_nonfinite_logs` consecutive NaN/Inf loss or grad-norm logs, so the
+  orchestrator restarts from the last good checkpoint instead of training on (and saving) corrupt weights.
+- Stops cleanly when `stop_requested()` turns true (SIGTERM from the orchestrator's deadline).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import random
+import math
 import re
 import shutil
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from transformers import (
     TrainerCallback,
@@ -30,10 +35,33 @@ from transformers import (
     TrainingArguments,
 )
 
+from .device import capture_rng_state, cpu_state_dict, peak_memory_mb, save_object
 from .loss import unwrap_causal_lm
 from .schedule import WSDScheduleController
 
 logger = logging.getLogger(__name__)
+
+
+class NonFiniteLossError(RuntimeError):
+    """Training produced NaN/Inf loss or gradients for several consecutive logging windows."""
+
+
+def _dir_size_bytes(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def save_adapter_weights(model: Any, out_dir: Path, accelerator: str = "cpu") -> None:
+    """PEFT `save_pretrained`; on XLA the LoRA tensors are synced and copied to host first.
+
+    The host copy keeps the raw (adapter-name-qualified) keys so PEFT's own filtering in `save_pretrained`
+    still selects them; passing an already-converted PEFT state dict would filter everything out.
+    """
+    unwrapped = model.module if hasattr(model, "module") else model
+    if accelerator != "tpu":
+        unwrapped.save_pretrained(out_dir)
+        return
+    raw = {k: v for k, v in unwrapped.state_dict().items() if "lora_" in k}
+    unwrapped.save_pretrained(out_dir, state_dict=cpu_state_dict(raw, accelerator))
 
 
 def inspect_dead_lora_modules(model: Any) -> dict[str, Any]:
@@ -86,62 +114,83 @@ def save_wallclock_checkpoint(
     samples_in_epoch: int,
     keep_checkpoints: int,
     is_main_process: bool = True,
+    accelerator: str = "cpu",
+    min_free_disk_gib: float = 0.0,
+    reason: str = "wallclock",
 ) -> Path | None:
-    """Writes a self-contained resumable checkpoint directory `step_<n>/` and prunes old ones (§7.8)."""
+    """Writes a self-contained resumable checkpoint directory `step_<n>/` and prunes old ones (§7.8).
+
+    Disk safety (Kaggle `/kaggle/working` is ~20 GiB): before writing, the expected size (the previous
+    checkpoint's size, else 4x the adapter) is compared with free space. Older checkpoints beyond the newest
+    one are pruned first if needed; if space is still short the save is skipped with a warning instead of
+    crashing training with `ENOSPC`. Returns None when nothing was written.
+    """
     if not is_main_process:
         return None
+
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    existing = list_checkpoints(checkpoint_root)
+    expected = _dir_size_bytes(existing[-1]) if existing else 0
+    if not expected:
+        expected = 4 * sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
+    floor = int(min_free_disk_gib * 1024**3)
+    if shutil.disk_usage(checkpoint_root).free - expected < floor:
+        for old in existing[:-1]:
+            shutil.rmtree(old, ignore_errors=True)
+        if shutil.disk_usage(checkpoint_root).free - expected < floor:
+            logger.warning(
+                "Skipping %s checkpoint at step %d: %.2f GiB free, need ~%.2f GiB + %.1f GiB floor",
+                reason,
+                step,
+                shutil.disk_usage(checkpoint_root).free / 1024**3,
+                expected / 1024**3,
+                min_free_disk_gib,
+            )
+            return None
 
     ckpt_dir = checkpoint_root / f"step_{step:06d}"
     tmp_dir = checkpoint_root / f".tmp_step_{step:06d}"
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    unwrapped = model.module if hasattr(model, "module") else model
-    adapter_dir = tmp_dir / "adapter"
-    unwrapped.save_pretrained(adapter_dir)
+    try:
+        save_adapter_weights(model, tmp_dir / "adapter", accelerator)
+        if optimizer is not None:
+            save_object(optimizer.state_dict(), tmp_dir / "optimizer.pt", accelerator)
+        if scheduler is not None:
+            torch.save(scheduler.state_dict(), tmp_dir / "scheduler.pt")
+        torch.save(capture_rng_state(accelerator), tmp_dir / "rng_state.pt")
 
-    if optimizer is not None:
-        torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
-    if scheduler is not None:
-        torch.save(scheduler.state_dict(), tmp_dir / "scheduler.pt")
+        meta = {
+            "step": int(step),
+            "epoch": float(epoch),
+            "elapsed_sec": wsd_controller.total_elapsed_sec(),
+            "schedule_state": wsd_controller.state_dict(),
+            "sampler_state": sampler.state_dict(samples_in_epoch) if sampler is not None else None,
+            "saved_at_ts": time.time(),
+            "reason": reason,
+            "accelerator": accelerator,
+        }
+        (tmp_dir / "trainer_resume.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
-    rng_state: dict[str, Any] = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch_cpu": torch.get_rng_state(),
-    }
-    if torch.cuda.is_available():
-        rng_state["torch_cuda"] = torch.cuda.get_rng_state_all()
-    torch.save(rng_state, tmp_dir / "rng_state.pt")
-
-    meta = {
-        "step": int(step),
-        "epoch": float(epoch),
-        "elapsed_sec": wsd_controller.total_elapsed_sec(),
-        "schedule_state": wsd_controller.state_dict(),
-        "sampler_state": sampler.state_dict(samples_in_epoch) if sampler is not None else None,
-        "saved_at_ts": time.time(),
-    }
-    (tmp_dir / "trainer_resume.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
+    # Atomic publish: the step dir only ever exists in complete form.
     shutil.rmtree(ckpt_dir, ignore_errors=True)
     tmp_dir.rename(ckpt_dir)
 
-    # Prune older step_* checkpoints beyond `keep_checkpoints`
-    existing = sorted(
-        (d for d in checkpoint_root.glob("step_*") if d.is_dir() and (d / "trainer_resume.json").is_file()),
-        key=lambda d: int(d.name.split("_", 1)[1]),
-    )
+    existing = list_checkpoints(checkpoint_root)
     while len(existing) > max(1, int(keep_checkpoints)):
-        old = existing.pop(0)
-        shutil.rmtree(old, ignore_errors=True)
+        shutil.rmtree(existing.pop(0), ignore_errors=True)
 
     return ckpt_dir
 
 
-def find_latest_checkpoint(checkpoint_root: Path) -> Path | None:
+def list_checkpoints(checkpoint_root: Path) -> list[Path]:
+    """Complete `step_*` checkpoints sorted oldest -> newest by global step."""
     if not checkpoint_root.exists():
-        return None
+        return []
     candidates = [
         d
         for d in checkpoint_root.glob("step_*")
@@ -149,10 +198,25 @@ def find_latest_checkpoint(checkpoint_root: Path) -> Path | None:
         and (d / "trainer_resume.json").is_file()
         and (d / "adapter" / "adapter_model.safetensors").is_file()
     ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda d: int(d.name.split("_", 1)[1]))
-    return candidates[-1]
+    return sorted(candidates, key=lambda d: int(d.name.split("_", 1)[1]))
+
+
+def find_latest_checkpoint(checkpoint_root: Path) -> Path | None:
+    found = list_checkpoints(checkpoint_root)
+    return found[-1] if found else None
+
+
+def checkpoint_is_loadable(ckpt: Path) -> bool:
+    """Cheap integrity check: resume metadata parses and the safetensors header is readable."""
+    try:
+        json.loads((ckpt / "trainer_resume.json").read_text(encoding="utf-8"))
+        from safetensors import safe_open
+
+        with safe_open(str(ckpt / "adapter" / "adapter_model.safetensors"), framework="pt") as fh:
+            return len(list(fh.keys())) > 0
+    except Exception as exc:  # noqa: BLE001 - any failure means "do not resume from this one"
+        logger.warning("Checkpoint %s is unreadable (%s); skipping it", ckpt, exc)
+        return False
 
 
 class MultiLoraTrainingCallback(TrainerCallback):
@@ -176,8 +240,20 @@ class MultiLoraTrainingCallback(TrainerCallback):
         dead_check_step: int = 50,
         throughput_project_step: int = 10,
         has_eval_dataset: bool = False,
+        step_offset: int = 0,
+        accelerator: str = "cpu",
+        min_free_disk_gib: float = 0.0,
+        max_nonfinite_logs: int = 3,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.adapter_name = adapter_name
+        self.step_offset = max(0, int(step_offset))
+        self.accelerator = accelerator
+        self.min_free_disk_gib = float(min_free_disk_gib)
+        self.max_nonfinite_logs = max(1, int(max_nonfinite_logs))
+        self.stop_requested = stop_requested
+        self.nonfinite_streak = 0
+        self.stopped_by_signal = False
         self.wsd = wsd_controller
         self.metrics_jsonl_path = metrics_jsonl_path
         self.checkpoint_root = checkpoint_root
@@ -201,6 +277,8 @@ class MultiLoraTrainingCallback(TrainerCallback):
         self.cumulative_all_tokens = 0
         self.cumulative_sup_tokens = 0
         self.samples_in_epoch = 0
+        # A resumed sampler starts mid-epoch; count from that offset so the next checkpoint's offset is absolute.
+        self._pending_resume_offset = int(getattr(sampler, "resume_offset", 0) or 0)
 
         self.dead_check_result: dict[str, Any] | None = None
         self.throughput_projection: dict[str, Any] | None = None
@@ -211,17 +289,42 @@ class MultiLoraTrainingCallback(TrainerCallback):
     def bind_trainer(self, trainer: Any) -> None:
         self._trainer_ref = trainer
 
+    def global_step(self, state: TrainerState) -> int:
+        return self.step_offset + int(state.global_step)
+
+    def save_checkpoint(self, state: TrainerState, model: Any, *, reason: str) -> Path | None:
+        """Writes a resumable checkpoint at the current global step (used by timers, SIGTERM, and crashes)."""
+        if self._trainer_ref is None or model is None:
+            return None
+        return save_wallclock_checkpoint(
+            checkpoint_root=self.checkpoint_root,
+            step=self.global_step(state),
+            epoch=float(state.epoch or 0.0),
+            model=model,
+            optimizer=self._trainer_ref.optimizer,
+            scheduler=self._trainer_ref.lr_scheduler,
+            wsd_controller=self.wsd,
+            sampler=self.sampler,
+            samples_in_epoch=self.samples_in_epoch,
+            keep_checkpoints=self.keep_checkpoints,
+            is_main_process=state.is_world_process_zero,
+            accelerator=self.accelerator,
+            min_free_disk_gib=self.min_free_disk_gib,
+            reason=reason,
+        )
+
     def on_epoch_begin(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
     ) -> TrainerControl:
-        self.samples_in_epoch = 0
+        self.samples_in_epoch = self._pending_resume_offset
+        self._pending_resume_offset = 0
         return control
 
     def on_step_end(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
     ) -> TrainerControl:
         now = self.wsd.now()
-        self.wsd.on_step_end(state.global_step, now=now)
+        self.wsd.on_step_end(self.global_step(state), now=now)
 
         step_all = float(self.metrics_tracker.get("step_total_tokens", 0.0)) * max(1, args.world_size)
         step_sup = float(self.metrics_tracker.get("step_supervised_tokens", 0.0)) * max(1, args.world_size)
@@ -277,20 +380,16 @@ class MultiLoraTrainingCallback(TrainerCallback):
 
         # Wall-clock checkpoint trigger (§7.8)
         if (now - self._last_ckpt_ts) >= self.ckpt_every_sec and self._trainer_ref is not None and model is not None:
-            save_wallclock_checkpoint(
-                checkpoint_root=self.checkpoint_root,
-                step=state.global_step,
-                epoch=float(state.epoch or 0.0),
-                model=model,
-                optimizer=self._trainer_ref.optimizer,
-                scheduler=self._trainer_ref.lr_scheduler,
-                wsd_controller=self.wsd,
-                sampler=self.sampler,
-                samples_in_epoch=self.samples_in_epoch,
-                keep_checkpoints=self.keep_checkpoints,
-                is_main_process=is_main,
-            )
+            self.save_checkpoint(state, model, reason="wallclock")
             self._last_ckpt_ts = now
+
+        # External stop (SIGTERM at the orchestrator's hard deadline): stop now, the caller saves final weights.
+        if self.stop_requested is not None and self.stop_requested():
+            if is_main and not self.stopped_by_signal:
+                logger.warning("[%s] Stop requested by signal at step %d", self.adapter_name, self.global_step(state))
+            self.stopped_by_signal = True
+            control.should_training_stop = True
+            return control
 
         # Time-budget / WSD stop check (§7.6)
         if self.wsd.should_stop(now):
@@ -314,7 +413,33 @@ class MultiLoraTrainingCallback(TrainerCallback):
         logs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        if not state.is_world_process_zero or not logs:
+        if not logs:
+            return
+
+        # NaN/Inf guard runs on every rank so all ranks abort together (requires logging_nan_inf_filter=False).
+        if "loss" in logs:
+            loss_val = float(logs["loss"])
+            gn = logs.get("grad_norm")
+            bad = not math.isfinite(loss_val) or (gn is not None and not math.isfinite(float(gn)))
+            self.nonfinite_streak = self.nonfinite_streak + 1 if bad else 0
+            if bad:
+                logger.warning(
+                    "[%s] Non-finite loss/grad_norm at step %d (loss=%s, grad_norm=%s) [%d/%d]",
+                    self.adapter_name,
+                    self.global_step(state),
+                    loss_val,
+                    gn,
+                    self.nonfinite_streak,
+                    self.max_nonfinite_logs,
+                )
+            if self.nonfinite_streak >= self.max_nonfinite_logs:
+                raise NonFiniteLossError(
+                    f"[{self.adapter_name}] {self.nonfinite_streak} consecutive non-finite loss/grad-norm logs at "
+                    f"step {self.global_step(state)}; aborting so the run restarts from the last good checkpoint. "
+                    "Lower train.lr, raise schedule.warmup_steps, or check data for empty supervision."
+                )
+
+        if not state.is_world_process_zero:
             return
 
         now = self.wsd.now()
@@ -337,15 +462,11 @@ class MultiLoraTrainingCallback(TrainerCallback):
         self._window_all_tokens = 0.0
         self._window_sup_tokens = 0.0
 
-        gpu_peak_mb: list[float] = []
-        if torch.cuda.is_available():
-            gpu_peak_mb = [
-                round(torch.cuda.max_memory_allocated(i) / (1024 * 1024), 1)
-                for i in range(torch.cuda.device_count())
-            ]
+        gpu_peak_mb = peak_memory_mb(self.accelerator)
 
         entry = {
-            "step": state.global_step,
+            "step": self.global_step(state),
+            "segment_step": state.global_step,
             "epoch": round(float(state.epoch or 0.0), 4),
             "elapsed_sec": round(self.wsd.total_elapsed_sec(now), 2),
             "lr": float(logs.get("learning_rate", 0.0)),

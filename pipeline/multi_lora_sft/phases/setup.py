@@ -131,28 +131,33 @@ def run_setup_phase(ctx: RunContext, cfg: PipelineConfig | None = None, deadline
             notes.append(f"Eval enabled, but optional eval packages missing at setup: {missing_eval}")
             logger.warning("Optional eval packages missing: %s", missing_eval)
 
-        import torch
+        from ..training.device import accelerator_inventory, resolve_accelerator
 
-        has_cuda = torch.cuda.is_available()
-        gpu_count = torch.cuda.device_count() if has_cuda else 0
-        gpus: list[dict[str, Any]] = []
-        if has_cuda:
-            for idx in range(gpu_count):
-                props = torch.cuda.get_device_properties(idx)
-                gpus.append(
-                    {
-                        "index": idx,
-                        "name": props.name,
-                        "total_memory_gib": round(props.total_memory / (1024**3), 2),
-                    }
-                )
+        inventory = accelerator_inventory()
+        gpus: list[dict[str, Any]] = inventory["cuda"]
+        gpu_count = len(gpus)
+        accelerators: dict[str, str] = {}
+        for spec in cfg.adapters:
+            requested = cfg.resolve_adapter(spec).train.accelerator
+            accelerators[spec.name] = resolve_accelerator(requested)  # raises with an install hint if missing
+        outputs["accelerator_inventory"] = inventory
+        outputs["resolved_accelerators"] = accelerators
+        uses_tpu = "tpu" in accelerators.values()
 
-        if cfg.setup.require_gpu and gpu_count == 0:
-            raise RuntimeError("setup.require_gpu=True, but torch.cuda.is_available() is False")
-        if cfg.setup.expected_gpu_count is not None and gpu_count != cfg.setup.expected_gpu_count:
+        if cfg.setup.require_gpu and gpu_count == 0 and not uses_tpu:
+            raise RuntimeError("setup.require_gpu=True, but torch.cuda.is_available() is False and no TPU is in use")
+        if cfg.setup.expected_gpu_count is not None and not uses_tpu and gpu_count != cfg.setup.expected_gpu_count:
             raise RuntimeError(
                 f"Expected {cfg.setup.expected_gpu_count} GPU(s), found {gpu_count}"
             )
+        if "cpu" in accelerators.values() and cfg.run.mode == "full" and cfg.model.train_base_path not in {None, "__tiny__"}:
+            msg = "Full-mode training resolved to CPU (no GPU/TPU visible); this will be extremely slow"
+            notes.append(msg)
+            logger.warning(msg)
+        if uses_tpu and cfg.eval.enabled:
+            msg = "Eval uses vLLM on CUDA GPUs; on a TPU session set eval.enabled=false (the zip is still packaged)"
+            notes.append(msg)
+            logger.warning(msg)
 
         # Input path verification (§6.2)
         if not cfg.data.train_files:
@@ -161,15 +166,31 @@ def run_setup_phase(ctx: RunContext, cfg: PipelineConfig | None = None, deadline
             if not Path(tf).is_file():
                 raise FileNotFoundError(f"Training file not found: {tf}")
 
-        for label, mpath in (
-            ("model.train_base_path", cfg.model.train_base_path),
-            ("model.served_path", cfg.model.served_path),
-        ):
-            if mpath and mpath != "__tiny__" and not Path(mpath).exists():
-                raise FileNotFoundError(f"{label} does not exist: {mpath}")
+        from ..training.model import check_train_served_compat, validate_model_dir
 
         if cfg.model.train_base_path is None and cfg.model.served_path is None:
             raise FileNotFoundError("model.train_base_path is not configured")
+
+        train_hf_cfg = served_hf_cfg = None
+        if cfg.model.train_base_path and cfg.model.train_base_path != "__tiny__":
+            train_hf_cfg = validate_model_dir(cfg.model.train_base_path, "model.train_base_path", for_training=True)
+        elif cfg.model.train_base_path is None:
+            notes.append("model.train_base_path is unset; training will fail unless every adapter is resumed/fallback")
+        if cfg.model.served_path and cfg.model.served_path != "__tiny__":
+            served_hf_cfg = validate_model_dir(cfg.model.served_path, "model.served_path", for_training=False)
+        if train_hf_cfg is not None and served_hf_cfg is not None:
+            check_train_served_compat(train_hf_cfg, served_hf_cfg)
+
+        out_root = Path(cfg.run.output_root)
+        probe = out_root if out_root.exists() else next((p for p in out_root.parents if p.exists()), None)
+        if probe is not None:
+            free_gib = shutil.disk_usage(probe).free / 1024**3
+            outputs["output_root_free_gib"] = round(free_gib, 2)
+            min_needed = max(cfg.resolve_adapter(a).train.min_free_disk_gib for a in cfg.adapters) + 1.0
+            if free_gib < min_needed:
+                msg = f"Only {free_gib:.1f} GiB free under {probe}; checkpoints may be skipped (need > {min_needed:.1f})"
+                notes.append(msg)
+                logger.warning(msg)
 
         if cfg.submission.template_dir and not Path(cfg.submission.template_dir).is_dir():
             raise FileNotFoundError(f"submission.template_dir does not exist: {cfg.submission.template_dir}")
@@ -183,6 +204,8 @@ def run_setup_phase(ctx: RunContext, cfg: PipelineConfig | None = None, deadline
             {
                 "python_version": platform.python_version(),
                 "gpus": gpus,
+                "tpu": inventory.get("tpu"),
+                "resolved_accelerators": accelerators,
                 "package_versions": pkg_versions,
             }
         )

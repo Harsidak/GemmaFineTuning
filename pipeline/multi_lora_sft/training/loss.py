@@ -15,12 +15,14 @@ Implements design_doc.md §7.3:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from ...src.data.processor import IGNORE_INDEX
 
@@ -52,6 +54,102 @@ def unwrap_causal_lm(model: Any) -> Any:
     return cur
 
 
+def _chunk_weighted_ce(
+    lm_head: nn.Module,
+    softcap: float | None,
+    h_chunk: torch.Tensor,
+    y_chunk: torch.Tensor,
+    w_chunk: torch.Tensor | None,
+) -> torch.Tensor:
+    """`Σ w * CE` for one chunk of rows; the [rows, vocab] fp32 logits live only inside this call."""
+    logits = lm_head(h_chunk).float()
+    if softcap is not None and softcap > 0.0:
+        logits = softcap * torch.tanh(logits / softcap)
+    ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y_chunk.reshape(-1), reduction="none")
+    if w_chunk is not None:
+        ce = ce * w_chunk.reshape(-1).to(ce.device)
+    return ce.sum()
+
+
+def _run_chunk(
+    lm_head: nn.Module,
+    softcap: float | None,
+    h_chunk: torch.Tensor,
+    y_chunk: torch.Tensor,
+    w_chunk: torch.Tensor | None,
+    recompute: bool,
+) -> torch.Tensor:
+    # Without recompute, autograd keeps every chunk's [rows, 262144] fp32 logits until backward
+    # (~1 GiB per 1k supervised tokens); with it only the [rows, H] hidden chunk is kept.
+    if recompute and torch.is_grad_enabled() and h_chunk.requires_grad:
+        return torch_checkpoint(
+            _chunk_weighted_ce, lm_head, softcap, h_chunk, y_chunk, w_chunk, use_reentrant=False
+        )
+    return _chunk_weighted_ce(lm_head, softcap, h_chunk, y_chunk, w_chunk)
+
+
+def _normalise(weighted_sum: torch.Tensor, weight_sum: torch.Tensor | float | None, fallback: torch.Tensor) -> torch.Tensor:
+    if weight_sum is not None:
+        denom = (
+            weight_sum.to(device=weighted_sum.device, dtype=torch.float32)
+            if torch.is_tensor(weight_sum)
+            else torch.tensor(float(weight_sum), device=weighted_sum.device, dtype=torch.float32)
+        )
+    else:
+        denom = fallback.to(device=weighted_sum.device, dtype=torch.float32)
+    return weighted_sum / torch.clamp(denom, min=1e-8)
+
+
+def static_cross_entropy_loss(
+    hidden_states: torch.Tensor,
+    lm_head: nn.Module,
+    labels: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+    softcap: float | None = None,
+    chunk_rows: int = 4096,
+    weight_sum: torch.Tensor | float | None = None,
+    ignore_index: int = IGNORE_INDEX,
+    checkpoint_chunks: bool = True,
+) -> torch.Tensor:
+    """Same objective as `selective_cross_entropy_loss` but with only static shapes (no boolean indexing,
+    no `.item()` host syncs), so XLA/TPU compiles one graph per padded sequence length.
+
+    Unsupervised positions are computed and zero-weighted instead of being gathered out, so it is a little
+    more compute than the selective path on GPU but avoids a recompilation for every distinct token count.
+    """
+    if hidden_states.size(1) <= 1:
+        return hidden_states.sum() * 0.0
+
+    h_shift = hidden_states[:, :-1, :]
+    y_shift = labels[:, 1:]
+    mask = y_shift.ne(ignore_index)
+    w = mask.to(torch.float32)
+    if weights is not None:
+        w = w * weights[:, 1:].to(torch.float32)
+    y_safe = torch.where(mask, y_shift, torch.zeros_like(y_shift))
+
+    head_device = next(lm_head.parameters()).device
+    bsz, seq = y_shift.shape
+    tokens_per_chunk = max(1, int(chunk_rows) // max(1, bsz))
+
+    weighted_sum: torch.Tensor | None = None
+    for start in range(0, seq, tokens_per_chunk):
+        end = min(seq, start + tokens_per_chunk)
+        part = _run_chunk(
+            lm_head,
+            softcap,
+            h_shift[:, start:end].to(head_device),
+            y_safe[:, start:end].to(head_device),
+            w[:, start:end].to(head_device),
+            checkpoint_chunks,
+        )
+        weighted_sum = part if weighted_sum is None else weighted_sum + part
+
+    assert weighted_sum is not None
+    return _normalise(weighted_sum, weight_sum, w.sum())
+
+
 def selective_cross_entropy_loss(
     hidden_states: torch.Tensor,
     lm_head: nn.Module,
@@ -62,6 +160,7 @@ def selective_cross_entropy_loss(
     chunk_rows: int = 4096,
     weight_sum: torch.Tensor | float | None = None,
     ignore_index: int = IGNORE_INDEX,
+    checkpoint_chunks: bool = False,
 ) -> torch.Tensor:
     """Computes `Σ(w_i * CE_i) / weight_sum` over supervised positions without full `[B, T, V]` logits."""
     if hidden_states.size(1) <= 1:
@@ -91,35 +190,14 @@ def selective_cross_entropy_loss(
             h_chunk = h_chunk.to(head_device)
         if y_chunk.device != head_device:
             y_chunk = y_chunk.to(head_device)
+        w_chunk = w_sel[start:end] if w_sel is not None else None
 
-        logits = lm_head(h_chunk).float()
-        if softcap is not None and softcap > 0.0:
-            logits = softcap * torch.tanh(logits / softcap)
-
-        ce = F.cross_entropy(logits, y_chunk, reduction="none")
-        if w_sel is not None:
-            w_chunk = w_sel[start:end]
-            if w_chunk.device != ce.device:
-                w_chunk = w_chunk.to(ce.device)
-            ce = ce * w_chunk
-
-        chunk_total = ce.sum()
+        chunk_total = _run_chunk(lm_head, softcap, h_chunk, y_chunk, w_chunk, checkpoint_chunks)
         weighted_sum = chunk_total if weighted_sum is None else (weighted_sum + chunk_total)
 
     assert weighted_sum is not None
-    if weight_sum is not None:
-        denom = (
-            weight_sum.to(device=weighted_sum.device, dtype=torch.float32)
-            if torch.is_tensor(weight_sum)
-            else torch.tensor(float(weight_sum), device=weighted_sum.device, dtype=torch.float32)
-        )
-    elif w_sel is not None:
-        denom = w_sel.to(device=weighted_sum.device).sum()
-    else:
-        denom = torch.tensor(float(n_sup), device=weighted_sum.device, dtype=torch.float32)
-
-    denom = torch.clamp(denom, min=1e-8)
-    return weighted_sum / denom
+    fallback = w_sel.sum() if w_sel is not None else torch.tensor(float(n_sup), dtype=torch.float32)
+    return _normalise(weighted_sum, weight_sum, fallback)
 
 
 @dataclass
@@ -128,9 +206,14 @@ class WeightedLanguageModelingCollator:
 
     pad_token_id: int = 0
     ignore_index: int = IGNORE_INDEX
+    pad_to_multiple_of: int | None = None  # bucket lengths so XLA compiles a bounded set of shapes
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        if not examples:
+            raise ValueError("WeightedLanguageModelingCollator received an empty batch")
         max_len = max(len(ex["input_ids"]) for ex in examples)
+        if self.pad_to_multiple_of and self.pad_to_multiple_of > 1:
+            max_len = int(math.ceil(max_len / self.pad_to_multiple_of) * self.pad_to_multiple_of)
         bsz = len(examples)
         has_weights = "weights" in examples[0] and examples[0]["weights"] is not None
 
@@ -171,13 +254,25 @@ def build_selective_sft_trainer_cls() -> type:
             *args: Any,
             chunk_rows: int = 4096,
             loss_impl: str = "selective",
+            checkpoint_chunks: bool = True,
             custom_train_sampler: Any | None = None,
             metrics_tracker: dict[str, float] | None = None,
+            optimizer_factory: Any | None = None,
+            tuple_outputs: bool = False,
             **kwargs: Any,
         ) -> None:
             super().__init__(*args, **kwargs)
+            # FSDP (incl. XLA FSDPv2) forbids passing pre-built optimizers: they must be created after the
+            # model is wrapped, so the factory builds AdamW + WSD scheduler on the wrapped parameters.
+            self._optimizer_factory = optimizer_factory
+            # XLA FSDPv2's output-sharding hook only understands tensors/tuples/CausalLMOutputWithPast.
+            self._tuple_outputs = bool(tuple_outputs)
             self.chunk_rows = int(chunk_rows)
+            if loss_impl == "liger":
+                logger.warning("loss.impl='liger' is not implemented; using the equivalent 'selective' loss")
+                loss_impl = "selective"
             self.loss_impl = loss_impl
+            self.checkpoint_chunks = bool(checkpoint_chunks)
             self.custom_train_sampler = custom_train_sampler
             self.metrics_tracker = metrics_tracker if metrics_tracker is not None else {}
             self.loss_is_scaled_for_ga = True
@@ -187,6 +282,12 @@ def build_selective_sft_trainer_cls() -> type:
             super()._set_signature_columns_if_needed()
             if self._signature_columns is not None and "weights" not in self._signature_columns:
                 self._signature_columns = [*self._signature_columns, "weights"]
+
+        def create_optimizer_and_scheduler(self, num_training_steps: int) -> None:
+            if self._optimizer_factory is None:
+                super().create_optimizer_and_scheduler(num_training_steps)
+                return
+            self.optimizer, self.lr_scheduler = self._optimizer_factory(self.model)
 
         def _get_train_sampler(self, train_dataset: Any | None = None) -> Any:
             if self.custom_train_sampler is not None:
@@ -199,32 +300,33 @@ def build_selective_sft_trainer_cls() -> type:
             if not batch_samples or "labels" not in batch_samples[0]:
                 return None
 
+            # Accumulate as tensors and read back once (one host sync per optimizer step, not per micro-batch).
             total_w = torch.zeros((), dtype=torch.float32, device=device)
-            total_sup = 0
-            total_all = 0
+            total_sup = torch.zeros((), dtype=torch.float32, device=device)
+            total_all = torch.zeros((), dtype=torch.float32, device=device)
             for batch in batch_samples:
                 lbl = batch["labels"]
                 y_shift = lbl[..., 1:]
-                mask = y_shift.ne(IGNORE_INDEX)
-                sup_cnt = int(mask.sum().item())
-                total_sup += sup_cnt
+                mask = y_shift.ne(IGNORE_INDEX).to(device=device, dtype=torch.float32)
+                total_sup = total_sup + mask.sum()
                 if "attention_mask" in batch:
-                    total_all += int(batch["attention_mask"].sum().item())
+                    total_all = total_all + batch["attention_mask"].to(device=device, dtype=torch.float32).sum()
                 else:
-                    total_all += int(lbl.numel())
+                    total_all = total_all + float(lbl.numel())
 
                 if "weights" in batch and batch["weights"] is not None:
                     w_shift = batch["weights"][..., 1:].to(device=device, dtype=torch.float32)
-                    total_w = total_w + (w_shift * mask.to(device=device, dtype=torch.float32)).sum()
+                    total_w = total_w + (w_shift * mask).sum()
                 else:
-                    total_w = total_w + torch.tensor(float(sup_cnt), dtype=torch.float32, device=device)
+                    total_w = total_w + mask.sum()
 
             if self.args.world_size > 1 and self.args.average_tokens_across_devices:
                 total_w = self.accelerator.gather(total_w).sum()
 
-            self.metrics_tracker["step_supervised_tokens"] = float(total_sup)
-            self.metrics_tracker["step_total_tokens"] = float(total_all)
-            self.metrics_tracker["step_weight_sum"] = float(total_w.detach().cpu().item())
+            stats = torch.stack([total_sup, total_all, total_w.detach().to(total_sup.device)]).cpu().tolist()
+            self.metrics_tracker["step_supervised_tokens"] = float(stats[0])
+            self.metrics_tracker["step_total_tokens"] = float(stats[1])
+            self.metrics_tracker["step_weight_sum"] = float(stats[2])
             return total_w
 
         def compute_loss(
@@ -253,6 +355,8 @@ def build_selective_sft_trainer_cls() -> type:
             try:
                 # Pass logits_to_keep=1 without labels so DDP/PEFT forward hooks execute cleanly
                 # while `lm_head` inside `forward` only touches 1 token instead of all T tokens.
+                if self._tuple_outputs:
+                    model_inputs["return_dict"] = False
                 outputs = model(**model_inputs, logits_to_keep=1)
             finally:
                 handle.remove()
@@ -261,7 +365,8 @@ def build_selective_sft_trainer_cls() -> type:
             # During evaluation (`not model.training`), `num_items_in_batch` is None -> per-batch mean
             self.loss_is_scaled_for_ga = num_items_in_batch is not None
 
-            loss = selective_cross_entropy_loss(
+            loss_fn = static_cross_entropy_loss if self.loss_impl == "static" else selective_cross_entropy_loss
+            loss = loss_fn(
                 hidden_states,
                 causal_lm.lm_head,
                 labels,
@@ -269,6 +374,7 @@ def build_selective_sft_trainer_cls() -> type:
                 softcap=self._softcap,
                 chunk_rows=self.chunk_rows,
                 weight_sum=num_items_in_batch,
+                checkpoint_chunks=self.checkpoint_chunks,
             )
 
             if (
