@@ -419,6 +419,24 @@ def _coerce_scalar(val: Any, target_name: str, field_path: str) -> Any:
     return val
 
 
+_SECTION_CLASSES: dict[str, type] = {
+    "RunSection": RunSection,
+    "ResumeSection": ResumeSection,
+    "BudgetSection": BudgetSection,
+    "SetupSection": SetupSection,
+    "ModelSection": ModelSection,
+    "DataSection": DataSection,
+    "LoraSection": LoraSection,
+    "TrainSection": TrainSection,
+    "ScheduleSection": ScheduleSection,
+    "LossSection": LossSection,
+    "ParitySection": ParitySection,
+    "SubmissionSection": SubmissionSection,
+    "EvalSection": EvalSection,
+    "VllmEvalSection": VllmEvalSection,
+}
+
+
 def _build_dataclass(cls: type, data: dict[str, Any], prefix: str) -> Any:
     if not isinstance(data, dict):
         raise ConfigError(f"Expected mapping for {prefix or cls.__name__}, got {type(data).__name__}")
@@ -435,8 +453,8 @@ def _build_dataclass(cls: type, data: dict[str, Any], prefix: str) -> Any:
         val = data[name]
         f_path = f"{prefix}.{name}".strip(".")
         t_str = str(f_info.type)
-        if name == "vllm" and cls is EvalSection:
-            kwargs[name] = _build_dataclass(VllmEvalSection, val or {}, f_path)
+        if t_str in _SECTION_CLASSES:
+            kwargs[name] = _build_dataclass(_SECTION_CLASSES[t_str], val if val is not None else {}, f_path)
         elif name == "adapters" and cls is PipelineConfig:
             if not isinstance(val, list):
                 raise ConfigError(f"'adapters' must be a list, got {type(val).__name__}")
@@ -640,9 +658,10 @@ def validate_config(cfg: PipelineConfig) -> None:
         if spec.name in seen_names:
             raise ConfigError(f"Duplicate adapter name {spec.name!r}")
         seen_names.add(spec.name)
-        if spec.roles is not None:
-            if not isinstance(spec.roles, list) or not all(isinstance(r, str) and r for r in spec.roles):
-                raise ConfigError(f"adapters[{spec.name}].roles must be null or a list of non-empty strings")
+        if spec.roles is not None and (
+            not isinstance(spec.roles, list) or not all(isinstance(r, str) and r for r in spec.roles)
+        ):
+            raise ConfigError(f"adapters[{spec.name}].roles must be null or a list of non-empty strings")
         if spec.time_share is not None:
             if spec.time_share <= 0.0 or spec.time_share > 1.0:
                 raise ConfigError(f"adapters[{spec.name}].time_share must be in (0.0, 1.0]")

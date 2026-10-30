@@ -45,8 +45,8 @@ TRACKED_PACKAGES: tuple[str, ...] = (
 
 def utc_iso(ts: float | None = None) -> str:
     if ts is None:
-        return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat(timespec="seconds")
+        return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+    return dt.datetime.fromtimestamp(ts, tz=dt.UTC).isoformat(timespec="seconds")
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -145,7 +145,7 @@ class RunContext:
         if cfg.run.run_id:
             run_id = cfg.run.run_id
         else:
-            date_tag = dt.datetime.fromtimestamp(t0, tz=dt.timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+            date_tag = dt.datetime.fromtimestamp(t0, tz=dt.UTC).strftime("%Y-%m-%d_%H%M%S")
             run_id = f"{date_tag}_{cfg.run.name}"
         ctx = cls(out_root / run_id, run_id=run_id)
         ctx.ensure_dirs()

@@ -95,18 +95,17 @@ class WSDScheduleController:
 
     def _maybe_transition_phase(self, cur: float) -> None:
         # Handle completion of a resumed quick-decay window (§7.8)
-        if self._in_resume_quick_decay and self._resume_quick_end is not None:
-            if cur >= self._resume_quick_end:
-                if self._resume_extend:
-                    # Re-enter stable phase for the remainder of the new budget
-                    self._in_resume_quick_decay = False
-                    self._resume_quick_end = None
-                    self.decay_started = False
-                    self.decay_start_time = None
-                    self.decay_start_ratio = 1.0
-                    self.frozen_t_end = None
-                else:
-                    return
+        if self._in_resume_quick_decay and self._resume_quick_end is not None and cur >= self._resume_quick_end:
+            if self._resume_extend:
+                # Re-enter stable phase for the remainder of the new budget
+                self._in_resume_quick_decay = False
+                self._resume_quick_end = None
+                self.decay_started = False
+                self.decay_start_time = None
+                self.decay_start_ratio = 1.0
+                self.frozen_t_end = None
+            else:
+                return
 
         if not self.decay_started and self.decay_frac > 0.0:
             t_end = self.projected_t_end(cur)
@@ -158,9 +157,13 @@ class WSDScheduleController:
         self._maybe_transition_phase(cur)
         if self.step >= self.total_epoch_steps:
             return True
-        if self._in_resume_quick_decay and not self._resume_extend and self.frozen_t_end is not None:
-            if cur >= self.frozen_t_end:
-                return True
+        if (
+            self._in_resume_quick_decay
+            and not self._resume_extend
+            and self.frozen_t_end is not None
+            and cur >= self.frozen_t_end
+        ):
+            return True
         target_end = self.frozen_t_end if (self.decay_started and self.frozen_t_end is not None) else self.deadline
         return cur >= target_end
 

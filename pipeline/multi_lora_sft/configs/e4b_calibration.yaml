@@ -1,0 +1,79 @@
+# 30-minute calibration config for Gemma 4 E4B (design_doc.md §10.1, §12 step 8).
+# Compares r=32 (main_lora) vs r=16 (tool_lora) parity and measures memory/speed end-to-end.
+
+run:
+  name: e4b_calibration
+  mode: calibration
+  calibration_minutes: 30.0
+  seed: 1234
+  output_root: /kaggle/working/runs
+
+model:
+  served_model_id: gemma-4-e4b-it-qat-w4a16-ct
+  quantization: bf16
+  attn_implementation: sdpa
+  max_memory_gib: 20.0
+  skip_multimodal_towers: true
+
+data:
+  train_files: []
+  tasks_file: /kaggle/input/gemma-4-developer-agent/tasks.jsonl
+  successful_only: true
+  val_fraction: 0.05
+  val_max_examples: 16
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.0
+  target_regex: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+  exclude_kv_shared: true
+
+train:
+  backend: trl
+  parallelism: ddp
+  lr: 1.0e-4
+  max_epochs: 2.0
+  max_seq_length: 16384
+  per_device_batch: 1
+  grad_accum: 4
+  longest_first_steps: 2
+  checkpoint_every_min: 10.0
+  keep_checkpoints: 2
+  val_every_min: 10.0
+  log_every_steps: 2
+  dead_check_step: 10
+  throughput_project_step: 5
+  oom_fallbacks:
+    - {quantization: nf4}
+    - {max_seq_length: 12288}
+    - {max_seq_length: 8192}
+
+adapters:
+  - name: main_lora
+    roles: null                           # accepts all roles (including single-agent sample trajectories)
+    time_share: 0.55
+    overrides:
+      lora: {r: 32, alpha: 64}
+  - name: tool_lora
+    roles: null
+    time_share: 0.45
+    overrides:
+      lora: {r: 16, alpha: 32}
+      train: {max_seq_length: 8192}
+
+submission:
+  served_model_id: gemma-4-e4b-it-qat-w4a16-ct
+  adapter_map:
+    main_lora: main_lora
+    tool_lora: tool_lora
+  working_zip_path: /kaggle/working/submission.zip
+
+eval:
+  enabled: true
+  task_ids: []
+  vllm:
+    gpu_memory_utilization: 0.90
+    tensor_parallel_size: 4
+    max_model_len: 32768
+    startup_timeout: 900

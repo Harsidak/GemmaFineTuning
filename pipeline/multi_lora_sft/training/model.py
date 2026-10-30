@@ -53,8 +53,8 @@ def canonical_gemma4_chat_template() -> str:
         tpl_path = Path(trl.__file__).resolve().parent / "chat_templates" / "gemma4_v5.jinja"
         if tpl_path.exists():
             return tpl_path.read_text(encoding="utf-8")
-    except Exception:
-        pass
+    except (ImportError, OSError) as exc:
+        logger.debug("Could not read trl gemma4_v5.jinja: %s", exc)
     raise FileNotFoundError("Could not locate canonical gemma4_v5.jinja in installed trl package")
 
 
@@ -238,7 +238,7 @@ def build_lora_target_regex(config: Any, lora_cfg: LoraSection) -> str:
 
 def find_matching_lora_modules(model: Any, target_regex: str) -> list[str]:
     """Returns sorted module paths in `model` matched by `target_regex` (verified linear-like)."""
-    import torch.nn as nn
+    from torch import nn
 
     pat = re.compile(target_regex)
     matched: list[str] = []
@@ -260,7 +260,11 @@ def load_base_model_for_training(
 ) -> Any:
     """Loads `Gemma4ForConditionalGeneration` configured for LoRA/QLoRA SFT training."""
     import torch
-    from transformers import AutoConfig, BitsAndBytesConfig, Gemma4ForConditionalGeneration
+    from transformers import (
+        AutoConfig,
+        BitsAndBytesConfig,
+        Gemma4ForConditionalGeneration,
+    )
 
     model_path = cfg.model.train_base_path
     if model_path in {None, "__tiny__"}:

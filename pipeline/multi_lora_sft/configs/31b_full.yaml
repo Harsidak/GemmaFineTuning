@@ -1,0 +1,107 @@
+# Full 12-hour 4x L4 NF4 QLoRA pipeline-parallel configuration for Gemma 4 31B (design_doc.md §10.1).
+
+run:
+  name: 31b_full
+  mode: full
+  seed: 1234
+  output_root: /kaggle/working/runs
+  resume_from: null
+
+budget:
+  session_hours: 12.0
+  safety_margin_min: 20.0
+  eval_min: 60.0
+  package_min: 5.0
+  export_min: 10.0
+  setup_max_min: 10.0
+  preflight_max_min: 15.0
+
+model:
+  train_base_path: null                   # e.g. /kaggle/input/gemma-4/transformers/gemma-4-31b-it-qat-q4_0-unquantized/1
+  served_path: null                       # e.g. /kaggle/input/gemma-4/transformers/gemma-4-31b-it-qat-w4a16-ct/1
+  served_model_id: gemma-4-31b-it-qat-w4a16-ct
+  expected_template_sha256: null
+  quantization: nf4
+  attn_implementation: sdpa
+  max_memory_gib: 20.0
+  skip_multimodal_towers: true
+
+data:
+  train_files: []                         # passed at launch via --set data.train_files=[...]
+  tasks_file: /kaggle/input/gemma-4-developer-agent/tasks.jsonl
+  successful_only: true
+  val_fraction: 0.05
+  val_max_examples: 64
+  template_kwargs: {}
+  cache_dir: null
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.0
+  target_regex: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+  exclude_kv_shared: true
+
+train:
+  backend: trl
+  parallelism: model_split
+  lr: 1.0e-4
+  max_epochs: 2.0
+  max_seq_length: 16384
+  per_device_batch: 1
+  grad_accum: 16
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  longest_first_steps: 3
+  checkpoint_every_min: 45.0
+  keep_checkpoints: 2
+  val_every_min: 60.0
+  log_every_steps: 5
+  oom_fallbacks:
+    - {max_seq_length: 12288}
+    - {max_seq_length: 8192}
+
+schedule:
+  warmup_steps: 20
+  decay_frac: 0.15
+  final_lr_ratio: 0.1
+
+loss:
+  impl: selective
+  chunk_rows: 4096
+  tool_call_weight: 1.0
+
+adapters:
+  - name: main_lora
+    roles: [root]
+    time_share: null
+  - name: tool_lora
+    roles: [code_analyzer]
+    time_share: null
+    overrides:
+      lora: {r: 16, alpha: 32}
+      train: {max_seq_length: 8192}
+
+parity:
+  enabled: true
+  num_prompts: 8
+  gen_tokens: 64
+  max_agreement_drop: 0.10
+
+submission:
+  template_dir: null
+  served_model_id: gemma-4-31b-it-qat-w4a16-ct
+  adapter_map:
+    main_lora: main_lora
+    tool_lora: tool_lora
+  fallback_adapters_dir: null
+  working_zip_path: /kaggle/working/submission.zip
+
+eval:
+  enabled: true
+  task_ids: []
+  vllm:
+    gpu_memory_utilization: 0.90
+    tensor_parallel_size: 4
+    max_model_len: 32768
+    startup_timeout: 1200

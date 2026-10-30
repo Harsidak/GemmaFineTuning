@@ -1,0 +1,144 @@
+# Authoritative defaults for pipeline.multi_lora_sft (design_doc.md §10.1).
+# Do not commit private dataset paths or slugs here; supply them via --set at launch.
+
+run:
+  name: multi_lora_sft
+  mode: full                              # full | calibration
+  calibration_minutes: 30.0
+  seed: 1234
+  output_root: /kaggle/working/runs
+  run_id: null                            # defaults to <UTC_date>_<run.name>
+  resume_from: null
+  session_start_env: SESSION_T0
+  git_sha: null
+
+resume:
+  extend: false                           # if resumed mid-decay, finish quick decay then stop unless true
+
+budget:
+  session_hours: 12.0
+  safety_margin_min: 20.0
+  eval_min: 60.0
+  package_min: 5.0
+  export_min: 10.0
+  setup_max_min: 10.0
+  preflight_max_min: 15.0
+
+setup:
+  wheelhouse_dirs: []
+  install_wheels: false
+  require_gpu: false
+  expected_gpu_count: null
+
+model:
+  train_base_path: null                   # passed at launch via --set model.train_base_path=...
+  served_path: null                       # path to -qat-w4a16-ct checkpoint for tokenizer + chat_template.jinja + eval
+  served_model_id: gemma-4-31b-it-qat-w4a16-ct
+  expected_template_sha256: null
+  quantization: nf4                       # bf16 | nf4 | fp32
+  attn_implementation: sdpa               # sdpa | eager | flash_attention_2
+  max_memory_gib: 20.0
+  skip_multimodal_towers: true
+
+data:
+  train_files: []                         # passed at launch via --set data.train_files=[...]
+  tasks_file: /kaggle/input/gemma-4-developer-agent/tasks.jsonl
+  successful_only: true
+  val_fraction: 0.05
+  val_max_examples: 64
+  template_kwargs: {}
+  cache_dir: null
+  num_workers: 0
+  max_template_mismatch_fraction: 0.05
+  repo_commit_warn_distance: 50
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  use_rslora: false
+  init_lora_weights: true
+  target_regex: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+  exclude_kv_shared: true
+  export_target_modules_mode: explicit    # explicit | regex
+
+train:
+  backend: trl
+  parallelism: model_split                # ddp | model_split | single
+  num_processes: null
+  lr: 1.0e-4
+  max_epochs: 2.0
+  max_steps: null
+  max_seq_length: 16384
+  per_device_batch: 1
+  grad_accum: 16
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  longest_first_steps: 3
+  length_bucket_size: 64
+  checkpoint_every_min: 45.0
+  keep_checkpoints: 2
+  val_every_min: 60.0
+  log_every_steps: 5
+  dead_check_step: 50
+  throughput_project_step: 10
+  max_restarts: 2
+  min_restart_min: 20.0
+  oom_fallbacks:
+    - {max_seq_length: 12288}
+    - {max_seq_length: 8192}
+
+schedule:
+  warmup_steps: 20
+  decay_frac: 0.15
+  final_lr_ratio: 0.1
+  step_time_ema_beta: 0.9
+
+loss:
+  impl: selective
+  chunk_rows: 4096
+  tool_call_weight: 1.0
+
+adapters:
+  - name: main_lora
+    roles: [root]
+    time_share: null
+    overrides: {}
+  - name: tool_lora
+    roles: [code_analyzer]
+    time_share: null
+    overrides: {}
+
+parity:
+  enabled: true
+  num_prompts: 8
+  max_prompt_tokens: 4096
+  gen_tokens: 64
+  max_agreement_drop: 0.10
+
+submission:
+  template_dir: null
+  served_model_id: null                   # defaults to model.served_model_id
+  adapter_map:
+    main_lora: main_lora
+    tool_lora: tool_lora
+  fallback_adapters_dir: null
+  working_zip_path: /kaggle/working/submission.zip
+
+eval:
+  enabled: true
+  task_ids: []
+  snapshots_dir: null
+  graphs_dir: null
+  embeddings_dir: null
+  wheels_dir: null
+  concurrency: 1
+  sandbox: subprocess
+  vllm:
+    host: 127.0.0.1
+    port: 8000
+    gpu_memory_utilization: 0.90
+    tensor_parallel_size: 4
+    max_model_len: 32768
+    startup_timeout: 1200
