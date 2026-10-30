@@ -19,11 +19,25 @@
       "notebook": "kaggle/multi_lora_sft.ipynb",
       "kernel_slug": "gemmafinetuning-multi-lora-sft",
       "kernel_title": "GemmaFineTuning Multi-LoRA SFT",
-      "wheelhouses": ["metric/gemma-4-developer-agent-wheelhouse"],
+      "wheelhouses": ["metric/gemma-4-developer-agent-wheelhouse", "banwait13/gemmafinetunewheels"],
       "private_datasets": [],
       "model_sources": [
         "google/gemma-4/transformers/gemma-4-31b-it-qat-q4_0-unquantized/1",
-        "google/gemma-4/transformers/gemma-4-31b-it-qat-w4a16-ct/1"
+        "google/gemma-4/other/gemma-4-31b-it-qat-w4a16-ct/2"
+      ],
+      "machine_shape": "NvidiaL4",
+      "enable_internet": false,
+      "is_private": true
+    },
+    "multi_lora_sft_e4b": {
+      "notebook": "kaggle/multi_lora_sft.ipynb",
+      "kernel_slug": "gemmafinetuning-multi-lora-sft-e4b",
+      "kernel_title": "GemmaFineTuning Multi-LoRA SFT E4B",
+      "wheelhouses": ["metric/gemma-4-developer-agent-wheelhouse", "banwait13/gemmafinetunewheels"],
+      "private_datasets": [],
+      "model_sources": [
+        "google/gemma-4/transformers/gemma-4-e4b-it-qat-q4_0-unquantized/2",
+        "google/gemma-4/other/gemma-4-e4b-it-qat-w4a16-ct/2"
       ],
       "machine_shape": "NvidiaL4",
       "enable_internet": false,
