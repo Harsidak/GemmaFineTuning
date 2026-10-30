@@ -145,6 +145,8 @@ def build_kernel(s: dict, name: str, overrides: dict) -> tuple[Path, dict]:
         "model_sources": p.get("model_sources", []),
         "machine_shape": p["machine_shape"],
     }
+    if p.get("docker_image"):  # pins the Python/CUDA image; the competition wheelhouse is cp312-only
+        meta["docker_image"] = p["docker_image"]
     (kdir / "kernel-metadata.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return kdir, meta
 

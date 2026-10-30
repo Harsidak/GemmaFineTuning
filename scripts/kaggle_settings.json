@@ -1,5 +1,5 @@
 {
-  "_comment": "Read by scripts/kaggle_push.py. Each key under 'pipelines' becomes a -<name> flag. No secrets here: credentials come from ~/.kaggle/kaggle.json or KAGGLE_* env vars.",
+  "_comment": "docker_image = the competition's pinned Python 3.12 image (copied from the official starter notebook's metadata); without it Kaggle uses its default Python 3.13 image and the cp312 wheelhouse will not install. Read by scripts/kaggle_push.py. Each key under 'pipelines' becomes a -<name> flag. No secrets here: credentials come from ~/.kaggle/kaggle.json or KAGGLE_* env vars.",
   "username": "banwait13",
   "competition": "gemma-4-developer-agent",
   "repo_dataset": "banwait13/gemmafinetuning",
@@ -27,6 +27,7 @@
       ],
       "machine_shape": "NvidiaL4",
       "enable_internet": false,
+      "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
       "is_private": true
     },
     "multi_lora_sft_e4b": {
@@ -41,6 +42,7 @@
       ],
       "machine_shape": "NvidiaL4",
       "enable_internet": false,
+      "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
       "is_private": true
     }
   }
