@@ -1,0 +1,63 @@
+experiment:
+  id: "EXP-010"
+  name: "specialist_adapters"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 3   # needs trained adapters; owned with the Alignment session
+  depends_on: ["EXP-009", "EXP-001"]
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "Several role-specialised LoRA adapters on one base model, served together, vs one shared adapter"
+  target_metric: "Pass@1 (129)"
+  baseline_score: null
+  expected_score: null   # prediction: +2 to +5 tasks over the shared adapter in the same architecture
+
+legality:
+  rule_refs:
+    - "HARNESS_README.md §3.4 (different agents may use different LoRA adapters on the single base model; max_loras = number of adapters; rank <= 128)"
+    - "HARNESS_README.md §2.4 (3 GiB total unpacked, adapters included)"
+  notes: "Explicitly supported. The 3 GiB limit is the only constraint (31B r16 ~110-220 MB each -> about 8 fit)."
+
+ownership:
+  training: "Alignment session (owns SFT/DPO, adapters and packaging)"
+  this_experiment: "Pipeline session defines the role data slicing and evaluation; no edits to Alignment's trainer/configs without user approval"
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true   # E4B adapters are far smaller -> many more roles fit
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - all 129 (evaluation only, never training)"
+  control: "EXP-009 winning architecture with one shared main adapter on every agent"
+
+lora_configuration:
+  enabled: true
+  adapters:
+    scout_lora: "trained on the localization slice of trajectories (read/search turns up to the first edit); target: compact report"
+    fixer_lora: "trained on edit + verify turns"
+    judge_lora: "trained on 'pick the candidate that passes', using best-of-N rollouts as preference data (pairs with DPO)"
+  rank: 16
+  size_budget_note: "check vLLM latency with max_loras = 3 vs 1 (multi-LoRA batching cost)"
+  data_rules:
+    - "the 129 local tasks are never in training data"
+    - "mined data stays in gitignored DataMining/; configs reference it via env/CLI, never hardcoded paths"
+
+kill_criteria:
+  - "Role adapters < +3 tasks over the shared adapter -> REJECT (one adapter is cheaper to train and maintain)."
+  - "Per-token latency with 3 LoRAs > 1.25x single LoRA -> only keep roles that pay for themselves."
+
+evaluation_results:
+  pass_at_1_shared: null
+  pass_at_1_roles: null
+  delta: null
+  latency_ratio_multi_vs_single_lora: null
+  total_adapter_size_mb: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

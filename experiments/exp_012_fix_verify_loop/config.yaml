@@ -1,0 +1,67 @@
+experiment:
+  id: "EXP-012"
+  name: "fix_verify_loop"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 2
+  depends_on: ["EXP-005"]   # Q6 optional templating, Q7 LoopAgent early exit
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "LoopAgent[fixer, critic]: a fresh-context critic reviews and tests the fixer's change and feeds a verdict back, up to K rounds"
+  target_metric: "Pass@1 (129)"
+  baseline_score: null
+  expected_score: null   # prediction: +2 to +5 tasks; compare head-to-head with EXP-011 at equal wall-clock
+
+legality:
+  rule_refs:
+    - "HARNESS_README.md §2.3 (LoopAgent, max_iterations 1-500; output_key + state templating)"
+  notes: "Documented agent classes only."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - DEV-30 then all 129 (evaluation only, never training)"
+  control: "EXP-009 winner"
+
+lora_configuration:
+  enabled: "same as control"
+
+agent_architecture:
+  mode: "multi_agent"
+  root: "LlmAgent coordinator holding submit_patch; calls the loop as an agent_tool, then submits"
+  loop:
+    class: "LoopAgent"
+    max_iterations: [2, 3]
+    sub_agents:
+      fixer: "edits /workspace; instruction includes {review?} from the previous round"
+      critic:
+        include_contents: "none"   # fresh eyes: sees only the problem + git diff, not the fixer's reasoning
+        tools: ["run_command", "read_file"]
+        procedure: "read git diff; run related tests (EXP-007 scripts if adopted); write a verdict: PASS or a concrete defect list"
+        output_key: "review"
+  early_exit: "if EXP-005 Q7 finds no exit mechanism: when review == PASS the fixer makes no change, so each extra round costs one short turn per agent"
+
+kill_criteria:
+  - "Gain < +2 tasks on 129 -> REJECT."
+  - "If EXP-011 at the same wall-clock beats it -> keep EXP-011 only (or combine: judge = critic)."
+  - "Critic false-PASS rate (critic says PASS, scorer fails) > 50% -> the critic adds nothing; REJECT."
+
+evaluation_results:
+  pass_at_1_K2: null
+  pass_at_1_K3: null
+  delta_vs_control: null
+  critic_false_pass_rate: null
+  critic_false_fail_rate: null
+  avg_rounds_used: null
+  wall_clock_per_task: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

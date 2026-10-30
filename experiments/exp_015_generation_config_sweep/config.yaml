@@ -1,0 +1,54 @@
+experiment:
+  id: "EXP-015"
+  name: "generation_config_sweep"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 1
+  depends_on: []
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "Tune generate_content_config per agent (thinking budget, output cap, thought retention, temperature) for pass@1 per minute"
+  target_metric: "Pass@1 (DEV-30 sweep, 129 confirm) and wall-clock per task"
+  baseline_score: null
+  expected_score: null   # prediction: 0 to +3 tasks, plus a large time saving that feeds EXP-006/011
+
+legality:
+  rule_refs:
+    - "HARNESS_README.md §2.4 (max_output_tokens and thinking_budget <= 32,768; include_thoughts; temperature/top_p/top_k/seed unrestricted)"
+  notes: "Plain configuration. Leave thinking_level unset when serving through vLLM with LoRA."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true   # sweep separately for E4B
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - DEV-30 sweep, top-2 settings on all 129 (evaluation only, never training)"
+  control: "sample_submission sampling (thinking_budget 4096, max_output_tokens 16384)"
+
+lora_configuration:
+  enabled: "same as control"
+
+sweep:
+  thinking_budget: [0, 1024, 4096, 8192]
+  max_output_tokens: [8192, 16384]
+  include_thoughts: [false, true]   # false keeps old thoughts out of the history -> smaller context, fewer compactions
+  temperature: [0.0, 0.3, 0.6]
+  seed: 1234   # fixed for comparability
+  design: "one-factor-at-a-time from the control on DEV-30 (11 runs), then combine the best of each factor; confirm the top-2 on 129"
+
+kill_criteria:
+  - "No setting beats the control by >= 1 task or saves >= 20% wall-clock on DEV-30 -> keep the control and stop."
+
+evaluation_results:
+  table: "fill in notes.md section 3"
+  chosen_root_config: null
+  chosen_subagent_config: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

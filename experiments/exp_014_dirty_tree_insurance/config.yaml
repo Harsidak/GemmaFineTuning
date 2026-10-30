@@ -1,0 +1,59 @@
+experiment:
+  id: "EXP-014"
+  name: "dirty_tree_insurance"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 1
+  depends_on: []
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "Exploit the harness harvesting the working-tree diff on timeout / budget exhaustion: always keep the best-so-far fix applied and importable in /workspace"
+  target_metric: "Pass@1 (129), especially among timed-out / budget-exhausted tasks"
+  baseline_score: null
+  expected_score: null   # prediction: +1 to +4 tasks, all from tasks that currently end with an empty or broken tree
+
+legality:
+  rule_refs:
+    - "HARNESS_README.md §8.1 (no submit_patch -> harness runs git add -N . && git diff against baseline and still scores the patch)"
+    - "HARNESS_README.md §8.2 (4-pass resilient apply: git apply variants, -3, ignore-whitespace, --recount, -p0, GNU patch -l)"
+    - "HARNESS_README.md §6 (budget_warning when <= 10 tool calls remain)"
+  notes: "Uses documented fallback behaviour."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true   # E4B times out more -> likely a bigger gain
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - all 129 (evaluation only, never training)"
+  control: "CTRL-31B under the EXP-006 cap (the insurance only matters when caps bite)"
+
+lora_configuration:
+  enabled: "same as control"
+
+agent_architecture:
+  mode: "prompt policy (any architecture)"
+  instruction_delta:
+    - "As soon as you have a plausible fix, apply it in /workspace; improve it in place afterwards. Never leave /workspace clean while you think."
+    - "Never run git checkout/stash/reset/clean on /workspace."
+    - "After every edit, run `python -m py_compile <file>`: a syntax error in the tree is worse than no edit."
+    - "When you see budget_warning: stop exploring, make sure the tree holds your best fix, call submit_patch."
+  optional: "time awareness: none is exposed to the agent except budget_warning (tool calls); consider setting max_tool_calls so the warning fires at ~80% of the time cap (calibrate in EXP-006)"
+
+kill_criteria:
+  - "Pass@1 drops by > 2 tasks (early edits anchor the model on a wrong fix) -> REJECT the 'edit early' part, keep the 'never clean / py_compile / budget_warning' parts."
+
+evaluation_results:
+  pass_at_1: null
+  delta_vs_control: null
+  empty_patch_rate_on_unfinished: null      # tasks ended by cap/budget with an empty diff
+  resolved_without_submit_patch: null       # wins coming purely from the fallback harvest
+  syntax_broken_tree_rate: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

@@ -1,0 +1,64 @@
+experiment:
+  id: "EXP-006"
+  name: "eval_config_pacing"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 1
+  depends_on: ["EXP-004"]
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "Choose eval_config.yaml budgets that use the 12h limit fully without the run being killed"
+  target_metric: "Pass@1 under the chosen cap, plus projected total runtime on ~120 tasks"
+  baseline_score: null
+  expected_score: null
+
+legality:
+  rule_refs:
+    - "resources/Competition.md:39 (participants MAY set per-task limits in eval_config.yaml)"
+    - "HARNESS_README.md §7.1 (max_time_minutes, max_tool_calls, max_turns, timeout_seconds; agent time excludes container setup)"
+  notes: "Explicitly supported by the rules."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true   # repeat the calibration separately for E4B; its time profile is different
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl, all 129 (evaluation only, never training)"
+  control: "CTRL-31B with uncapped budget (max_time_minutes 60, max_tool_calls 300)"
+
+lora_configuration:
+  enabled: "same as control"
+
+method:
+  - "Run the control once uncapped. Record each task's agent wall-clock, setup time, tool calls, turns and resolved flag."
+  - "Plot time-to-submit for resolved vs unresolved tasks."
+  - "cap = min(1.2 * p90(time of resolved tasks), (0.85 * 12h * C / N_tasks) - mean_setup), where C = concurrency from EXP-004 and N_tasks = 120"
+  - "Re-score offline by truncating each trajectory at the cap (patch = working tree at the cap) and check the predicted loss."
+  - "Confirm with one real capped run."
+
+eval_config_candidates:
+  timeout_seconds: [60, 120, 300]   # shorter per-command timeouts stop one hung pytest from eating the whole budget
+  max_tool_calls: [100, 150, 250]
+  max_time_minutes: "derived from the formula above"
+  max_turns: [500]
+
+kill_criteria:
+  - "If the cap the 12h limit forces costs more than 3 of 129 tasks vs uncapped, don't accept the loss silently: escalate to EXP-015 (faster generation) or EXP-009 (shorter root context)."
+
+evaluation_results:
+  pass_at_1_uncapped: null
+  pass_at_1_capped: null
+  p50_resolved_minutes: null
+  p90_resolved_minutes: null
+  mean_setup_minutes: null
+  projected_total_hours_120_tasks: null
+  chosen_eval_config: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

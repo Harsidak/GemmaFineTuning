@@ -1,0 +1,69 @@
+experiment:
+  id: "EXP-004"
+  name: "scorer_concurrency_probe"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 0
+  depends_on: []
+  blocks: ["EXP-006", "EXP-011", "EXP-012"]
+  costs_kaggle_submission: true   # needs explicit user go-ahead before submitting
+
+objective:
+  description: "Find out whether the Kaggle scorer runs tasks one at a time or several at once, using a deliberately slow agent"
+  target_metric: "submission completes within 12h (yes/no)"
+  baseline_score: null
+  expected_score: null   # the score is irrelevant: a probe scores ~0 by design
+
+legality:
+  rule_refs:
+    - "resources/Competition.md:39 (12h limit for all tasks; per-task limits optional in eval_config.yaml)"
+    - "HARNESS_README.md §7.1 (eval_config keys)"
+  notes: "An ordinary submission that only uses run_command and submit_patch. No rule limits what the agent does with its time."
+
+base_model:
+  name: "gemma-4-e4b-it-qat-w4a16-ct"   # smallest and fastest to serve; the scorer's concurrency doesn't depend on the model
+  applies_to_e4b: true
+
+evaluation:
+  where: "kaggle"
+  tasks: "hidden test set (~120 tasks)"
+  control: null
+
+lora_configuration:
+  enabled: false
+
+agent_architecture:
+  mode: "single_agent"
+  tools: ["run_command", "submit_patch"]
+  instruction_summary: "Call run_command('sleep 290') exactly twice, then call submit_patch(). Do nothing else."
+  sampling:
+    temperature: 0.0
+    thinking_budget: 0
+    max_output_tokens: 512
+
+eval_config:
+  probe_P1:   # ~10 min/task -> ~20h if tasks run one at a time
+    timeout_seconds: 300
+    max_tool_calls: 5
+    max_time_minutes: 11
+    max_turns: 10
+  probe_P2:   # only if P1 passes: 6 sleeps (~30 min/task -> ~60h if run one at a time)
+    timeout_seconds: 300
+    max_tool_calls: 9
+    max_time_minutes: 32
+    max_turns: 20
+
+kill_criteria:
+  - "Not applicable: this is a measurement. Stop after P1 if it times out (the answer is then: tasks run one at a time)."
+
+evaluation_results:
+  p1_completed_within_12h: null
+  p2_completed_within_12h: null
+  inferred_concurrency_lower_bound: null
+  reported_runtime_if_visible: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: "Feed the concurrency estimate into EXP-006 pacing."

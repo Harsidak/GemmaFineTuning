@@ -1,0 +1,68 @@
+experiment:
+  id: "EXP-007"
+  name: "skill_toolchain"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 1
+  depends_on: ["EXP-005"]   # Q2: do skill calls count against max_tool_calls?
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "Ship deterministic Python helper scripts as an ADK skill: the agent gets real custom tools without a Python entrypoint"
+  target_metric: "Pass@1 (129)"
+  baseline_score: null
+  expected_score: null   # prediction: +3 to +8 tasks vs control, mostly from fewer broken or misplaced patches
+
+legality:
+  rule_refs:
+    - "resources/Competition.md:57-62 (skills: SKILL.md + scripts executed via run_skill_script inside the task container, debiting the central budget)"
+    - "HARNESS_README.md §2.4 (.py allowed for ADK skill scripts only; 1000 skills, 50 MiB each)"
+  notes: "The rules explicitly allow this. The only bans are a Python *entrypoint* and network access, and these scripts run inside the sandbox using only the standard library."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true   # likely helps E4B more: the scripts do the reasoning-light work
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - DEV-30 for iteration, all 129 to confirm (evaluation only, never training)"
+  control: "CTRL-31B (same prompt and adapter, no skills)"
+
+lora_configuration:
+  enabled: "same as control"
+
+skill_design:
+  path: "skills/swe_toolkit/"
+  constraints:
+    - "stdlib only (sandbox has no network; don't assume ripgrep or other binaries are installed)"
+    - "every script prints at most ~2,000 chars (tool output is truncated at 5,000 chars anyway)"
+    - "never write inside /workspace except where the script's job is to (scratch files go in /tmp)"
+    - "hard internal timeout so a script can't eat the task's time budget"
+  scripts:
+    locate.py: "parse the problem statement (via argv/stdin) for identifiers, dotted paths, file names and traceback frames; walk the repo with os.walk + ast; output the top-10 ranked files/symbols with the reason for each match"
+    related_tests.py: "map changed or suspected source files to existing test files (name match + import scan); output the pytest node ids"
+    run_tests.py: "run the selected pytest node ids with timeout and -x -q; output a compact pass/fail summary plus the first failing assertion"
+    patch_check.py: "py_compile every changed .py file; flag edits that the harness will strip (tests/, test_*.py, conftest.py, pyproject.toml, setup.cfg, tox.ini, pytest.ini); flag untracked scratch files in /workspace; print git diff --stat"
+  resources:
+    workflow.md: "a short playbook: locate -> reproduce -> edit -> patch_check -> related tests -> submit"
+
+kill_criteria:
+  - "DEV-30: if the gain is < +1 task AND the broken-patch rate doesn't drop, stop."
+  - "129: ADOPT only if the gain is >= +3 tasks with no rise in timeouts."
+  - "If the agent uses no skill script on > 50% of tasks, the problem is the prompt or training, not the idea: iterate once, then decide."
+
+evaluation_results:
+  pass_at_1: null
+  delta_vs_control: null
+  broken_patch_rate: null        # patches that fail py_compile / import
+  stripped_edit_rate: null       # patches whose only fix lived in a file the harness strips
+  tool_calls_to_first_edit: null
+  skill_usage_rate: null
+  tasks_timed_out: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

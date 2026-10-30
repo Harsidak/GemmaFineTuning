@@ -1,0 +1,75 @@
+experiment:
+  id: "EXP-009"
+  name: "context_isolated_scout"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 2
+  depends_on: ["EXP-005"]   # Q1 budget accounting, Q6 templating with include_contents: none
+  blocks: ["EXP-010", "EXP-011"]
+  costs_kaggle_submission: false
+
+objective:
+  description: "The legal form of 'E4B scout under 31B': a 31B AgentTool scout that is cheap and context-isolated, returning only a compressed localization report to the root"
+  target_metric: "Pass@1 (129)"
+  baseline_score: null
+  expected_score: null   # prediction: +2 to +6 tasks; gains concentrated in long tasks that currently hit compaction
+
+legality:
+  rule_refs:
+    - "resources/Competition.md:41-55 (every agent must use the same model -> scout is 31B, not E4B)"
+    - "HARNESS_README.md §2.3 (AgentTool, include_contents: none, output_key, state templating)"
+    - "HARNESS_README.md §10.4 (AgentTool + skip_summarization recommended to isolate context)"
+  notes: "Recommended by the harness authors themselves."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - DEV-30 then all 129 (evaluation only, never training)"
+  control: "CTRL-31B (single root agent, same adapter)"
+
+lora_configuration:
+  enabled: "root: main adapter; scout: same main adapter in v1 (role adapter is EXP-010)"
+
+agent_architecture:
+  mode: "multi_agent"
+  root:
+    tools: ["run_command", "read_file", "edit_file", "write_file", "get_status", "submit_patch", "agent_tool: sub_agents/scout.yaml (skip_summarization: true)"]
+    instruction_delta: "First call scout. Trust its report; read only the lines it points to. Call scout again (with a narrower question) instead of browsing yourself."
+  scout:
+    file: "sub_agents/scout.yaml"
+    include_contents: "none"   # does not see the root's history
+    instruction_template: "uses {problem_description} and {hints?} (hints is absent from state when empty -> must be optional)"
+    tools: ["read_file", "run_command", "search_similar_code", "get_code_neighbors", "get_code_subgraph"]   # read-only by instruction; no edit/submit
+    output_contract: "<= 300 words: ranked files/symbols with line ranges, root-cause guess, how to reproduce, existing tests that cover it"
+    output_key: "localization"
+    generate_content_config:
+      thinking_budget: 1024
+      max_output_tokens: 2048
+      temperature: 0.0
+  variants:
+    A: "scout via AgentTool (root can call it repeatedly)"
+    B: "SequentialAgent[scout, root] (scout once; root reads {localization} from its instruction)"
+
+kill_criteria:
+  - "Scout top-3 localization accuracy (gold patch file in scout's top 3, scored using the gold patch for evaluation only) < 60% -> fix the scout before judging pass@1."
+  - "Pass@1 on 129 not >= control + 2 -> REJECT (keep the simpler single agent)."
+  - "Wall-clock per task > 1.3x control with no pass@1 gain -> REJECT."
+
+evaluation_results:
+  pass_at_1_A: null
+  pass_at_1_B: null
+  delta_vs_control: null
+  scout_top1_file_acc: null
+  scout_top3_file_acc: null
+  root_peak_prompt_tokens: null
+  compaction_events_per_task: null
+  wall_clock_per_task: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

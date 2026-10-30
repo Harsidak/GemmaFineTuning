@@ -1,0 +1,58 @@
+experiment:
+  id: "EXP-008"
+  name: "skill_knowledge_base"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 3   # speculative; run after the cheaper levers
+  depends_on: ["EXP-007"]
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "Use skill resources as an on-demand reference library: knowledge loaded only when needed, so it costs no context until used"
+  target_metric: "Pass@1 (129)"
+  baseline_score: null
+  expected_score: null   # prediction: small (0 to +3); the hidden repos are private and their libraries unknown
+
+legality:
+  rule_refs:
+    - "resources/Competition.md:62 (agents can inspect domain knowledge files using load_skill_resource)"
+    - "HARNESS_README.md §2.4 (1000 skills x 50 MiB; .md/.txt allowed)"
+  notes: "Explicitly allowed. HARD RULE: no content may be derived from the 129 local tasks' gold patches or tests (they are our test set)."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true   # a small model may benefit more from looked-up knowledge
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - all 129 (evaluation only, never training, never a knowledge source)"
+  control: "best config after EXP-007"
+
+lora_configuration:
+  enabled: "same as control"
+
+knowledge_design:
+  skills:
+    python_bug_patterns: "common Python bug classes and their minimal fixes (mutable defaults, off-by-one, None handling, str/bytes, unicode, float edge cases, py-version compat, iteration-while-mutating, shallow vs deep copy)"
+    pytest_triage: "how to read pytest failures, parametrized node ids, fixtures, xfail/skip semantics, why a test can be 'skipped' (= unresolved for the scorer)"
+    stdlib_api_notes: "concise behaviour notes for the stdlib modules that show up most in bugs (datetime, re, pathlib, json, collections, functools, typing)"
+    popular_lib_notes: "API change notes for widely used libraries (numpy, pandas, requests, click, attrs, pydantic, sqlalchemy), version-tagged"
+  source_policy: "public docs and our own write-ups only; never the 129 local tasks"
+  routing: "SKILL.md description says when to load which resource; nothing is loaded by default"
+
+kill_criteria:
+  - "Resource load rate < 10% of tasks -> the model doesn't reach for it: REJECT (don't force it)."
+  - "Gain < +2 tasks on 129 -> REJECT (keeps the submission simpler)."
+
+evaluation_results:
+  pass_at_1: null
+  delta_vs_control: null
+  resource_load_rate: null
+  avg_tokens_loaded_per_task: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

@@ -1,0 +1,69 @@
+experiment:
+  id: "EXP-011"
+  name: "parallel_best_of_n"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 2
+  depends_on: ["EXP-004", "EXP-005", "EXP-009"]   # Q1, Q3, Q4, Q5, Q8
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "N fixers run at the same time on the shared vLLM server (batched, so close to free), each in its own /tmp git worktree; a judge applies the best candidate to /workspace"
+  target_metric: "Pass@1 (129) at equal or acceptable wall-clock"
+  baseline_score: null
+  expected_score: null   # prediction: +4 to +10 tasks at N=3 (pass@k >> pass@1 is typical; the judge captures part of the gap)
+
+legality:
+  rule_refs:
+    - "HARNESS_README.md §2.3 (ParallelAgent: sub_agents run concurrently in isolated branches)"
+    - "HARNESS_README.md §2.4 (max_agents 500)"
+    - "HARNESS_README.md §3.1 (one vLLM server; continuous batching across requests)"
+  notes: "Uses documented agent classes. Only the judge holds submit_patch."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true   # E4B is fast enough that N=4-8 may fit the budget
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - DEV-30 then all 129 (evaluation only, never training)"
+  control: "EXP-009 winner (single fixer)"
+
+lora_configuration:
+  enabled: "same as control (role adapters from EXP-010 if adopted)"
+
+agent_architecture:
+  mode: "multi_agent"
+  root: "LlmAgent coordinator with tools [scout agent_tool, fanout agent_tool, run_command, submit_patch] - kept as an LlmAgent so nudges never rerun a whole pipeline (EXP-005 Q8)"
+  fanout: "ParallelAgent[fixer_1 .. fixer_N]"
+  fixer_i:
+    setup: "git worktree add /tmp/wt_i HEAD (or cp -r if Q4 says worktrees fail)"
+    rule: "edit ONLY under /tmp/wt_i; never touch /workspace; no submit_patch tool"
+    test_import_gotcha: "the editable install points to /workspace -> run tests as `cd /tmp/wt_i && PYTHONPATH=/tmp/wt_i python -m pytest ...` (verify in EXP-005 Q4)"
+    diversity: "different seed per fixer; temperature 0.0 / 0.4 / 0.7; optional different 'strategy' line in each instruction"
+    output_key: "candidate_i (summary + `git -C /tmp/wt_i diff` stat)"
+  judge:
+    tools: ["run_command", "submit_patch"]
+    procedure: "run targeted tests for each candidate ONE AT A TIME (4 GiB / 2 vCPU sandbox), pick by: tests pass > smallest diff > agreement between candidates; then `git -C /tmp/wt_k diff | git -C /workspace apply` and submit_patch"
+  N_sweep: [1, 2, 3, 4]
+
+memory_cpu_risk: "N concurrent fixers each running pytest can OOM the 4 GiB container -> fixers run only targeted tests with a timeout; the judge serialises the full checks"
+
+kill_criteria:
+  - "N=2 < control + 3 tasks on 129 -> REJECT the whole line."
+  - "Wall-clock per task at the chosen N > the EXP-006 cap -> reduce N or REJECT."
+  - "OOM (exit 137) on > 5% of tasks -> redesign test execution before continuing."
+
+evaluation_results:
+  pass_at_1_by_N: {1: null, 2: null, 3: null, 4: null}
+  oracle_pass_at_N: {2: null, 3: null, 4: null}   # any candidate passes -> upper bound for the judge
+  judge_selection_accuracy: null
+  wall_clock_by_N: {1: null, 2: null, 3: null, 4: null}
+  oom_rate: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""

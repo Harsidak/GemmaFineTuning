@@ -1,0 +1,59 @@
+experiment:
+  id: "EXP-013"
+  name: "repro_test_first"
+  date: "2026-10-30"
+  author: "Research Team"
+  status: "PLANNED"
+  priority: 1
+  depends_on: []
+  blocks: []
+  costs_kaggle_submission: false
+
+objective:
+  description: "Have the agent write a failing reproduction test inside the repo's tests/ BEFORE editing; the harness strips test files from the patch, so no cleanup is needed"
+  target_metric: "Pass@1 (129)"
+  baseline_score: null
+  expected_score: null   # prediction: +2 to +6 tasks (fewer 'fixed the wrong thing' and 'never verified' failures)
+
+legality:
+  rule_refs:
+    - "HARNESS_README.md §8.1 (strip_protected_files_from_patch removes test_*.py, *_test.py, tests/**, conftest.py, pytest.ini, pyproject.toml, setup.cfg, tox.ini ... from the patch)"
+    - "HARNESS_README.md §8.2 (protected files the patch touches are reset before the gold test_patch is applied)"
+  notes: "The harness itself guarantees our scratch tests never reach the scorer, so in-repo repro tests are free."
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true
+
+evaluation:
+  where: "offline swegemma eval on a Kaggle 4xL4 notebook"
+  tasks: "build/gemma-4-developer-agent/tasks.jsonl - all 129 (evaluation only, never training)"
+  control: "CTRL-31B"
+
+lora_configuration:
+  enabled: "same as control"
+
+agent_architecture:
+  mode: "single_agent (prompt change; can be layered on any architecture)"
+  instruction_delta:
+    - "Before editing, write tests/test_swegemma_repro.py (inside the repo, so imports and conftest work) reproducing the issue; run it and confirm it FAILS for the right reason."
+    - "Fix the source; rerun the repro until it PASSES; then run the existing tests of the module you touched."
+    - "Never rely on edits to pyproject.toml / setup.cfg / tox.ini / pytest.ini / conftest.py / tests/: the harness discards them."
+    - "No cleanup needed for files under tests/ (stripped automatically); scratch files OUTSIDE tests/ go in /tmp."
+
+kill_criteria:
+  - "Gain < +2 tasks on 129 -> REJECT."
+  - "Timeouts rise by > 3 tasks (repro writing eats the budget) -> make repro optional for tasks with a traceback in the problem statement only, then re-test once."
+
+evaluation_results:
+  pass_at_1: null
+  delta_vs_control: null
+  repro_written_rate: null
+  repro_failed_first_rate: null     # the repro actually reproduced the bug
+  repro_pass_but_unresolved: null   # false confidence: our repro passed, the hidden tests didn't
+  tasks_timed_out: null
+
+verdict:
+  decision: "PENDING"
+  key_findings: ""
+  recommended_next_step: ""
