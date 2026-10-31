@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
+import os
 import platform
 import re
 import shutil
@@ -137,6 +139,9 @@ def run_setup_phase(ctx: RunContext, cfg: PipelineConfig | None = None, deadline
         required = tuple(dict.fromkeys([*(REQUIRED_CORE_IMPORTS if uses_trl else ()), *(TUNIX_CORE_IMPORTS if uses_tunix else ())]))
 
         missing_core: list[str] = []
+        if uses_trl and not uses_tunix:
+            os.environ.setdefault("USE_TF", "0")
+            os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
         for mod_name in required:
             try:
                 importlib.import_module(mod_name)
@@ -145,11 +150,11 @@ def run_setup_phase(ctx: RunContext, cfg: PipelineConfig | None = None, deadline
         if missing_core:
             raise RuntimeError(f"Missing required core imports: {', '.join(missing_core)}")
 
+        # Probe optional eval packages via module spec rather than cold-importing `vllm` (~50s on Kaggle).
         eval_import_status: dict[str, bool] = {}
         for mod_name in OPTIONAL_EVAL_IMPORTS:
             try:
-                importlib.import_module(mod_name)
-                eval_import_status[mod_name] = True
+                eval_import_status[mod_name] = importlib.util.find_spec(mod_name) is not None
             except Exception:  # noqa: BLE001
                 eval_import_status[mod_name] = False
         outputs["eval_imports"] = eval_import_status

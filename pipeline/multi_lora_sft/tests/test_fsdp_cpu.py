@@ -293,3 +293,31 @@ def test_keep_buffers_in_native_dtype_survives_later_set_mixed_precision() -> No
     plugin.set_mixed_precision(torch.bfloat16, override=True)  # what the Trainer does for QLoRA before wrapping
     assert plugin.mixed_precision_policy.buffer_dtype is None
     assert plugin.mixed_precision_policy.param_dtype == torch.bfloat16
+
+
+def test_collective_device_handles_hybrid_fsdp_backend_and_env_precedes_init(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ast
+    import inspect
+
+    import torch.distributed as dist
+
+    from pipeline.multi_lora_sft.phases import train as train_phase
+    from pipeline.multi_lora_sft.training import distributed as dist_mod
+
+    # Hybrid `cuda:nccl,cpu:gloo` backend selected by accelerate PartialState when FSDP + FULL_STATE_DICT is active.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(dist, "get_backend", lambda: "cuda:nccl,cpu:gloo")
+    assert dist_mod._collective_device() == torch.device("cuda", 2)
+
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
+    assert dist_mod._collective_device() == torch.device("cpu")
+
+    # `apply_fsdp_env()` call must precede `init_distributed()` call in `run_train_adapter_phase` so PartialState sees FSDP_ENV.
+    tree = ast.parse(inspect.getsource(train_phase.run_train_adapter_phase))
+    call_lines = {
+        node.func.id: node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"apply_fsdp_env", "init_distributed"}
+    }
+    assert call_lines["apply_fsdp_env"] < call_lines["init_distributed"]

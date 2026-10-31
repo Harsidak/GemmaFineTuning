@@ -188,6 +188,9 @@ def run_train_adapter_phase(
     trainer: Any = None
 
     try:
+        os.environ.setdefault("USE_TF", "0")
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
         import datasets as hf_datasets
         import numpy as np
         import torch
@@ -232,13 +235,16 @@ def run_train_adapter_phase(
         )
 
         multi_proc = accelerator == "cuda" and parallelism in {"ddp", "fsdp"} and world_size > 1
+        if parallelism == "fsdp":
+            # Must precede `init_distributed()` so `accelerate.PartialState` sees `ACCELERATE_USE_FSDP=true`
+            # and `FSDP_STATE_DICT_TYPE=FULL_STATE_DICT` and registers the `cuda:nccl,cpu:gloo` backend needed
+            # by CPU-offloaded full optimizer state dicts.
+            apply_fsdp_env()
         if multi_proc:
             # Process group up before loading: binds each rank to its GPU and lets ranks share one start time,
             # so the time-driven schedule and stop decisions match on every rank.
             init_distributed()
             t_start = broadcast_float(t_start)
-        if parallelism == "fsdp":
-            apply_fsdp_env()  # read by the Accelerator the Trainer creates below
         clock = SyncedClock()
         clock.sync()  # first (collective) read happens here, at the same point on every rank
 

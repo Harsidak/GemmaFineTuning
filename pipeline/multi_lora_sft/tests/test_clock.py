@@ -79,3 +79,28 @@ def test_calibration_mode_scales_phase_budgets() -> None:
     assert clock.plan.session_sec == pytest.approx(1800.0)
     # With eval disabled, at least 75% of 1800s (1350s) is available for setup+preflight+train
     assert clock.remaining_train_sec() >= 1350.0 - 1e-6
+
+
+def test_short_full_mode_session_scales_reserves_after_wheelhouse_install(repo_root: object) -> None:
+    from pathlib import Path
+
+    cfg = load_config(
+        Path(str(repo_root)) / "pipeline" / "multi_lora_sft" / "configs" / "31b_full.yaml",
+        set_overrides=["budget.session_hours=1.0"],
+    )
+    # Simulate 4m15s spent in notebook wheelhouse installation before Orchestrator starts (run 225019).
+    t0 = 1_000_000.0
+    now_after_wheels = t0 + 255.0
+    clock = SessionClock(cfg, t0=t0, now_fn=lambda: now_after_wheels)
+
+    assert clock.plan.session_sec == pytest.approx(3600.0)
+    # Setup gets its full 10-min cap instead of being choked to 45s by unscaled 55-min post-train reserves.
+    assert clock.phase_deadline("setup") - now_after_wheels == pytest.approx(600.0)
+    # Over 28 minutes remain for setup + preflight + training, and ~9.8 min remain reserved for parity eval.
+    assert clock.remaining_train_sec() >= 28.0 * 60.0
+    assert clock.plan.eval_sec >= 9.5 * 60.0
+
+    # Even a 30-minute full-mode smoke check validates cleanly and reserves 55% for training.
+    cfg_half_hour = load_config(set_overrides=["budget.session_hours=0.5"])
+    clock_half = SessionClock(cfg_half_hour, t0=0.0, now_fn=lambda: 0.0)
+    assert clock_half.remaining_train_sec() == pytest.approx(1800.0 * 0.55)

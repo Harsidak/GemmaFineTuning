@@ -102,7 +102,7 @@ def _collective_device() -> Any:
     import torch
     import torch.distributed as dist
 
-    if dist.get_backend() == "nccl":
+    if torch.cuda.is_available() and "nccl" in str(dist.get_backend()).lower():
         return torch.device("cuda", torch.cuda.current_device())
     return torch.device("cpu")
 

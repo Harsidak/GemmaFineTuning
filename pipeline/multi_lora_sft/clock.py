@@ -77,40 +77,41 @@ class SessionClock:
 
     def _build_plan(self) -> PhasePlan:
         b = self.cfg.budget
-        eval_enabled = self.cfg.eval.enabled
+        session_sec = (
+            self.cfg.run.calibration_minutes * 60.0
+            if self.cfg.run.mode == "calibration"
+            else b.session_hours * 3600.0
+        )
+        raw_margin = b.safety_margin_min * 60.0
+        raw_eval = self.cfg.eval_reserve_min() * 60.0
+        raw_pkg = b.package_min * 60.0
+        raw_exp = b.export_min * 60.0
+        raw_setup = b.setup_max_min * 60.0
+        raw_preflight = b.preflight_max_min * 60.0
 
-        if self.cfg.run.mode == "calibration":
-            session_sec = self.cfg.run.calibration_minutes * 60.0
-            raw_margin = b.safety_margin_min * 60.0
-            raw_eval = self.cfg.eval_reserve_min() * 60.0
-            raw_pkg = b.package_min * 60.0
-            raw_exp = b.export_min * 60.0
-            raw_setup = b.setup_max_min * 60.0
-            raw_preflight = b.preflight_max_min * 60.0
-
-            raw_reserved = raw_margin + raw_eval + raw_pkg + raw_exp
-            # Ensure at least 45% of calibration_minutes is available for setup + preflight + train.
-            max_post_train = session_sec * (0.55 if eval_enabled else 0.25)
-            if raw_reserved > max_post_train and raw_reserved > 0:
-                scale = max_post_train / raw_reserved
-                margin_sec = raw_margin * scale
-                eval_sec = raw_eval * scale
-                pkg_sec = raw_pkg * scale
-                exp_sec = raw_exp * scale
-            else:
-                margin_sec, eval_sec, pkg_sec, exp_sec = raw_margin, raw_eval, raw_pkg, raw_exp
-
+        raw_reserved = raw_margin + raw_eval + raw_pkg + raw_exp
+        # Scale post-train reservations down on short sessions (calibration runs or short `budget.session_hours`
+        # smoke checks like `--hours 1`) so at least 55% (with eval) or 75% (without eval) stays available for
+        # setup + preflight + training while leaving normal 12h runs completely unscaled.
+        max_post_train = session_sec * (0.45 if raw_eval > 0 else 0.25)
+        if raw_reserved > max_post_train and raw_reserved > 0:
+            scale = max_post_train / raw_reserved
+            margin_sec = raw_margin * scale
+            eval_sec = raw_eval * scale
+            pkg_sec = raw_pkg * scale
+            exp_sec = raw_exp * scale
             train_window = session_sec - (margin_sec + eval_sec + pkg_sec + exp_sec)
-            setup_max_sec = min(raw_setup, max(30.0, train_window * 0.25))
-            preflight_max_sec = min(raw_preflight, max(30.0, train_window * 0.30))
+            setup_max_sec = min(raw_setup, max(30.0, train_window * 0.35))
+            preflight_max_sec = min(raw_preflight, max(30.0, train_window * 0.40))
         else:
-            session_sec = b.session_hours * 3600.0
-            margin_sec = b.safety_margin_min * 60.0
-            eval_sec = self.cfg.eval_reserve_min() * 60.0
-            pkg_sec = b.package_min * 60.0
-            exp_sec = b.export_min * 60.0
-            setup_max_sec = b.setup_max_min * 60.0
-            preflight_max_sec = b.preflight_max_min * 60.0
+            margin_sec, eval_sec, pkg_sec, exp_sec = raw_margin, raw_eval, raw_pkg, raw_exp
+            if self.cfg.run.mode == "calibration":
+                train_window = session_sec - raw_reserved
+                setup_max_sec = min(raw_setup, max(30.0, train_window * 0.35))
+                preflight_max_sec = min(raw_preflight, max(30.0, train_window * 0.40))
+            else:
+                setup_max_sec = raw_setup
+                preflight_max_sec = raw_preflight
 
         session_hard_limit = self.t0 + session_sec
         eval_deadline = session_hard_limit - margin_sec

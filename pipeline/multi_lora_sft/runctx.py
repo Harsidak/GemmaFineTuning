@@ -16,6 +16,7 @@ import hashlib
 import importlib.metadata
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -215,11 +216,22 @@ class RunContext:
 
 
 def configure_phase_logging(log_file: Path | None = None, level: int = logging.INFO) -> logging.Logger:
-    """Configures root/phase logging to stdout and an optional UTF-8 log file."""
+    """Configures root/phase logging to stdout and an optional UTF-8 log file.
+
+    When the orchestrator redirects a phase subprocess's `stdout` directly to `log_file`, avoids
+    attaching a second `FileHandler` pointing at the same file so log lines are never duplicated.
+    """
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        stdout_is_log_file = False
+        if log_file.exists():
+            try:
+                stdout_is_log_file = os.path.samefile(sys.stdout.fileno(), log_file)
+            except (OSError, ValueError, AttributeError):
+                stdout_is_log_file = False
+        if not stdout_is_log_file:
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",

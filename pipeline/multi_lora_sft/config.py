@@ -751,7 +751,7 @@ def validate_config(cfg: PipelineConfig) -> None:
     if cfg.run.calibration_minutes <= 0:
         raise ConfigError(f"run.calibration_minutes must be > 0, got {cfg.run.calibration_minutes}")
 
-    # Budget validation
+    # Budget validation (`SessionClock` proportionally scales post-train reserves on short sessions)
     for fname in (
         "session_hours",
         "safety_margin_min",
@@ -765,15 +765,6 @@ def validate_config(cfg: PipelineConfig) -> None:
         val = getattr(cfg.budget, fname)
         if val < 0 or (fname == "session_hours" and val <= 0):
             raise ConfigError(f"budget.{fname} must be positive, got {val}")
-
-    if cfg.run.mode == "full":
-        eval_m = cfg.eval_reserve_min()
-        reserved_min = cfg.budget.safety_margin_min + eval_m + cfg.budget.package_min + cfg.budget.export_min
-        if cfg.budget.session_hours * 60.0 <= reserved_min:
-            raise ConfigError(
-                f"budget.session_hours ({cfg.budget.session_hours * 60:.1f} min) leaves no time for training "
-                f"after reserved phases ({reserved_min:.1f} min)"
-            )
 
     # Served model validation (competition rule §3.3)
     served_id = cfg.effective_served_model_id()

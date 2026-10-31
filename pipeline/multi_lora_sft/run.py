@@ -121,16 +121,21 @@ def default_phase_command_builder(
             if backend == "tunix":  # torch-free entry: the PyTorch train module imports torch/transformers at import time
                 cmd = [sys.executable, "-m", "tpu_training.phase"]
             elif eff.train.parallelism in {"ddp", "fsdp"} and n_proc and n_proc > 1:
-                # One process per GPU. FSDP itself is switched on inside the train phase (training/distributed.py),
-                # so the phase behaves the same under torchrun or a bare `accelerate launch`.
+                # One process per GPU (`--multi_gpu` overrides any single-GPU default_config.yaml on the host).
+                # FSDP plugin env vars are applied both in the subprocess env and inside `phases/train.py`.
                 cmd = [
                     sys.executable,
                     "-m",
                     "accelerate.commands.launch",
+                    "--multi_gpu",
+                    "--num_machines",
+                    "1",
                     "--num_processes",
                     str(n_proc),
                     "--mixed_precision",
                     "bf16",
+                    "--dynamo_backend",
+                    "no",
                     "-m",
                     "pipeline.multi_lora_sft.phases.train",
                 ]
@@ -192,6 +197,9 @@ def phase_subprocess_env(cfg: PipelineConfig, repo_root: str) -> dict[str, str]:
     # Fewer fragmentation OOMs on long, variable-length sequences.
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # Prevent transformers / datasets from spending ~15s cold-importing TensorFlow on Kaggle images.
+    env.setdefault("USE_TF", "0")
+    env.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
     accelerators = {cfg.train.accelerator} | {cfg.resolve_adapter(a).train.accelerator for a in cfg.adapters}
     if "tpu" in accelerators:
         env.setdefault("PJRT_DEVICE", "TPU")
@@ -267,7 +275,15 @@ class Orchestrator:
         env = phase_subprocess_env(self.cfg, repo_root)
         grace_sec = 3.0
         if phase.startswith("train:"):
-            grace_sec = max(3.0, self.cfg.resolve_adapter(phase.split(":", 1)[1]).train.sigterm_grace_sec)
+            eff_train = apply_oom_override(
+                self.cfg.resolve_adapter(phase.split(":", 1)[1]),
+                (extra or {}).get("oom_override"),
+            )
+            grace_sec = max(3.0, eff_train.train.sigterm_grace_sec)
+            if eff_train.train.parallelism == "fsdp":
+                from .training.distributed import apply_fsdp_env
+
+                apply_fsdp_env(env)
 
         popen_kwargs: dict[str, Any] = {
             "cwd": repo_root,
