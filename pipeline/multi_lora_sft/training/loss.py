@@ -167,7 +167,10 @@ def selective_cross_entropy_loss(
         return hidden_states.sum() * 0.0
 
     h_shift = hidden_states[:, :-1, :]
-    y_shift = labels[:, 1:]
+    # With model_split (device_map="auto") the last decoder layer, and so `hidden_states`, sits on the last GPU
+    # while labels/weights stay on the input device. Boolean indexing needs the mask on the indexed tensor's device.
+    h_device = h_shift.device
+    y_shift = labels[:, 1:].to(h_device)
     mask = y_shift.ne(ignore_index)
 
     n_sup = int(mask.sum().item())
@@ -176,7 +179,7 @@ def selective_cross_entropy_loss(
 
     h_sel = h_shift[mask]  # [N, H]
     y_sel = y_shift[mask]  # [N]
-    w_sel = weights[:, 1:][mask].float() if weights is not None else None
+    w_sel = weights[:, 1:].to(h_device)[mask].float() if weights is not None else None
 
     head_device = next(lm_head.parameters()).device
     step = max(1, int(chunk_rows))

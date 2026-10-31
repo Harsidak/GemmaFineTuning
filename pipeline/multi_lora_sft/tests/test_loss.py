@@ -140,3 +140,21 @@ def test_grad_accum_step_normalization_invariance(tiny_gemma4_dir: Path) -> None
 
     assert (l1 + l2).item() == pytest.approx(loss_all.item(), rel=1e-5, abs=1e-5)
     assert torch.allclose(model_comb.lm_head.weight.grad, model_ga.lm_head.weight.grad, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ CUDA devices")
+def test_selective_loss_with_hidden_states_on_another_gpu() -> None:
+    # Regression for the 2026-10-31 4xL4 run: under model_split the hidden states leave the last decoder layer on
+    # cuda:N while labels/weights stay on cuda:0, and `h_shift[mask]` raised "indices should be either on cpu or on
+    # the same device as the indexed tensor".
+    torch.manual_seed(0)
+    last = torch.device(f"cuda:{torch.cuda.device_count() - 1}")
+    head = torch.nn.Linear(16, 50, bias=False).to(last)
+    hidden = torch.randn(2, 12, 16, device=last)
+    labels = torch.randint(0, 50, (2, 12), device="cuda:0")
+    labels[:, :4] = IGNORE_INDEX
+    weights = torch.ones(2, 12, device="cuda:0")
+
+    got = selective_cross_entropy_loss(hidden, head, labels, weights=weights)
+    want = selective_cross_entropy_loss(hidden.cpu(), head.cpu(), labels.cpu(), weights=weights.cpu())
+    assert got.item() == pytest.approx(want.item(), rel=1e-4)
