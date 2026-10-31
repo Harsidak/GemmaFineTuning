@@ -89,6 +89,8 @@ from the environment.
 * **W&B**: the notebook verifies the `WANDB_API_KEY` secret with a real login before training and says whether the run logs
   online or offline. An online start that fails falls back to offline. Offline runs (no internet, e.g. GPU sessions) are
   uploaded by `scripts/kaggle_push.py` after it downloads the output (`wandb sync`, needs a local key; `--no-wandb-sync`).
+  4×L4 (`NvidiaL4`) does not allow internet: `kaggle_push.py` refuses `--internet on` there and sets `RUN["internet"]=False`,
+  so the notebook skips the W&B login and pip fallbacks and logs W&B offline from the start.
 * **Clock**: `RUN["clock_hours"]` (or `kaggle_push.py --hours 4`) is the whole notebook's wall clock from the first cell;
   training gets what remains after export / package / eval / the safety margin, and a backstop stops the run at the clock.
 

@@ -8,7 +8,7 @@
     uv run scripts/kaggle_push.py -tpu                           # E4B on a TPU VM (Tunix / JAX), full pipeline
     uv run scripts/kaggle_push.py -tpu --hours 4                 # whole notebook limited to 4 h (clock_hours)
     uv run scripts/kaggle_push.py -tpu --set probe=true          # 2-minute on-TPU check of the Tunix path, then stop
-    uv run scripts/kaggle_push.py -multi_lora_sft --internet on  # this push with internet (live W&B charts)
+    uv run scripts/kaggle_push.py -training --internet on        # this push with internet (live W&B charts; not on 4xL4)
     uv run scripts/kaggle_push.py -tpu --set tune=true           # Optuna search on the TPU instead of a training run
     uv run scripts/kaggle_push.py -training                      # push, wait for the run, download outputs + log
     uv run scripts/kaggle_push.py -training --set dry_run=true   # RUN overrides baked into the pushed notebook
@@ -24,6 +24,10 @@ unpushed commits would make the run differ from it.
 Pipelines are declared in scripts/kaggle_settings.json; each key under "pipelines" becomes a -<name> flag. Runs are
 saved to runs/kaggle/<slug>_<timestamp>/ (gitignored). Credentials: ~/.kaggle/kaggle.json, KAGGLE_* env vars, or the
 gitignored repo .env.
+
+Internet: Kaggle does not allow internet on the 4xL4 machine (NvidiaL4), so those pushes are always offline; a settings
+file or --internet on that asks for it is refused before anything is pushed. The pushed notebook is told
+(RUN["internet"]) so it skips every network step instead of waiting on it.
 
 W&B: a run without internet logs offline into its output. After the download, every `wandb/offline-run-*` folder is
 uploaded with `wandb sync` when a W&B key is available here (WANDB_API_KEY in the environment / .env, or a prior
@@ -47,6 +51,7 @@ PUSH_DIR = REPO / "kaggle" / ".push"
 RUNS_DIR = REPO / "runs" / "kaggle"
 MARKER = "# @@RUN_OVERRIDES@@"
 TERMINAL = {"complete", "error", "cancelrequested", "cancelacknowledged"}
+NO_INTERNET_SHAPES = {"NvidiaL4"}  # Kaggle runs the 4xL4 machine without internet; enabling it is not allowed
 UTF8_ENV = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}  # the CLI echoes kernel logs; cp1252 chokes
 
 
@@ -147,9 +152,21 @@ def wandb_sync(out: Path) -> None:
         print(f"W&B sync failed: {exc}")
 
 
+def resolve_internet(p: dict, flag: bool | None) -> bool:
+    """The push's enable_internet: --internet wins over the settings; refused on machines that must run offline."""
+    wanted = p.get("enable_internet", True) if flag is None else flag
+    if wanted and p["machine_shape"] in NO_INTERNET_SHAPES:
+        source = "--internet on" if flag else "enable_internet: true in scripts/kaggle_settings.json"
+        sys.exit(f"{p['machine_shape']} (4xL4) does not allow internet, but {source} asks for it. Push without it: "
+                 "the run logs W&B offline and this script uploads it with `wandb sync` after the download.")
+    return wanted
+
+
 def build_kernel(s: dict, name: str, overrides: dict, internet: bool | None = None) -> tuple[Path, dict]:
     """Copy the notebook into kaggle/.push/<name> with RUN_OVERRIDES filled in, plus its kernel-metadata.json."""
     p = s["pipelines"][name]
+    internet = resolve_internet(p, internet)
+    overrides = {**overrides, "internet": internet}  # the notebook skips its network steps when False
     nb_path = REPO / p["notebook"]
     nb = json.loads(nb_path.read_text(encoding="utf-8"))
     hits = 0
@@ -180,7 +197,7 @@ def build_kernel(s: dict, name: str, overrides: dict, internet: bool | None = No
         "is_private": p.get("is_private", True),
         "enable_gpu": not p["machine_shape"].startswith("Tpu"),
         "enable_tpu": p["machine_shape"].startswith("Tpu"),
-        "enable_internet": p.get("enable_internet", True) if internet is None else internet,
+        "enable_internet": internet,
         "competition_sources": [s["competition"]],
         "dataset_sources": [s["repo_dataset"], *p.get("wheelhouses", []), *p.get("private_datasets", []),
                             *existing_datasets(p.get("optional_datasets", []))],
@@ -290,7 +307,7 @@ def main() -> None:
     ap.add_argument("--hours", type=float, default=None, metavar="H",
                     help="whole-notebook wall clock in hours, e.g. 4 or 11.3 (sets RUN clock_hours; Kaggle caps 12 GPU / 9 TPU)")
     ap.add_argument("--internet", choices=["on", "off"], default=None,
-                    help="override the pipeline's enable_internet for this push (on = live W&B charts)")
+                    help="override the pipeline's enable_internet for this push (on = live W&B charts; refused on 4xL4)")
     ap.add_argument("--no-wandb-sync", action="store_true", help="do not upload offline W&B runs after downloading outputs")
     args = ap.parse_args()
 
@@ -313,6 +330,7 @@ def main() -> None:
     overrides = {**repo_state(), **p.get("run_defaults", {}), **clock, **parse_sets(args.set)}
     internet = None if args.internet is None else args.internet == "on"
     kdir, meta = build_kernel(s, args.pipeline, overrides, internet)
+    overrides["internet"] = meta["enable_internet"]
     print(f"RUN_OVERRIDES = {overrides}  (internet {'on' if meta['enable_internet'] else 'off'})")
     check_sources(meta["dataset_sources"], meta["model_sources"])
     kaggle("kernels", "push", "-p", str(kdir))
