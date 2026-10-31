@@ -11,7 +11,7 @@ Implements design_doc.md §6.2 and §9.1–§9.4:
 from __future__ import annotations
 
 import argparse
-import inspect
+import asyncio
 import json
 import math
 import os
@@ -23,7 +23,6 @@ from typing import Any
 
 import yaml
 
-from ...src.data.loader import load_tasks
 from ..config import PipelineConfig, load_config
 from ..runctx import PhaseStatus, RunContext, configure_phase_logging, utc_iso
 from ..training.parity import evaluate_parity_against_hf
@@ -258,6 +257,8 @@ def _extract_task_result_fields(res: Any, task_id: str, duration_sec: float) -> 
 
     turns = _get("turns", "num_turns", "turn_count")
     tool_errors = _get("tool_call_errors", "tool_errors", "num_tool_errors")
+    tool_calls = _get("tool_calls")
+    exit_code = _get("test_exit_code")
 
     return {
         "task_id": task_id,
@@ -266,6 +267,8 @@ def _extract_task_result_fields(res: Any, task_id: str, duration_sec: float) -> 
         "patch_applied": patch_applied,
         "turns": int(turns) if isinstance(turns, (int, float)) else None,
         "tool_call_errors": int(tool_errors) if isinstance(tool_errors, (int, float)) else None,
+        "tool_calls": int(tool_calls) if isinstance(tool_calls, (int, float)) else None,
+        "test_exit_code": exit_code,
         "duration_sec": round(duration_sec, 2),
         "error": err_str or None,
     }
@@ -313,17 +316,6 @@ def _start_server_failing_fast(server: Any, logger: Any, poll_sec: float = 5.0) 
         watcher.join(timeout=poll_sec + 1.0)
 
 
-def _build_kwargs_filtered(cls_or_fn: Any, candidate_kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Filters `candidate_kwargs` to parameters accepted by `cls_or_fn` so minor wheel signature shifts never break."""
-    try:
-        sig = inspect.signature(cls_or_fn)
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-            return candidate_kwargs
-        return {k: v for k, v in candidate_kwargs.items() if k in sig.parameters}
-    except (TypeError, ValueError):
-        return candidate_kwargs
-
-
 def run_eval_phase(
     ctx: RunContext,
     cfg: PipelineConfig | None = None,
@@ -358,12 +350,39 @@ def run_eval_phase(
     server = None
 
     try:
+        # The swegemma / adk_submission calls below follow the official "Getting Started - Gemma 4 Developer Agent"
+        # notebook (ryanholbrook), the reference for how the scorer drives these packages. Arguments are passed
+        # explicitly, so a signature change raises at once instead of being silently dropped.
         import adk_submission  # type: ignore[import-not-found]
-        import swegemma.evaluate as swe_eval  # type: ignore[import-not-found]
+        import litellm  # type: ignore[import-not-found]
+        from google.adk.agents.context_cache_config import ContextCacheConfig  # type: ignore[import-not-found]
+        from google.adk.apps._configs import EventsCompactionConfig  # type: ignore[import-not-found]
+        from swegemma.config import (  # type: ignore[import-not-found]
+            ALLOWED_ADAPTER_EXTENSIONS,
+            EvalConfig,
+            build_submission_limits,
+        )
+        from swegemma.evaluate import Evaluator  # type: ignore[import-not-found]
+        from swegemma.models import load_tasks as load_swe_tasks  # type: ignore[import-not-found]
 
+        litellm.drop_params = True
         served_id = cfg.effective_served_model_id()
         served_model_path = cfg.model.served_path or served_id
+        if not cfg.data.tasks_file or not Path(cfg.data.tasks_file).is_file():
+            raise FileNotFoundError(f"data.tasks_file not found: {cfg.data.tasks_file}")
+        if not cfg.eval.snapshots_dir or not Path(cfg.eval.snapshots_dir).is_dir():
+            raise FileNotFoundError(f"eval.snapshots_dir not found: {cfg.eval.snapshots_dir}")
+
         adapter_paths, adapter_ranks = _discover_staged_adapters(ctx.submission_dir)
+        # Same discovery the scorer runs: adapters/<name>/ is served as LoRA module <name>, which `adapter: <name>`
+        # in the agent YAML routes to. VllmServer mounts these itself (VllmConfig has no lora_modules field).
+        adapter_manifest = adk_submission.discover_adapters(
+            str(ctx.submission_dir), adapter_extensions=ALLOWED_ADAPTER_EXTENSIONS
+        )
+        served_adapters = set(getattr(adapter_manifest, "adapters", None) or {})
+        if served_adapters != set(adapter_paths):
+            notes.append(f"Scorer discovers adapters {sorted(served_adapters)}, staged dirs are {sorted(adapter_paths)}")
+            logger.warning(notes[-1])
 
         extra_args: list[str] = []
         if served_id == "gemma-4-12b-it-qat-w4a16-ct":
@@ -376,47 +395,106 @@ def run_eval_phase(
         # what pushed 31B past 22 GiB per L4). VllmServer passes this process's environment to the server.
         os.environ.setdefault("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
 
-        vllm_cfg_cls = adk_submission.VllmConfig
-        vllm_srv_cls = adk_submission.VllmServer
-
-        vllm_kwargs = _build_kwargs_filtered(
-            vllm_cfg_cls,
-            {
-                "model": served_model_path,
-                "served_model_name": served_id,
-                "host": cfg.eval.vllm.host,
-                "port": cfg.eval.vllm.port,
-                "tensor_parallel_size": cfg.eval.vllm.tensor_parallel_size,
-                "gpu_memory_utilization": cfg.eval.vllm.gpu_memory_utilization,
-                "max_model_len": cfg.eval.vllm.max_model_len,
-                "tool_call_parser": "gemma4",
-                "reasoning_parser": "gemma4",
-                "enable_auto_tool_choice": True,
-                "enable_lora": bool(adapter_paths),
-                "max_loras": max(1, len(adapter_paths)),
-                "max_lora_rank": max(adapter_ranks.values()) if adapter_ranks else 128,
-                "lora_modules": {k: str(v) for k, v in adapter_paths.items()},
-                "startup_timeout": cfg.eval.vllm.startup_timeout,
-                "extra_args": extra_args,
-            },
+        vllm_cfg = adk_submission.VllmConfig(
+            model=served_model_path,
+            host=cfg.eval.vllm.host,
+            port=cfg.eval.vllm.port,
+            tool_call_parser="gemma4",
+            reasoning_parser="gemma4",
+            max_model_len=cfg.eval.vllm.max_model_len,
+            dtype="bfloat16",
+            gpu_memory_utilization=cfg.eval.vllm.gpu_memory_utilization,
+            enable_auto_tool_choice=True,
+            enable_lora=bool(served_adapters),
+            max_loras=max(1, len(served_adapters)),
+            max_lora_rank=max(adapter_ranks.values()) if adapter_ranks else 128,
+            scheduler_reserve_full_isl=False,
+            tensor_parallel_size=cfg.eval.vllm.tensor_parallel_size,
+            startup_timeout=cfg.eval.vllm.startup_timeout,
+            extra_args=extra_args,
         )
-        server = vllm_srv_cls(vllm_cfg_cls(**vllm_kwargs))
-        logger.info("Starting VllmServer for %s (adapters=%s)", served_id, list(adapter_paths.keys()))
+        server = adk_submission.VllmServer(vllm_cfg, adapter_manifest=adapter_manifest)
+        # vLLM serves the base model under its --model path (there is no --served-model-name); the registry maps
+        # the YAML's model id onto it and adds "adapter:<name>" aliases for the mounted LoRAs.
+        base_model_name = vllm_cfg.model
+        model_registry = server.create_model_registry(
+            aliases=[served_id], model_prefix="openai/", api_key=os.environ.get("LOCAL_API_KEY", "EMPTY")
+        )
+
+        # Build the whole evaluator before vLLM loads (5+ min on 31B), so an API mismatch fails in seconds.
+        swe_tasks = {t.instance_id: t for t in load_swe_tasks(Path(cfg.data.tasks_file))}
+        target_count = 1 if cfg.run.mode == "calibration" else 3
+        chosen_ids = list(cfg.eval.task_ids[:target_count])
+        if not chosen_ids:
+            # Deterministic tasks from distinct repos when none are configured
+            seen_repos: set[str] = set()
+            for tid in sorted(swe_tasks):
+                if swe_tasks[tid].repo not in seen_repos:
+                    chosen_ids.append(tid)
+                    seen_repos.add(swe_tasks[tid].repo)
+                    if len(chosen_ids) >= target_count:
+                        break
+
+        sub_eval: dict[str, Any] = {}
+        eval_cfg_yaml = ctx.submission_dir / "eval_config.yaml"
+        if eval_cfg_yaml.is_file():
+            loaded_ec = yaml.safe_load(eval_cfg_yaml.read_text(encoding="utf-8")) or {}
+            sub_eval = loaded_ec.get("evaluation", loaded_ec) if isinstance(loaded_ec, dict) else {}
+        max_time_minutes = float(sub_eval.get("max_time_minutes", 60.0))
+        if deadline is not None and chosen_ids:
+            # Smoke eval only: shrink the per-task agent budget so every chosen task can finish before the phase
+            # deadline (~6 min vLLM startup, ~5 min pytest verification per task). The packaged zip keeps its budget.
+            fair_share = (deadline - time.time() - 360.0) / 60.0 / len(chosen_ids) - 5.0
+            if fair_share < max_time_minutes:
+                max_time_minutes = max(2.0, fair_share)
+                notes.append(f"Smoke eval agent budget capped at {max_time_minutes:.1f} min/task to fit the deadline")
+        turns_raw = sub_eval.get("max_turns", sub_eval.get("max_llm_calls"))
+        limits, gen_constraints = build_submission_limits()
+        evaluator = Evaluator(
+            EvalConfig(
+                tasks_path=Path(cfg.data.tasks_file),
+                snapshots_dir=Path(cfg.eval.snapshots_dir),
+                results_dir=ctx.eval_results_dir,
+                submission_dir=ctx.submission_dir,
+                models=model_registry,
+                sandbox=cfg.eval.sandbox,
+                timeout_seconds=int(sub_eval.get("timeout_seconds", 300)),
+                verification_timeout_seconds=int(sub_eval.get("verification_timeout_seconds", 300)),
+                max_time_minutes=max_time_minutes,
+                max_tool_calls=int(sub_eval.get("max_tool_calls", 100)),
+                max_turns=int(turns_raw) if turns_raw is not None else None,
+                limits=limits,
+                generation_constraints=gen_constraints,
+                adapter_manifest=adapter_manifest,
+                context_cache_config=ContextCacheConfig(min_tokens=2048, ttl_seconds=1800, cache_intervals=10),
+                events_compaction_config=EventsCompactionConfig(
+                    compaction_interval=15, overlap_size=2, token_threshold=14336, event_retention_size=5
+                ),
+                graph_dir=cfg.eval.graphs_dir,
+                embeddings_dir=cfg.eval.embeddings_dir,
+                wheels_dir=Path(cfg.eval.wheels_dir) if cfg.eval.wheels_dir else None,
+                verbose=False,
+            )
+        )
+        if hasattr(adk_submission, "install_litellm_reasoning_patch"):
+            adk_submission.install_litellm_reasoning_patch()
+
+        logger.info("Starting VllmServer for %s (adapters=%s)", served_id, sorted(served_adapters))
         _start_server_failing_fast(server, logger)
-        api_base =f"http://{cfg.eval.vllm.host}:{cfg.eval.vllm.port}/v1"
+        api_base = f"http://{cfg.eval.vllm.host}:{cfg.eval.vllm.port}/v1"
 
         # 1. Parity check (§9.3 — runs first before tasks)
         if cfg.parity.enabled:
             # Map trained adapter -> served slot name
             inv_map: dict[str, str] = {}
             for slot_n, target_n in cfg.submission.adapter_map.items():
-                if slot_n in adapter_paths and target_n not in inv_map:
+                if slot_n in served_adapters and target_n not in inv_map:
                     inv_map[target_n] = slot_n
 
             for spec in cfg.adapters:
                 hf_ref_path = ctx.parity_dir / f"{spec.name}_hf.json"
                 served_lora_name = inv_map.get(spec.name, spec.name)
-                if not hf_ref_path.is_file() or served_lora_name not in adapter_paths:
+                if not hf_ref_path.is_file() or served_lora_name not in served_adapters:
                     continue
                 hf_ref = json.loads(hf_ref_path.read_text(encoding="utf-8"))
                 gen_toks = int(hf_ref.get("gen_tokens", cfg.parity.gen_tokens))
@@ -434,7 +512,7 @@ def run_eval_phase(
                     v_base.append(
                         _vllm_completion_greedy(
                             api_base=api_base,
-                            model_name=served_id,
+                            model_name=base_model_name,
                             prompt_text=p["prompt_text"],
                             max_tokens=gen_toks,
                         )
@@ -454,65 +532,8 @@ def run_eval_phase(
                     logger.warning("PARITY SUSPECT on %s: %s", spec.name, pres)
 
         # 2. Smoke evaluation on 3 fixed tasks (1 task in calibration mode) (§9.2)
-        all_tasks = load_tasks(cfg.data.tasks_file) if cfg.data.tasks_file and Path(cfg.data.tasks_file).is_file() else []
-        tasks_by_id = {str(t.get("instance_id") or t.get("task_id")): t for t in all_tasks}
-
-        target_count = 1 if cfg.run.mode == "calibration" else 3
-        chosen_ids = list(cfg.eval.task_ids[:target_count])
-        if not chosen_ids and tasks_by_id:
-            # Pick deterministic tasks from distinct repos if none were specified
-            seen_repos: set[str] = set()
-            for tid in sorted(tasks_by_id.keys()):
-                repo = str(tasks_by_id[tid].get("repo", ""))
-                if repo not in seen_repos:
-                    chosen_ids.append(tid)
-                    seen_repos.add(repo)
-                    if len(chosen_ids) >= target_count:
-                        break
-
-        sub_eval_limits: dict[str, Any] = {}
-        eval_cfg_yaml = ctx.submission_dir / "eval_config.yaml"
-        if eval_cfg_yaml.is_file():
-            loaded_ec = yaml.safe_load(eval_cfg_yaml.read_text(encoding="utf-8")) or {}
-            if isinstance(loaded_ec.get("evaluation"), dict):
-                sub_eval_limits = loaded_ec["evaluation"]
-
-        if hasattr(adk_submission, "install_litellm_reasoning_patch"):
-            adk_submission.install_litellm_reasoning_patch()
-
-        model_registry = (
-            server.create_model_registry([served_id, *adapter_paths.keys()])
-            if hasattr(server, "create_model_registry")
-            else None
-        )
-
-        eval_cfg_cls = swe_eval.EvalConfig
-        evaluator_cls = swe_eval.Evaluator
-        eval_kwargs = _build_kwargs_filtered(
-            eval_cfg_cls,
-            {
-                "submission_dir": ctx.submission_dir,
-                "agent_dir": ctx.submission_dir,
-                "output_dir": ctx.eval_results_dir,
-                "sandbox": cfg.eval.sandbox,
-                "snapshots_dir": cfg.eval.snapshots_dir,
-                "graphs_dir": cfg.eval.graphs_dir,
-                "embeddings_dir": cfg.eval.embeddings_dir,
-                "wheels_dir": cfg.eval.wheels_dir,
-                "api_base": api_base,
-                "model_registry": model_registry,
-                "compaction_interval": 15,
-                "overlap_size": 2,
-                "token_threshold": 14336,
-                "event_retention_size": 5,
-                **sub_eval_limits,
-            },
-        )
-        evaluator = evaluator_cls(eval_cfg_cls(**eval_kwargs))
-
-        for tid in chosen_ids:
-            now = time.time()
-            if deadline is not None and now >= deadline:
+        for idx, tid in enumerate(chosen_ids, start=1):
+            if deadline is not None and time.time() >= deadline:
                 task_rows.append(
                     {
                         "task_id": tid,
@@ -527,15 +548,17 @@ def run_eval_phase(
                 )
                 continue
 
-            task_obj = tasks_by_id.get(tid, {"instance_id": tid})
             t0_task = time.time()
             try:
-                if hasattr(evaluator, "evaluate_task"):
-                    res = evaluator.evaluate_task(task_obj)
-                else:
-                    res = evaluator.evaluate([task_obj])[0]
+                if tid not in swe_tasks:
+                    raise KeyError(f"task {tid!r} is not in {cfg.data.tasks_file}")
+                logger.info("[%d/%d] Evaluating %s (%s)", idx, len(chosen_ids), tid, swe_tasks[tid].repo)
+                res = evaluator.evaluate_task(task=swe_tasks[tid], task_index=idx, total_tasks=len(chosen_ids))
+                if asyncio.iscoroutine(res):
+                    res = asyncio.run(res)
                 row = _extract_task_result_fields(res, tid, time.time() - t0_task)
-            except Exception as task_exc:  # noqa: BLE001
+            except Exception as task_exc:
+                logger.exception("Smoke task %s failed", tid)
                 row = {
                     "task_id": tid,
                     "result": "FAIL",
@@ -544,8 +567,9 @@ def run_eval_phase(
                     "turns": None,
                     "tool_call_errors": None,
                     "duration_sec": round(time.time() - t0_task, 2),
-                    "error": str(task_exc),
+                    "error": f"{type(task_exc).__name__}: {task_exc}",
                 }
+            logger.info("  -> %s", row)
             task_rows.append(row)
 
         banner = format_smoke_eval_banner(
@@ -596,7 +620,7 @@ def run_eval_phase(
 
     except Exception as exc:
         t_end = time.time()
-        logger.error("Eval phase failed (submission.zip unaffected): %s", exc)
+        logger.exception("Eval phase failed (submission.zip unaffected)")
         status = PhaseStatus(
             phase="eval",
             state="failed",
