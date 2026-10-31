@@ -1,0 +1,27 @@
+# JAX + Tunix stack the Tunix backend was tested with (JAX-CPU: tpu_training/tests). On a TPU VM use jax[tpu].
+# google-tunix is installed with --no-deps: its other declared dependencies (tensorflow-datasets, numba, kagglehub, ...)
+# are not imported by tpu_training. The offline wheelhouse is built by kaggle/build_train_wheels.py (TPU_TESTED).
+#
+#   pip install -r tpu_training/requirements-tpu.txt && pip install --no-deps google-tunix==0.1.7
+jax[tpu]==0.12.0.1
+flax==0.12.12
+optax==0.2.8
+qwix==0.1.8
+orbax-checkpoint==0.12.8
+google-metrax==0.2.4
+clu==0.0.12
+tensorboardX==2.6.5
+jaxtyping==0.3.11
+sentencepiece==0.2.2
+perfetto==0.59.1
+wadler-lindig
+wrapt
+tqdm
+pillow
+pandas
+python-dateutil
+pyyaml
+pyarrow
+fsspec
+safetensors
+numpy>=2.2

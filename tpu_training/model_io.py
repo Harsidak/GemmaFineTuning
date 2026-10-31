@@ -55,19 +55,50 @@ def load_base_model(model_dir: str | Path, model_cfg: Any, *, mesh: Any, dtype: 
 
 
 def attach_lora(model: Any, *, rank: int, alpha: float, seed: int, dropout: float = 0.0, module_path: str = LORA_MODULE_PATH) -> Any:
-    """qwix LoRA on the attention and MLP projections. A: he_uniform, B: zeros (so step 0 equals the base model)."""
+    """qwix LoRA on the attention and MLP projections. A: he_uniform, B: zeros (so step 0 equals the base model).
+
+    qwix adds LoRA by intercepting `einsum` / `dot_general` *while a registered method of the model runs*. The training
+    forward returns hidden states instead of logits, so it is registered as its own method (`train_hidden`) before qwix
+    wraps it; calling the layers from outside that method would silently train nothing.
+    """
     import qwix
     from flax import nnx
 
     if dropout:
         logger.warning("lora.dropout=%s is not applied by the Tunix backend (qwix dropout needs an rng per step)", dropout)
+    cls = type(model)
+    if not hasattr(cls, TRAIN_METHOD):
+        model.__class__ = type(cls.__name__, (cls,), {TRAIN_METHOD: _train_hidden_method})
     provider = qwix.LoraProvider(module_path=module_path, rank=int(rank), alpha=float(alpha))
-    lora_model = qwix.apply_lora_to_model(model, provider, rngs=nnx.Rngs(int(seed)), **model.get_model_input())
+    lora_model = qwix.apply_lora_to_model(
+        model, provider, rngs=nnx.Rngs(int(seed)), methods=(TRAIN_METHOD,), **model.get_model_input()
+    )
     n = sum(1 for _ in _lora_leaves(lora_model))
     if n == 0:
         raise ModelLoadError(f"qwix attached no LoRA tensors (module_path={module_path!r}); is this a Gemma 4 Tunix model?")
     logger.info("LoRA attached: %d tensors (rank %d, alpha %s)", n, rank, alpha)
     return lora_model
+
+
+def set_remat(model: Any, remat: str) -> int:
+    """Switch activation checkpointing on every module that carries the model config. Returns the module count.
+
+    Must happen AFTER `attach_lora`: qwix creates the LoRA parameters lazily during its first call, and inside
+    `nnx.remat` (graph_updates=False) those new variables are discarded, which leaves a model with no adapters at all.
+    """
+    import dataclasses
+
+    from tunix.models.gemma4 import model as M
+
+    level = M.RematConfig[remat]
+    cfg_cls = M.ModelConfig
+    n = 0
+    for _, mod in model.iter_modules():
+        cfg = getattr(mod, "config", None)
+        if isinstance(cfg, cfg_cls):
+            mod.config = dataclasses.replace(cfg, remat_config=level)
+            n += 1
+    return n
 
 
 def _lora_leaves(model: Any):
@@ -136,7 +167,10 @@ def cast_tree(tree: Any, dtype: Any) -> Any:
 
 
 # ----------------------------------------------------------------------------------------------- forward + loss
-def hidden_states(model: Any, tokens: Any, positions: Any, attn_mask: Any) -> Any:
+TRAIN_METHOD = "train_hidden"
+
+
+def _forward_hidden(model: Any, tokens: Any, positions: Any, attn_mask: Any) -> Any:
     """Final-norm hidden states `[B, T, D]`. Mirrors tunix 0.1.7 `Gemma4.__call__` for the no-cache training path."""
     x = model.embedder.encode(tokens)
     per_layer_inputs = None
@@ -157,6 +191,18 @@ def hidden_states(model: Any, tokens: Any, positions: Any, attn_mask: Any) -> An
         if i in model.shared_layer_origins:
             transient_kvs[f"layer_{i}"] = kvs
     return model.final_norm(x)
+
+
+def _train_hidden_method(self: Any, tokens: Any, positions: Any, cache: Any, attention_mask: Any) -> Any:
+    """Signature matches `Gemma4.__call__` so qwix can drive it with `get_model_input()`."""
+    return _forward_hidden(self, tokens, positions, attention_mask)
+
+
+def hidden_states(model: Any, tokens: Any, positions: Any, attn_mask: Any) -> Any:
+    """Hidden states through the LoRA-aware method when the model has one, else the plain forward (base model)."""
+    if hasattr(type(model), TRAIN_METHOD) and hasattr(type(model), "_unquantized_type"):
+        return getattr(model, TRAIN_METHOD)(tokens, positions, None, attn_mask)
+    return _forward_hidden(model, tokens, positions, attn_mask)
 
 
 def logits_from_hidden(model: Any, x: Any) -> Any:

@@ -4,11 +4,15 @@
 # ///
 """Push a pipeline notebook to Kaggle, run it, and bring its outputs and logs home.
 
+    uv run scripts/kaggle_push.py -multi_lora_sft                # 31B QLoRA on 4xL4 (PyTorch), full pipeline
+    uv run scripts/kaggle_push.py -tpu                           # E4B on a TPU VM (Tunix / JAX), full pipeline
+    uv run scripts/kaggle_push.py -tpu --set tune=true           # Optuna search on the TPU instead of a training run
     uv run scripts/kaggle_push.py -training                      # push, wait for the run, download outputs + log
     uv run scripts/kaggle_push.py -training --set dry_run=true   # RUN overrides baked into the pushed notebook
     uv run scripts/kaggle_push.py -training --no-wait            # push and return
     uv run scripts/kaggle_push.py -training -status              # one status check
     uv run scripts/kaggle_push.py -training -output              # download outputs + log now
+    uv run scripts/kaggle_push.py -tpu -output --publish-bundle  # ... and upload the checkpoint bundle as a dataset version
 
 Workflow: commit -> git push -> update the banwait13/gemmafinetuning dataset -> this script. The notebook imports the
 repo from that dataset, so this script only stamps the run with the local git SHA and warns when the working tree or
@@ -105,6 +109,17 @@ def parse_sets(pairs: list[str]) -> dict:
     return out
 
 
+def existing_datasets(ids: list[str]) -> list[str]:
+    """The subset of `ids` that exist and are readable (an optional dataset is simply left off until it has been created)."""
+    keep = []
+    for d in ids:
+        if kaggle("datasets", "files", d, "--page-size", "1", capture=True).returncode == 0:
+            keep.append(d)
+        else:
+            print(f"note: optional dataset {d} does not exist yet; not attaching it (it is created from the first run's bundle)")
+    return keep
+
+
 def build_kernel(s: dict, name: str, overrides: dict) -> tuple[Path, dict]:
     """Copy the notebook into kaggle/.push/<name> with RUN_OVERRIDES filled in, plus its kernel-metadata.json."""
     p = s["pipelines"][name]
@@ -140,7 +155,8 @@ def build_kernel(s: dict, name: str, overrides: dict) -> tuple[Path, dict]:
         "enable_tpu": p["machine_shape"].startswith("Tpu"),
         "enable_internet": p.get("enable_internet", True),
         "competition_sources": [s["competition"]],
-        "dataset_sources": [s["repo_dataset"], *p.get("wheelhouses", []), *p.get("private_datasets", [])],
+        "dataset_sources": [s["repo_dataset"], *p.get("wheelhouses", []), *p.get("private_datasets", []),
+                            *existing_datasets(p.get("optional_datasets", []))],
         "kernel_sources": [],
         "model_sources": p.get("model_sources", []),
         "machine_shape": p["machine_shape"],
@@ -189,6 +205,28 @@ def plain_log(raw: Path, dest: Path) -> None:
                 fh.write(f"[{e.get('time', 0):9.1f}s] {prefix}{line}\n")
 
 
+def publish_bundle(out: Path, message: str) -> None:
+    """Upload the run's checkpoint bundle (bundle.json + dataset-metadata.json) as a version of its private dataset.
+
+    Only runs on an explicit --publish-bundle. Creates the dataset the first time. The bundle was already scanned for
+    secrets by the pipeline; the dataset stays private."""
+    metas = sorted(out.rglob("dataset-metadata.json"))
+    bundles = [m.parent for m in metas if (m.parent / "bundle.json").is_file()]
+    if not bundles:
+        sys.exit(f"no checkpoint bundle (bundle.json + dataset-metadata.json) under {out}; was output.dataset_id set for the run?")
+    bdir = bundles[0]
+    ds_id = json.loads((bdir / "dataset-metadata.json").read_text(encoding="utf-8")).get("id")
+    if not ds_id or "/" not in ds_id:
+        sys.exit(f"{bdir / 'dataset-metadata.json'} has no usable dataset id: {ds_id!r}")
+    print(f"publishing {bdir} -> {ds_id}")
+    exists = kaggle("datasets", "files", ds_id, "--page-size", "1", capture=True).returncode == 0
+    if exists:
+        kaggle("datasets", "version", "-p", str(bdir), "-m", message, "--dir-mode", "zip")
+    else:
+        kaggle("datasets", "create", "-p", str(bdir), "--dir-mode", "zip")  # private by default
+    print(f"https://www.kaggle.com/datasets/{ds_id}  (delete older versions from the dataset page when you no longer need them)")
+
+
 def download(kid: str, slug: str) -> Path:
     out = RUNS_DIR / f"{slug}_{time.strftime('%Y%m%d_%H%M%S')}"
     out.mkdir(parents=True)
@@ -219,6 +257,8 @@ def main() -> None:
                         help="download outputs + log of the latest run and exit")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="override a RUN key")
     ap.add_argument("--no-wait", action="store_true", help="push and return without waiting")
+    ap.add_argument("--publish-bundle", action="store_true",
+                    help="after downloading outputs, upload the checkpoint bundle as a new dataset version (explicit opt-in)")
     ap.add_argument("--poll", type=int, default=60, help="seconds between status checks (default 60)")
     args = ap.parse_args()
 
@@ -228,10 +268,12 @@ def main() -> None:
         print(f"{kid}: {status(kid)}")
         return
     if args.action == "output":
-        download(kid, p["kernel_slug"])
+        out = download(kid, p["kernel_slug"])
+        if args.publish_bundle:
+            publish_bundle(out, f"{p['kernel_slug']} {time.strftime('%Y-%m-%d %H:%M')}")
         return
 
-    overrides = {**repo_state(), **parse_sets(args.set)}
+    overrides = {**repo_state(), **p.get("run_defaults", {}), **parse_sets(args.set)}
     kdir, meta = build_kernel(s, args.pipeline, overrides)
     print(f"RUN_OVERRIDES = {overrides}")
     check_sources(meta["dataset_sources"], meta["model_sources"])
@@ -240,7 +282,9 @@ def main() -> None:
     if args.no_wait:
         return
     final = wait(kid, args.poll)
-    download(kid, p["kernel_slug"])
+    out = download(kid, p["kernel_slug"])
+    if args.publish_bundle:
+        publish_bundle(out, f"{p['kernel_slug']} {time.strftime('%Y-%m-%d %H:%M')}")
     if final != "complete":
         sys.exit(f"run ended with status {final!r}; see run.log above")
 

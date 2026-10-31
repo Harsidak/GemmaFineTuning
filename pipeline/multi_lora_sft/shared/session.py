@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from .bundle import discover_bundles, resume_candidates
-from .checkpoints import ADAPTER_FILE, RESUME_FILE, checkpoint_is_loadable, read_best_adapter, write_best_adapter
+from .checkpoints import (
+    ADAPTER_FILE,
+    RESUME_FILE,
+    checkpoint_is_loadable,
+    read_best_adapter,
+    write_best_adapter,
+)
 from .compat import (
     Problem,
     ResumeIncompatible,

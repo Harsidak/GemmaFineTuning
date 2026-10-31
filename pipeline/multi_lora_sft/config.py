@@ -502,6 +502,8 @@ def _coerce_scalar(val: Any, target_name: str, field_path: str) -> Any:
             raise ConfigError(f"Expected boolean at {field_path!r}, got {val!r}")
         return val
     if target_name == "str":
+        if isinstance(val, bool) and field_path == "tracking.wandb":
+            return "auto" if val else "off"  # YAML 1.1 reads the bare words on/off/yes/no as booleans
         if not isinstance(val, str):
             raise ConfigError(f"Expected string at {field_path!r}, got {val!r}")
         return val
@@ -559,6 +561,11 @@ def _build_dataclass(cls: type, data: dict[str, Any], prefix: str) -> Any:
         elif t_str in {"float", "float | None"}:
             if val is None and "None" not in t_str:
                 raise ConfigError(f"{f_path!r} cannot be null")
+            if isinstance(val, str):  # YAML 1.1 reads "5e-5" / "1e-05" (no dot) as a string
+                try:
+                    val = float(val)
+                except ValueError:
+                    pass
             if val is not None and (isinstance(val, bool) or not isinstance(val, (int, float))):
                 raise ConfigError(f"{f_path!r} must be a number, got {val!r}")
             kwargs[name] = _coerce_scalar(val, "float", f_path)
@@ -878,6 +885,29 @@ def validate_config(cfg: PipelineConfig) -> None:
         raise ConfigError("eval.vllm.gpu_memory_utilization must be in (0.0, 1.0]")
     if cfg.eval.sandbox not in {"subprocess", "docker"}:
         raise ConfigError(f"eval.sandbox must be 'subprocess' or 'docker', got {cfg.eval.sandbox!r}")
+
+
+def apply_oom_override(eff: EffectiveAdapterConfig, override: dict[str, Any] | None) -> EffectiveAdapterConfig:
+    """Applies a single `oom_fallbacks` dict onto `EffectiveAdapterConfig` (torch-free: shared by both backends)."""
+    if not override:
+        return eff
+    train_dict = dataclasses.asdict(eff.train)
+    quant = eff.model_quantization
+    for k, v in override.items():
+        if k == "quantization":
+            quant = str(v)
+        elif k in train_dict:
+            train_dict[k] = v
+    return EffectiveAdapterConfig(
+        name=eff.name,
+        roles=eff.roles,
+        time_share=eff.time_share,
+        lora=eff.lora,
+        train=type(eff.train)(**train_dict),
+        schedule=eff.schedule,
+        loss=eff.loss,
+        model_quantization=quant,
+    )
 
 
 def load_config(

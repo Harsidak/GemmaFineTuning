@@ -154,7 +154,7 @@ def sync_bundle(
 
     if tuning_dir and Path(tuning_dir).is_dir():
         try:
-            _copy_tree(Path(tuning_dir), root / "tuning")
+            copy_tuning_files(Path(tuning_dir), root / "tuning")
         except Exception as exc:  # noqa: BLE001
             logger.error("Bundle sync failed for tuning dir: %s", exc)
 
@@ -186,6 +186,34 @@ def sync_bundle(
     }
     atomic_write_json(root / BUNDLE_FILE, meta)
     return meta
+
+
+TUNING_FILES = ("study.db", "best_params.json", "trials.json")
+
+
+def copy_tuning_files(src: Path, dst: Path) -> list[str]:
+    """Study database and results only: trial run directories hold checkpoints and caches that must not enter the bundle.
+
+    Copying a bundle's `tuning/` onto itself is a no-op. Returns the copied file names."""
+    copied: list[str] = []
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in TUNING_FILES:
+        f = src / name
+        if f.is_file() and f.resolve() != (dst / name).resolve():
+            shutil.copy2(f, dst / name)
+            copied.append(name)
+    return copied
+
+
+def tuning_source(explicit_dir: str | Path | None, bundle_dirs: Iterable[str | Path]) -> Path | None:
+    """Where the next bundle takes its `tuning/` from: this run's study dir, else the newest attached bundle that has one."""
+    if explicit_dir and Path(explicit_dir).is_dir():
+        return Path(explicit_dir)
+    for b in bundle_dirs:
+        t = Path(b) / "tuning"
+        if any((t / n).is_file() for n in TUNING_FILES):
+            return t
+    return None
 
 
 def previous_session_count(bundle_dirs: Iterable[str | Path]) -> int:

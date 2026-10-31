@@ -1,5 +1,5 @@
 {
-  "_comment": "docker_image = the competition's pinned Python 3.12 image (copied from the official starter notebook's metadata); without it Kaggle uses its default Python 3.13 image and the cp312 wheelhouse will not install. Read by scripts/kaggle_push.py. Each key under 'pipelines' becomes a -<name> flag. No secrets here: credentials come from ~/.kaggle/kaggle.json or KAGGLE_* env vars.",
+  "_comment": "docker_image = the competition's pinned Python 3.12 image (copied from the official starter notebook's metadata); without it Kaggle uses its default Python 3.13 image and the cp312 wheelhouse will not install. Read by scripts/kaggle_push.py. Each key under 'pipelines' becomes a -<name> flag. No secrets here: credentials come from ~/.kaggle/kaggle.json or KAGGLE_* env vars. 'run_defaults' are RUN overrides baked into the notebook (a --set on the command line wins). 'optional_datasets' are attached only when they exist (the checkpoint bundle appears after the first run). TPU: machine_shape TpuV5E8 selects the TPU VM; the pipeline named 'tpu' is the -tpu flag.",
   "username": "banwait13",
   "competition": "gemma-4-developer-agent",
   "repo_dataset": "banwait13/gemmafinetuning",
@@ -10,7 +10,9 @@
       "kernel_title": "GemmaFineTuning Training",
       "wheelhouses": [],
       "private_datasets": [],
-      "model_sources": ["google/gemma-4/transformers/gemma-4-e4b-it-qat-q4_0-unquantized/2"],
+      "model_sources": [
+        "google/gemma-4/transformers/gemma-4-e4b-it-qat-q4_0-unquantized/2"
+      ],
       "machine_shape": "NvidiaTeslaT4",
       "enable_internet": true,
       "is_private": true
@@ -19,7 +21,10 @@
       "notebook": "kaggle/multi_lora_sft.ipynb",
       "kernel_slug": "gemmafinetuning-multi-lora-sft",
       "kernel_title": "GemmaFineTuning Multi-LoRA SFT",
-      "wheelhouses": ["metric/gemma-4-developer-agent-wheelhouse", "banwait13/gemmafinetunewheels"],
+      "wheelhouses": [
+        "metric/gemma-4-developer-agent-wheelhouse",
+        "banwait13/gemmafinetunewheels"
+      ],
       "private_datasets": [],
       "model_sources": [
         "google/gemma-4/transformers/gemma-4-31b-it-qat-q4_0-unquantized/1",
@@ -28,14 +33,25 @@
       "machine_shape": "NvidiaL4",
       "enable_internet": false,
       "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
-      "is_private": true
+      "is_private": true,
+      "run_defaults": {
+        "preset": "31b_gpu_full"
+      },
+      "optional_datasets": [
+        "banwait13/gemmafinetuning-lora-bundle"
+      ]
     },
     "multi_lora_sft_e4b": {
       "notebook": "kaggle/multi_lora_sft.ipynb",
       "kernel_slug": "gemmafinetuning-multi-lora-sft-e4b",
       "kernel_title": "GemmaFineTuning Multi-LoRA SFT E4B",
-      "wheelhouses": ["metric/gemma-4-developer-agent-wheelhouse", "banwait13/gemmafinetunewheels"],
-      "private_datasets": ["banwait13/gemmafinetuning-private-data"],
+      "wheelhouses": [
+        "metric/gemma-4-developer-agent-wheelhouse",
+        "banwait13/gemmafinetunewheels"
+      ],
+      "private_datasets": [
+        "banwait13/gemmafinetuning-private-data"
+      ],
       "model_sources": [
         "google/gemma-4/transformers/gemma-4-e4b-it-qat-q4_0-unquantized/2",
         "google/gemma-4/other/gemma-4-e4b-it-qat-w4a16-ct/2"
@@ -43,7 +59,39 @@
       "machine_shape": "NvidiaL4",
       "enable_internet": false,
       "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
+      "is_private": true,
+      "run_defaults": {
+        "preset": "e4b_gpu_full"
+      },
+      "optional_datasets": [
+        "banwait13/gemmafinetuning-lora-bundle"
+      ]
+    },
+    "tpu": {
+      "notebook": "kaggle/multi_lora_sft.ipynb",
+      "kernel_slug": "gemmafinetuning-multi-lora-sft-tpu",
+      "kernel_title": "GemmaFineTuning Multi-LoRA SFT TPU",
+      "wheelhouses": [
+        "metric/gemma-4-developer-agent-wheelhouse",
+        "banwait13/gemmafinetunewheels"
+      ],
+      "private_datasets": [
+        "banwait13/gemmafinetuning-private-data"
+      ],
+      "optional_datasets": [
+        "banwait13/gemmafinetuning-lora-bundle"
+      ],
+      "model_sources": [
+        "google/gemma-4/transformers/gemma-4-e4b-it-qat-q4_0-unquantized/2",
+        "google/gemma-4/other/gemma-4-e4b-it-qat-w4a16-ct/2"
+      ],
+      "machine_shape": "TpuV5E8",
+      "enable_internet": true,
+      "run_defaults": {
+        "preset": "e4b_tpu"
+      },
       "is_private": true
     }
-  }
+  },
+  "checkpoint_bundle_dataset": "banwait13/gemmafinetuning-lora-bundle"
 }

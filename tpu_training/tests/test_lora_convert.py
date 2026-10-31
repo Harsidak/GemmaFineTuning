@@ -22,7 +22,7 @@ SCALE = 2.0  # alpha / r
 def _model_params(rng: np.random.Generator, layers: int = 3) -> dict[str, np.ndarray]:
     """Random LoRA tensors with exactly the shapes qwix produces for a tiny Gemma 4 (see the probe in the docstring)."""
     t: dict[str, np.ndarray] = {}
-    r = lambda *s: rng.standard_normal(s).astype(np.float32)  # noqa: E731
+    r = lambda *s: rng.standard_normal(s).astype(np.float32)
     for L in range(layers):
         p = f"layers/{L}"
         t[f"{p}/attn/q_einsum/w_lora_a"], t[f"{p}/attn/q_einsum/w_lora_b"] = r(D, R), r(R, N, H)

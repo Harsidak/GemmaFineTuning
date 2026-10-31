@@ -100,7 +100,7 @@ def params_to_sets(params: dict[str, Any], base_r: int) -> list[str]:
         sets.append(f"{key}={json.dumps(val)}")
     if mult is not None:
         r = int(p.get("lora.r", base_r))
-        sets.append(f"lora.alpha={json.dumps(int(round(r * float(mult))))}")
+        sets.append(f"lora.alpha={json.dumps(round(r * float(mult)))}")
     return sets
 
 
@@ -340,12 +340,32 @@ def _default_runner(cmd: list[str], trial_dir: Path, trial: Any, adapter: str, p
         return int(proc.returncode or 0)
 
 
+def _bundles_hold_checkpoints(bundle_dirs: list[str | Path]) -> bool:
+    from .checkpoints import list_checkpoints
+
+    for b in bundle_dirs:
+        root = Path(b)
+        if root.is_dir() and any(list_checkpoints(d) for d in root.iterdir() if d.is_dir()):
+            return True
+    return False
+
+
 def apply_best_params(sets: list[str], bundle_dirs: list[str | Path]) -> tuple[list[str], str | None]:
-    """Adds an attached bundle's tuned parameters in front of `sets` (so explicit later overrides still win)."""
+    """Adds an attached bundle's tuned parameters in front of `sets` (so explicit later overrides still win).
+
+    When the same bundle already holds resumable checkpoints, the tuned `lora.*` values (rank / alpha) are dropped: a
+    different rank makes those checkpoints incompatible and the run would silently restart from scratch.
+    """
     from .bundle import best_params_from_bundles
 
     best = best_params_from_bundles(bundle_dirs)
     if not best:
         return sets, None
+    tuned = list(best.get("sets", []))
     note = f"tuned params from trial {best.get('trial')} (val {best.get('value')}): {best.get('params')}"
-    return [*best.get("sets", []), *sets], note
+    if _bundles_hold_checkpoints(bundle_dirs):
+        kept = [x for x in tuned if not x.startswith("lora.")]
+        if len(kept) != len(tuned):
+            note += f" [lora.* ignored: {sorted(set(tuned) - set(kept))}; the attached bundle has checkpoints that must stay resumable]"
+        tuned = kept
+    return [*tuned, *sets], note

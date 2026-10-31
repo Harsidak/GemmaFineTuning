@@ -25,6 +25,7 @@ from pipeline.multi_lora_sft.shared.bundle import (
     discover_bundles,
     resume_candidates,
     sync_bundle,
+    tuning_source,
 )
 from pipeline.multi_lora_sft.shared.checkpoints import (
     CheckpointError,
@@ -449,6 +450,56 @@ def test_sync_bundle_copies_latest_and_discovery_finds_it(tmp_path: Path) -> Non
     assert discover_bundles([tmp_path / "does-not-exist"]) == []
 
 
+def test_tuning_bundle_carries_only_study_files_and_survives_a_session_without_a_study(tmp_path: Path) -> None:
+    study = tmp_path / "study"
+    (study / "trials" / "trial_0000" / "checkpoints").mkdir(parents=True)
+    (study / "trials" / "trial_0000" / "checkpoints" / "big.bin").write_bytes(b"x" * 1000)
+    (study / "shared_cache").mkdir()
+    (study / "shared_cache" / "train.parquet").write_bytes(b"p")
+    (study / "study.db").write_bytes(b"sqlite")
+    (study / "best_params.json").write_text('{"params": {"train.lr": 0.0001}, "sets": ["train.lr=0.0001"]}')
+    out1 = tmp_path / "bundle1"
+    sync_bundle(out1, run_checkpoints_dir=tmp_path / "none", adapters=[], served_model_id="m", tuning_dir=study)
+    assert sorted(p.name for p in (out1 / "tuning").iterdir()) == ["best_params.json", "study.db"]  # no trials / caches
+    # A later normal run has no study of its own; it must still hand the attached bundle's results on to the next bundle.
+    assert tuning_source(None, [out1]) == out1 / "tuning"
+    assert tuning_source(study, [out1]) == study
+    out2 = tmp_path / "bundle2"
+    sync_bundle(out2, run_checkpoints_dir=tmp_path / "none", adapters=[], served_model_id="m", tuning_dir=tuning_source(None, [out1]))
+    assert (out2 / "tuning" / "best_params.json").is_file() and (out2 / "tuning" / "study.db").is_file()
+    assert best_params_from_bundles([out2])
+    # Syncing a bundle onto itself must not fail or truncate the files.
+    sync_bundle(out2, run_checkpoints_dir=tmp_path / "none", adapters=[], served_model_id="m", tuning_dir=out2 / "tuning")
+    assert (out2 / "tuning" / "study.db").read_bytes() == b"sqlite"
+    assert tuning_source(None, [tmp_path / "nothing"]) is None
+
+
+def test_run_applies_tuned_params_from_an_attached_bundle(tmp_path: Path) -> None:
+    from pipeline.multi_lora_sft.run import with_tuned_params
+    from pipeline.multi_lora_sft.shared.fsio import atomic_write_json
+
+    bundle = tmp_path / "bundle"
+    atomic_write_json(bundle / "bundle.json", {"schema": 1})
+    atomic_write_json(bundle / "tuning" / "best_params.json",
+                      {"trial": 3, "value": 1.5, "params": {"train.lr": 2e-4}, "sets": ["train.lr=0.0002", "lora.r=16", "lora.alpha=32"]})
+    base = [f"resume.bundle_dirs=[{bundle.as_posix()!r}]".replace("'", '"'), "resume.auto_discover=false"]
+    cfg, sets, note = with_tuned_params(None, base)
+    assert cfg.train.lr == 2e-4 and cfg.lora.r == 16 and cfg.lora.alpha == 32
+    assert note and "trial 3" in note
+    # explicit overrides still win over the tuned value
+    cfg2, _, _ = with_tuned_params(None, [*base, "train.lr=5e-5"])
+    assert cfg2.train.lr == 5e-5
+    # never inside a tuning trial, and never when switched off
+    assert with_tuned_params(None, [*base, "tuning.active=true"])[2] is None
+    assert with_tuned_params(None, [*base, "tuning.use_best_params=false"])[2] is None
+    # a bundle that already has checkpoints keeps its LoRA shape: tuned lora.* is dropped, the rest applies
+    from pipeline.multi_lora_sft.shared.checkpoints import write_checkpoint
+
+    write_checkpoint(bundle / "main_lora", 5, fake_checkpoint_writer(5))
+    cfg3, _, note3 = with_tuned_params(None, base)
+    assert note3 and "lora.* ignored" in note3 and cfg3.train.lr == 2e-4 and cfg3.lora.r != 16
+
+
 def test_bundle_removes_files_that_contain_secrets(tmp_path: Path) -> None:
     root = _run_ckpts(tmp_path)
     (root / "main_lora" / "step_000020" / "notes.json").write_text('{"token": "hf_' + "z" * 34 + '"}')
@@ -496,6 +547,21 @@ def test_resolve_backend(requested, model, acc, tpu, expect) -> None:
 
 
 # ----------------------------------------------------------------------------------------------- config rules
+def test_float_overrides_in_exponent_notation_without_a_dot_are_numbers() -> None:
+    # PyYAML parses `5e-5` / `1e-05` as strings; the notebook's json.dumps(1e-05) produces exactly that.
+    cfg = load_config(None, ["train.lr=5e-5", "train.max_grad_norm=1e-05", "schedule.final_lr_ratio=1e-1"])
+    assert (cfg.train.lr, cfg.train.max_grad_norm, cfg.schedule.final_lr_ratio) == (5e-5, 1e-5, 0.1)
+    with pytest.raises(ConfigError):
+        load_config(None, ["train.lr=fast"])
+
+
+def test_wandb_off_survives_yaml_boolean_parsing() -> None:
+    # `--set tracking.wandb=off` is parsed by YAML as the boolean False; it must still mean "off".
+    assert load_config(None, ["tracking.wandb=off"]).tracking.wandb == "off"
+    assert load_config(None, ["tracking.wandb=on"]).tracking.wandb == "auto"
+    assert load_config(None, ["tracking.wandb=offline"]).tracking.wandb == "offline"
+
+
 def test_new_config_sections_validate() -> None:
     cfg = load_config(None, ["train.backend=tunix", "train.accelerator=tpu", "train.parallelism=spmd", "model.quantization=bf16"])
     assert cfg.train.backend == "tunix"

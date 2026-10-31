@@ -26,8 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .clock import SessionClock
-from .config import AdapterSpec, PipelineConfig, load_config
-from .shared.bundle import discover_bundles, previous_session_count, sync_bundle
+from .config import AdapterSpec, ConfigError, PipelineConfig, load_config
 from .runctx import (
     PhaseStatus,
     RunContext,
@@ -35,6 +34,13 @@ from .runctx import (
     configure_phase_logging,
     utc_iso,
 )
+from .shared.bundle import (
+    discover_bundles,
+    previous_session_count,
+    sync_bundle,
+    tuning_source,
+)
+from .shared.tuning import apply_best_params
 from .training.device import OOM_SIGNATURES, is_oom_text
 
 CommandBuilder = Callable[[str, RunContext, float, dict[str, Any] | None], list[str]]
@@ -313,10 +319,10 @@ class Orchestrator:
         if not out or self.cfg.tuning.active:
             return
         try:
-            previous = previous_session_count(
-                [Path(p) for p in self.cfg.resume.bundle_dirs]
-                + (discover_bundles([self.cfg.resume.input_root]) if self.cfg.resume.auto_discover else [])
+            attached = [Path(p) for p in self.cfg.resume.bundle_dirs] + (
+                discover_bundles([self.cfg.resume.input_root]) if self.cfg.resume.auto_discover else []
             )
+            previous = previous_session_count(attached)
             meta = sync_bundle(
                 out,
                 run_checkpoints_dir=self.ctx.checkpoints_dir,
@@ -326,7 +332,7 @@ class Orchestrator:
                 dataset_title=self.cfg.output.dataset_title,
                 run_id=self.ctx.run_id,
                 git_sha=self.cfg.run.git_sha or os.environ.get("GIT_SHA"),
-                tuning_dir=Path(self.cfg.tuning.storage_dir) if self.cfg.tuning.storage_dir else None,
+                tuning_dir=tuning_source(self.cfg.tuning.storage_dir, attached),
                 previous_sessions=previous,
                 scan_secrets=self.cfg.output.scan_secrets,
             )
@@ -550,10 +556,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def with_tuned_params(config_path: str | None, sets: list[str]) -> tuple[Any, list[str], str | None]:
+    """Loads the config; if an attached bundle carries Optuna's best parameters, applies them (explicit overrides still win)."""
+    cfg = load_config(config_path, sets)
+    if not cfg.tuning.use_best_params or cfg.tuning.active or cfg.tuning.enabled:
+        return cfg, sets, None
+    bundles = [Path(p) for p in cfg.resume.bundle_dirs] + (
+        discover_bundles([cfg.resume.input_root]) if cfg.resume.auto_discover else []
+    )
+    new_sets, note = apply_best_params(sets, bundles)
+    if note is None:
+        return cfg, sets, None
+    try:
+        return load_config(config_path, new_sets), new_sets, note
+    except ConfigError as exc:  # a stale / incompatible best_params.json must never stop a run
+        print(f"warning: ignoring tuned parameters ({exc})", file=sys.stderr)
+        return cfg, sets, None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    cfg = load_config(args.config, args.set_overrides)
+    cfg, _sets, note = with_tuned_params(args.config, list(args.set_overrides or []))
+    if note:
+        print(f"[tuning] {note}", flush=True)
     orch = Orchestrator(cfg)
     result = orch.run()
     return result.exit_code

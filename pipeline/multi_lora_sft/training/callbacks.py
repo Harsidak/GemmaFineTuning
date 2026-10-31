@@ -18,9 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
-import shutil
+import shutil  # noqa: F401 - tests patch `callbacks.shutil.disk_usage`
 import time
 from collections import defaultdict
 from collections.abc import Callable

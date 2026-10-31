@@ -30,10 +30,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..config import EffectiveAdapterConfig, PipelineConfig, load_config
+from ..config import (  # noqa: F401 - re-exported
+    EffectiveAdapterConfig,
+    PipelineConfig,
+    apply_oom_override,
+    load_config,
+)
 from ..runctx import PhaseStatus, RunContext, configure_phase_logging, utc_iso
 from ..shared.backend import resolve_backend
-from ..shared.bundle import discover_bundles, resume_candidates as shared_resume_candidates
+from ..shared.bundle import discover_bundles
+from ..shared.bundle import resume_candidates as shared_resume_candidates
 from ..shared.session import TrainingSession
 from ..training.callbacks import (
     MultiLoraTrainingCallback,
@@ -79,29 +85,6 @@ def _install_stop_handlers() -> None:
             signal.signal(sig, _handler)
         except (ValueError, OSError):  # not on the main thread / unsupported on this platform
             pass
-
-
-def apply_oom_override(eff: EffectiveAdapterConfig, override: dict[str, Any] | None) -> EffectiveAdapterConfig:
-    """Applies a single `oom_fallbacks` dict onto `EffectiveAdapterConfig`."""
-    if not override:
-        return eff
-    train_dict = dataclasses.asdict(eff.train)
-    quant = eff.model_quantization
-    for k, v in override.items():
-        if k == "quantization":
-            quant = str(v)
-        elif k in train_dict:
-            train_dict[k] = v
-    return EffectiveAdapterConfig(
-        name=eff.name,
-        roles=eff.roles,
-        time_share=eff.time_share,
-        lora=eff.lora,
-        train=type(eff.train)(**train_dict),
-        schedule=eff.schedule,
-        loss=eff.loss,
-        model_quantization=quant,
-    )
 
 
 def resume_candidates(ctx: RunContext, cfg: PipelineConfig, adapter_name: str) -> list[Path]:

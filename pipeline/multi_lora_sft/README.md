@@ -22,14 +22,40 @@ Each phase runs in an isolated subprocess under a hard wall-clock deadline from 
 | :--- | :--- | :--- |
 | `cuda` | `model_split` | 31B NF4 QLoRA split across 4×L4 (`configs/31b_full.yaml`) |
 | `cuda` | `ddp` | E4B bf16 LoRA, one replica per GPU (`configs/e4b_full.yaml`) |
-| `tpu` | `spmd` | E4B bf16 LoRA sharded over all TPU chips with torch_xla FSDPv2 (`configs/e4b_tpu.yaml`) |
+| `tpu` | `spmd` | E4B bf16 LoRA sharded over all TPU chips: **Tunix (JAX)** via `train.backend=auto` (`configs/e4b_tpu.yaml`, code in `tpu_training/`); `train.backend=trl` selects the older torch_xla FSDPv2 path |
 | `tpu` / `cuda` / `cpu` | `single` | one device (TPU single core, one GPU, or CPU smoke tests) |
 | `auto` | any | picks TPU > CUDA > CPU at runtime and remaps CUDA-only parallelism on TPU |
 
-TPU specifics: no bitsandbytes (bf16 only), sequences padded to `train.pad_to_multiple_of` (default 512) and the
+`train.backend` (`auto` | `trl` | `tunix`) picks the trainer: `auto` = Tunix for E4B/E2B on a TPU, PyTorch/TRL otherwise. Both write
+the same checkpoints, adapters, status files and `submission.zip`, and share one `TrainingSession`
+(`shared/`: resume, task ledger, guards, best-checkpoint, W&B, adapter contract, bundle). See `tpu_training/README.md`.
+
+TPU specifics (torch_xla path): no bitsandbytes (bf16 only), sequences padded to `train.pad_to_multiple_of` (default 512) and the
 `static` loss so XLA compiles a bounded set of graphs, the SPMD batch is global (multiple of the chip count),
 parity generation and the vLLM smoke eval are skipped. The TPU path has unit coverage for config and loss
 equivalence but has not yet been run on real TPU hardware: start with `run.mode=calibration`.
+
+## Sessions: run → update dataset → run
+
+Checkpoints survive the 12 h / 9 h session limit through a private dataset (`output.dataset_id`, default
+`banwait13/gemmafinetuning-lora-bundle`):
+
+1. A run ends by writing `output.bundle_dir` (`/kaggle/working/lora_checkpoints/`): per adapter the newest `step_N`
+   checkpoint, `best_adapter/`, `final_adapter/` and `progress.json` (the task ledger: which training problems were
+   consumed in the current epoch), plus `bundle.json` and `dataset-metadata.json`. Files containing secrets are removed.
+2. Save the notebook version and publish that folder as a new dataset version (manually, or
+   `uv run scripts/kaggle_push.py -tpu -output --publish-bundle`). Delete old versions on the dataset page.
+3. Attach the dataset to the next run. `resume.auto_discover` finds it; training resumes from the checkpoint and skips
+   the problems already trained on (10,000 problems, stopped at 4,173 → next run starts at 4,174). If the dataset grew,
+   only unseen problems are trained (`resume.on_data_change`). A checkpoint from a different model / LoRA rank / alpha /
+   targets is refused (`resume.strict`) instead of silently restarting.
+4. `resume.extend=true` (notebook: `RUN["continue_training"]`) keeps training past the old schedule's end.
+
+Optuna: `python -m pipeline.multi_lora_sft.tune ...` (notebook `RUN["tune"]=True`) runs short real training trials on
+whichever backend is configured, W&B off, and writes `tuning/{study.db,best_params.json}` into the same bundle. Later normal
+runs apply `best_params.json` automatically (explicit `--set` wins; tuned `lora.*` is skipped while checkpoints are attached).
+W&B is `tracking.wandb=auto`: online only with `WANDB_API_KEY` (Kaggle Secret) and network, else offline; the key is only read
+from the environment.
 
 ## Robustness
 

@@ -15,8 +15,12 @@ from importlib import metadata
 from pathlib import Path
 
 OUT = Path("/kaggle/working/train_wheels")
+OUT_TPU = Path("/kaggle/working/train_wheels_tpu")  # separate wheelhouse: only installed for the Tunix (JAX/TPU) backend
+# Which wheelhouses to build: "core" (PyTorch/TRL stack, GPUs) and/or "tpu" (JAX + Tunix). Override with WHEEL_BUNDLES=tpu.
+BUNDLES = {b.strip() for b in os.environ.get("WHEEL_BUNDLES", "core,tpu").split(",") if b.strip()}
 SCRATCH = Path("/tmp/wheel_build")
-TARGET_PY = (3, 12)  # the official wheelhouse is cp312
+TARGET_PY = tuple(int(x) for x in os.environ.get("WHEEL_PYTHON", "3.12").split("."))  # the official wheelhouse is cp312;
+# for a TPU image on another Python run:  WHEEL_BUNDLES=tpu WHEEL_PYTHON=3.13  (check `python --version` in a TPU notebook)
 
 # Tested locally; second set is the fallback if the first cannot be resolved/verified.
 TESTED = ["peft==0.21.2", "trl==1.16.0", "accelerate==1.15.0", "datasets==5.1.0"]
@@ -24,6 +28,25 @@ RANGES = ["peft>=0.17,<1", "trl>=1.0,<2", "accelerate>=1.10.1,<2", "datasets>=4.
 EXTRAS = ["optuna>=3.6,<5", "wandb>=0.17,<1", "matplotlib>=3.5", "pandas>=1.5",
           "regex"]  # transformers imports it; bundle it in case the target image lacks it
 CANDIDATES = [("tested-pins", TESTED + EXTRAS), ("ranges", RANGES + EXTRAS)]
+
+# ---- TPU bundle (JAX + Tunix). google-tunix declares ~25 dependencies (tensorflow-datasets, numba, kagglehub, ...) of
+# which the trainer imports almost none; installing it with --no-deps plus the import-time set below was verified by
+# running tpu_training/tests (fresh run, resume, bad checkpoint, NaN abort) in an environment holding exactly these.
+TUNIX_PIN = "google-tunix==0.1.7"
+TPU_TESTED = [
+    "jax[tpu]==0.12.0.1", "flax==0.12.12", "optax==0.2.8", "qwix==0.1.8", "orbax-checkpoint==0.12.8",
+    "google-metrax==0.2.4", "clu==0.0.12", "tensorboardX==2.6.5", "jaxtyping==0.3.11", "sentencepiece==0.2.2",
+    "perfetto==0.59.1", "wadler-lindig", "wrapt", "tqdm", "pillow", "pandas", "python-dateutil", "pyyaml", "pyarrow", "fsspec",
+]
+TPU_RANGES = [
+    "jax[tpu]>=0.8,<1", "flax>=0.12,<0.13", "optax>=0.2,<0.3", "qwix>=0.1.5,<0.2", "orbax-checkpoint>=0.11,<1",
+    "google-metrax", "clu", "tensorboardX", "jaxtyping", "sentencepiece", "perfetto", "wadler-lindig", "wrapt", "tqdm",
+    "pillow", "pandas", "python-dateutil", "pyyaml", "pyarrow", "fsspec",
+]
+TPU_CANDIDATES = [("tested-pins", TPU_TESTED), ("ranges", TPU_RANGES)]
+# Declared by google-tunix but not imported by anything the trainer uses (proved by the smoke test + tpu_training tests).
+TPU_WAIVED = ("tensorflow-datasets", "numba", "kagglehub", "omegaconf", "hf-transfer", "sympy", "jinja2", "pylatexenc",
+              "python-dotenv", "tenacity", "importlib-resources", "datasets", "transformers", "grain")
 
 # Official wheelhouse contents (Getting Started notebook, 2026-10-30); overridden by the real
 # wheelhouse when it is attached to this notebook.
@@ -106,10 +129,11 @@ def installed_versions(names) -> dict:
 
 
 def ensure_py312() -> str:
-    """The notebook's own Python may be 3.13 (no ensurepip, wrong wheel tags); fetch a 3.12 with uv."""
+    """The notebook's own Python may differ from the target (no ensurepip, wrong wheel tags); fetch the target version with uv."""
     subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "uv"], check=True, env=ENV)
-    run([*UV, "python", "install", "3.12"])
-    path = subprocess.check_output([*UV, "python", "find", "3.12"], text=True, env=ENV).strip()
+    want = "%d.%d" % TARGET_PY
+    run([*UV, "python", "install", want])
+    path = subprocess.check_output([*UV, "python", "find", want], text=True, env=ENV).strip()
     log(f"build interpreter: {path}")
     return path
 
@@ -185,20 +209,19 @@ def resolve(reqs: list, py: Path, fakes: dict) -> list:
     return sorted(bundle)
 
 
-def build_wheels(bundle: list) -> None:
-    shutil.rmtree(OUT, ignore_errors=True)
-    OUT.mkdir(parents=True)
-    for name, version in bundle:
-        spec = f"{name}=={version}"
+def build_wheels(bundle: list, out: Path = OUT, extra_specs: tuple = ()) -> None:
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    for spec in [*(f"{n}=={v}" for n, v in bundle), *extra_specs]:
         for attempt in range(1, 4):
-            r = pip(PY, "wheel", "--no-deps", "--quiet", "-w", str(OUT), spec, capture=True, check=False)
+            r = pip(PY, "wheel", "--no-deps", "--quiet", "-w", str(out), spec, capture=True, check=False)
             if r.returncode == 0:
                 break
             log(f"  retry {attempt}/3 for {spec}: {tail(r.stderr, 3)}")
             time.sleep(3 * attempt)
         else:
             raise StepError(f"could not build a wheel for {spec}")
-    bad = [w.name for w in OUT.glob("*.whl") if "+" in w.name]
+    bad = [w.name for w in out.glob("*.whl") if "+" in w.name]
     if bad:
         log(f"WARNING: local-version wheel names get their '+' stripped by Kaggle uploads: {bad}")
 
@@ -209,27 +232,32 @@ def read_wheel_meta(whl: Path):
         return email.message_from_bytes(z.read(meta))
 
 
-def closure_check(fakes: dict) -> dict:
-    """Every requirement of every bundled wheel must be met by the bundle or the target image."""
+def closure_check(fakes: dict, out: Path = OUT, waived: frozenset = frozenset()) -> dict:
+    """Every requirement of every bundled wheel must be met by the bundle or the target image.
+
+    `waived` names dependencies that are deliberately absent (declared by a --no-deps wheel, proven unneeded by the
+    smoke test); they are reported separately instead of failing the check."""
     try:
         from packaging.requirements import Requirement
     except ImportError:
         from pip._vendor.packaging.requirements import Requirement
-    metas = [read_wheel_meta(w) for w in sorted(OUT.glob("*.whl"))]
+    metas = [read_wheel_meta(w) for w in sorted(out.glob("*.whl"))]
     available = dict(fakes)
     available.update({norm(m["Name"]): m["Version"] for m in metas})
-    missing, conflicts = [], []
+    missing, conflicts, waived_hits = [], [], []
     for m in metas:
         for line in m.get_all("Requires-Dist") or []:
             req = Requirement(line)
             if req.marker and not req.marker.evaluate({"extra": ""}):
                 continue
             have = available.get(norm(req.name))
-            if have is None:
+            if have is None and norm(req.name) in waived:
+                waived_hits.append(f"{m['Name']} -> {req.name}")
+            elif have is None:
                 missing.append(f"{m['Name']} -> {line}")
             elif not req.specifier.contains(have, prereleases=True):
                 conflicts.append(f"{m['Name']} -> {line} (have {have})")
-    return {"missing": missing, "conflicts": conflicts}
+    return {"missing": missing, "conflicts": conflicts, "waived": waived_hits}
 
 
 SMOKE = r'''
@@ -319,6 +347,89 @@ def smoke_test(official_dirs: list, official_versions: dict, bundle_names: set, 
     return result
 
 
+TPU_SMOKE = r"""
+import importlib.util, json, os, sys, traceback
+os.environ.update(JAX_PLATFORMS="cpu", TF_CPP_MIN_LOG_LEVEL="3")
+out = {"ok": False}
+try:
+    import jax, jax.numpy as jnp, flax, optax, qwix, orbax.checkpoint
+    import tunix.models.gemma4.model as M
+    import tunix.models.gemma4.params_safetensors, tunix.sft.utils
+    qwix.LoraProvider(module_path=".*", rank=2, alpha=4.0)
+    g = jax.jit(jax.grad(lambda w: (w ** 2).sum()))(jnp.ones(4))
+    tx = optax.adam(1e-3); st = tx.init(g); tx.update(g, st)
+    cfg = M.ModelConfig.gemma4_e4b()
+    out.update(ok=bool(float(g.sum()) == 8.0), jax=jax.__version__, flax=flax.__version__, optax=optax.__version__,
+               e4b_layers=cfg.num_layers, libtpu=importlib.util.find_spec("libtpu") is not None)
+except Exception:
+    out["error"] = traceback.format_exc()[-1800:]
+print("SMOKE_JSON:" + json.dumps(out))
+sys.exit(0 if out["ok"] else 1)
+"""
+
+
+def smoke_test_tpu(fakes: dict) -> dict:
+    """Install the TPU wheelhouse into a clean venv (target-owned numpy/safetensors from PyPI, as on the image) and import
+    the exact modules the Tunix trainer uses. JAX runs on CPU here; libtpu only has to be present."""
+    py = make_venv(SCRATCH / "smoke_tpu_venv")
+    pins = [f"numpy=={fakes['numpy']}" if fakes.get("numpy") else "numpy",
+            f"safetensors=={fakes.get('safetensors', OFFICIAL_FALLBACK['safetensors'])}"]
+    pip(py, "install", "--quiet", *pins)
+    pip(py, "install", "--quiet", "--no-index", "--no-deps", *map(str, sorted(OUT_TPU.glob("*.whl"))))
+    chk = pip(py, "check", capture=True, check=False)
+    issues = [l for l in chk.stdout.splitlines() if l.strip() and not l.startswith("No broken")]
+    r = run([py, "-I", "-c", TPU_SMOKE], capture=True, check=False)
+    log(tail(r.stderr, 6))
+    line = next((l for l in r.stdout.splitlines() if l.startswith("SMOKE_JSON:")), None)
+    if not line:
+        raise StepError("TPU smoke test produced no result:\n" + tail(r.stdout + r.stderr))
+    result = json.loads(line[len("SMOKE_JSON:"):])
+    result["pip_check_lines"] = len(issues)
+    if not result.get("ok"):
+        raise StepError("TPU smoke test failed:\n" + json.dumps(result, indent=1)[:2500])
+    if not result.get("libtpu"):
+        raise StepError("libtpu is missing from the TPU wheelhouse: jax[tpu] would fall back to CPU on the TPU VM")
+    return result
+
+
+def build_tpu_bundle(fakes: dict, official_versions: dict, resolve_py: Path) -> dict:
+    """JAX + Tunix wheelhouse in OUT_TPU. google-tunix is built --no-deps (see TUNIX_PIN); everything it imports is
+    resolved explicitly and verified by `smoke_test_tpu`."""
+    inherited = preinstall_requirements(official_versions, fakes)
+    attempts, chosen = [], None
+    for label, base_reqs in TPU_CANDIDATES:
+        reqs = base_reqs + inherited
+        log(f"\n=== TPU candidate '{label}': {reqs}")
+        try:
+            bundle = resolve(reqs, resolve_py, fakes)
+            log(f"{len(bundle)} packages to bundle (+ {TUNIX_PIN} --no-deps)")
+            build_wheels(bundle, OUT_TPU, extra_specs=(TUNIX_PIN,))
+            closure = closure_check(fakes, OUT_TPU, frozenset(norm(n) for n in TPU_WAIVED))
+            if closure["missing"] or closure["conflicts"]:
+                raise StepError("TPU closure check failed: " + json.dumps(closure, indent=1))
+            smoke = smoke_test_tpu(fakes)
+            chosen = {"label": label, "requirements": base_reqs, "bundle": bundle, "smoke": smoke, "waived": closure["waived"]}
+            attempts.append({"label": label, "ok": True})
+            break
+        except (StepError, subprocess.CalledProcessError) as exc:
+            log(f"TPU candidate '{label}' REJECTED: {exc}")
+            attempts.append({"label": label, "ok": False, "error": str(exc)[-2000:]})
+    if not chosen:
+        raise StepError("No TPU candidate passed verification. See the log above.")
+    wheels = sorted(OUT_TPU.glob("*.whl"))
+    (OUT_TPU / "MANIFEST.json").write_text(json.dumps({
+        "built_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "python": platform.python_version(),
+        "chosen": chosen["label"], "requirements": chosen["requirements"], "tunix": TUNIX_PIN,
+        "waived_dependencies": chosen["waived"], "wheels": {w.name: sha256(w) for w in wheels},
+        "smoke": chosen["smoke"], "attempts": attempts,
+    }, indent=2))
+    (OUT_TPU / "requirements.lock.txt").write_text("".join(f"{n}=={v}\n" for n, v in chosen["bundle"]) + TUNIX_PIN + "\n")
+    log(f"\nTPU VERIFIED ({chosen['label']}): {len(wheels)} wheels, {sum(w.stat().st_size for w in wheels) / 1e6:.0f} MB in {OUT_TPU}")
+    for k in ("jax", "flax", "optax", "e4b_layers", "libtpu"):
+        log(f"  {k:12s} {chosen['smoke'].get(k)}")
+    return chosen
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -340,6 +451,19 @@ def main() -> None:
         fakes[name] = version
     log(f"target-owned packages modelled: {len(fakes)} (torch={fakes.get('torch')}, numpy={fakes.get('numpy')})")
     resolve_py = make_resolve_venv(fakes)
+
+    failures = []
+    if "tpu" in BUNDLES:
+        try:
+            build_tpu_bundle(fakes, official_versions, resolve_py)
+        except (StepError, subprocess.CalledProcessError) as exc:
+            failures.append(f"tpu bundle: {exc}")
+            log(f"TPU BUNDLE FAILED (the core bundle is still built): {exc}")
+    if "core" not in BUNDLES:
+        if failures:
+            raise SystemExit("\n".join(failures))
+        log("\nNext: Save Version (Save & Run All) -> Output -> New Dataset version -> send me the dataset name.")
+        return
 
     inherited = preinstall_requirements(official_versions, fakes)
     attempts, chosen = [], None
@@ -384,7 +508,9 @@ def main() -> None:
     for key in ("peft", "trl", "accelerate", "datasets", "optuna", "wandb", "transformers"):
         log(f"  {key:13s} {chosen['smoke']['core'].get(key)}")
     log(f"  tiny SFT end-to-end: {chosen['smoke']['e2e']}")
-    log("Next: Save Version (Save & Run All) -> Output -> New Dataset -> send me the dataset name.")
+    if failures:
+        log("\nWARNING: " + "; ".join(failures))
+    log("Next: Save Version (Save & Run All) -> Output -> New Dataset (version) containing train_wheels/ and train_wheels_tpu/.")
 
 
 main()

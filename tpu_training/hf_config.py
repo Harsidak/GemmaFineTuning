@@ -123,13 +123,13 @@ def build_model_config(
             if diffs:
                 logger.warning("config.json differs from the Tunix %s preset in %s; keeping the preset", name, diffs)
             break
-    train_overrides = dict(
-        param_dtype=param_dtype,
-        dtype=dtype,
-        remat_config=M.RematConfig[remat],
-        use_flash_attention=bool(flash_attention),
-        use_sliding_window_kv_cache=False,  # training never uses the decode cache; the sliding-window cache excludes flash
-    )
+    train_overrides = {
+        "param_dtype": param_dtype,
+        "dtype": dtype,
+        "remat_config": M.RematConfig[remat],
+        "use_flash_attention": bool(flash_attention),
+        "use_sliding_window_kv_cache": False,  # training never uses the decode cache; the sliding-window cache excludes flash
+    }
     if base is not None:
         return dataclasses.replace(base, **train_overrides)
     fields = {k: v for k, v in derived.items() if v is not None}
