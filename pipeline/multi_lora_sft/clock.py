@@ -82,7 +82,7 @@ class SessionClock:
         if self.cfg.run.mode == "calibration":
             session_sec = self.cfg.run.calibration_minutes * 60.0
             raw_margin = b.safety_margin_min * 60.0
-            raw_eval = (b.eval_min * 60.0) if eval_enabled else 0.0
+            raw_eval = self.cfg.eval_reserve_min() * 60.0
             raw_pkg = b.package_min * 60.0
             raw_exp = b.export_min * 60.0
             raw_setup = b.setup_max_min * 60.0
@@ -106,7 +106,7 @@ class SessionClock:
         else:
             session_sec = b.session_hours * 3600.0
             margin_sec = b.safety_margin_min * 60.0
-            eval_sec = (b.eval_min * 60.0) if eval_enabled else 0.0
+            eval_sec = self.cfg.eval_reserve_min() * 60.0
             pkg_sec = b.package_min * 60.0
             exp_sec = b.export_min * 60.0
             setup_max_sec = b.setup_max_min * 60.0

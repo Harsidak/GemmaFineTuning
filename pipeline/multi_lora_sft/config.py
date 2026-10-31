@@ -67,7 +67,8 @@ class ResumeSection:
 class BudgetSection:
     session_hours: float = 12.0
     safety_margin_min: float = 20.0
-    eval_min: float = 60.0
+    eval_min: float = 60.0  # eval reserve with the smoke tasks on (vLLM start-up + parity + 3 tasks)
+    eval_parity_min: float = 20.0  # eval reserve with the smoke tasks off (vLLM start-up + parity only)
     package_min: float = 5.0
     export_min: float = 10.0
     setup_max_min: float = 10.0
@@ -246,7 +247,8 @@ class VllmEvalSection:
 
 @dataclass
 class EvalSection:
-    enabled: bool = True
+    enabled: bool = True  # vLLM start-up + adapter parity check on the packaged submission
+    smoke_tasks: bool = False  # also run the 3 swegemma smoke tasks (1 in calibration); needs tasks_file + snapshots
     task_ids: list[str] = field(default_factory=list)
     snapshots_dir: str | None = None
     graphs_dir: str | None = None
@@ -341,6 +343,19 @@ class PipelineConfig:
 
     def effective_served_model_id(self) -> str:
         return self.submission.served_model_id or self.model.served_model_id
+
+    def eval_reserve_min(self) -> float:
+        """Minutes held back from training for the eval phase.
+
+        Smoke tasks on: the full `budget.eval_min`. Off: only vLLM start-up + the parity check
+        (`budget.eval_parity_min`, never more than `eval_min`); 0 when there is nothing to run."""
+        if not self.eval.enabled:
+            return 0.0
+        if self.eval.smoke_tasks:
+            return self.budget.eval_min
+        if not self.parity.enabled:
+            return 0.0
+        return min(self.budget.eval_min, self.budget.eval_parity_min)
 
     def resolve_adapter(self, adapter_or_name: AdapterSpec | str) -> EffectiveAdapterConfig:
         if isinstance(adapter_or_name, str):
@@ -730,6 +745,7 @@ def validate_config(cfg: PipelineConfig) -> None:
         "session_hours",
         "safety_margin_min",
         "eval_min",
+        "eval_parity_min",
         "package_min",
         "export_min",
         "setup_max_min",
@@ -740,7 +756,7 @@ def validate_config(cfg: PipelineConfig) -> None:
             raise ConfigError(f"budget.{fname} must be positive, got {val}")
 
     if cfg.run.mode == "full":
-        eval_m = cfg.budget.eval_min if cfg.eval.enabled else 0.0
+        eval_m = cfg.eval_reserve_min()
         reserved_min = cfg.budget.safety_margin_min + eval_m + cfg.budget.package_min + cfg.budget.export_min
         if cfg.budget.session_hours * 60.0 <= reserved_min:
             raise ConfigError(

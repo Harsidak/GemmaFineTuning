@@ -9,7 +9,7 @@ from pipeline.multi_lora_sft.config import load_config
 
 
 def test_12h_budget_deadlines_add_up() -> None:
-    cfg = load_config()
+    cfg = load_config(set_overrides=["eval.smoke_tasks=true"])
     now_val = 1_000_000.0
     clock = SessionClock(cfg, t0=now_val, now_fn=lambda: now_val)
 
@@ -23,10 +23,29 @@ def test_12h_budget_deadlines_add_up() -> None:
     assert clock.phase_deadline("preflight") - now_val == pytest.approx(15.0 * 60.0)
 
 
+@pytest.mark.parametrize(
+    ("sets", "eval_min"),
+    [
+        ([], 20.0),  # default: smoke tasks off -> vLLM start-up + parity only (budget.eval_parity_min)
+        (["eval.smoke_tasks=true"], 60.0),  # smoke tasks on -> the full budget.eval_min
+        (["parity.enabled=false"], 0.0),  # nothing to run -> nothing reserved
+        (["eval.enabled=false", "eval.smoke_tasks=true"], 0.0),
+        (["budget.eval_min=10"], 10.0),  # the parity reserve never exceeds eval_min
+    ],
+)
+def test_eval_reserve_follows_smoke_tasks_switch(sets: list[str], eval_min: float) -> None:
+    cfg = load_config(set_overrides=sets)
+    assert cfg.eval_reserve_min() == pytest.approx(eval_min)
+    clock = SessionClock(cfg, t0=0.0, now_fn=lambda: 0.0)
+    # 12 h minus 20 min margin, 5 min package, 10 min export and the eval reserve
+    assert clock.plan.train_deadline == pytest.approx((12 * 60 - 35 - eval_min) * 60.0)
+
+
 def test_leftover_time_redistribution_between_adapters() -> None:
     cfg = load_config(
         set_overrides=[
-            "adapters=[{name: main_lora, roles: [root]}, {name: tool_lora, roles: [code_analyzer]}]"
+            "adapters=[{name: main_lora, roles: [root]}, {name: tool_lora, roles: [code_analyzer]}]",
+            "eval.smoke_tasks=true",  # the 60-min eval reserve the numbers below assume
         ]
     )
     cur = [0.0]

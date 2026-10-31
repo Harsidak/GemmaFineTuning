@@ -316,17 +316,97 @@ def _start_server_failing_fast(server: Any, logger: Any, poll_sec: float = 5.0) 
         watcher.join(timeout=poll_sec + 1.0)
 
 
+def _build_smoke_evaluator(
+    ctx: RunContext,
+    cfg: PipelineConfig,
+    *,
+    model_registry: Any,
+    adapter_manifest: Any,
+    deadline: float | None,
+    notes: list[str],
+) -> tuple[Any, dict[str, Any], list[str]]:
+    """swegemma Evaluator for the smoke tasks (official "Getting Started" call shape), the task map and the chosen ids."""
+    from google.adk.agents.context_cache_config import ContextCacheConfig  # type: ignore[import-not-found]
+    from google.adk.apps._configs import EventsCompactionConfig  # type: ignore[import-not-found]
+    from swegemma.config import EvalConfig, build_submission_limits  # type: ignore[import-not-found]
+    from swegemma.evaluate import Evaluator  # type: ignore[import-not-found]
+    from swegemma.models import load_tasks as load_swe_tasks  # type: ignore[import-not-found]
+
+    swe_tasks = {t.instance_id: t for t in load_swe_tasks(Path(cfg.data.tasks_file))}
+    target_count = 1 if cfg.run.mode == "calibration" else 3
+    chosen_ids = list(cfg.eval.task_ids[:target_count])
+    if not chosen_ids:
+        # Deterministic tasks from distinct repos when none are configured
+        seen_repos: set[str] = set()
+        for tid in sorted(swe_tasks):
+            if swe_tasks[tid].repo not in seen_repos:
+                chosen_ids.append(tid)
+                seen_repos.add(swe_tasks[tid].repo)
+                if len(chosen_ids) >= target_count:
+                    break
+
+    sub_eval: dict[str, Any] = {}
+    eval_cfg_yaml = ctx.submission_dir / "eval_config.yaml"
+    if eval_cfg_yaml.is_file():
+        loaded_ec = yaml.safe_load(eval_cfg_yaml.read_text(encoding="utf-8")) or {}
+        sub_eval = loaded_ec.get("evaluation", loaded_ec) if isinstance(loaded_ec, dict) else {}
+    max_time_minutes = float(sub_eval.get("max_time_minutes", 60.0))
+    if deadline is not None and chosen_ids:
+        # Smoke eval only: shrink the per-task agent budget so every chosen task can finish before the phase
+        # deadline (~6 min vLLM startup, ~5 min pytest verification per task). The packaged zip keeps its budget.
+        fair_share = (deadline - time.time() - 360.0) / 60.0 / len(chosen_ids) - 5.0
+        if fair_share < max_time_minutes:
+            max_time_minutes = max(2.0, fair_share)
+            notes.append(f"Smoke eval agent budget capped at {max_time_minutes:.1f} min/task to fit the deadline")
+    turns_raw = sub_eval.get("max_turns", sub_eval.get("max_llm_calls"))
+    limits, gen_constraints = build_submission_limits()
+    evaluator = Evaluator(
+        EvalConfig(
+            tasks_path=Path(cfg.data.tasks_file),
+            snapshots_dir=Path(cfg.eval.snapshots_dir),
+            results_dir=ctx.eval_results_dir,
+            submission_dir=ctx.submission_dir,
+            models=model_registry,
+            sandbox=cfg.eval.sandbox,
+            timeout_seconds=int(sub_eval.get("timeout_seconds", 300)),
+            verification_timeout_seconds=int(sub_eval.get("verification_timeout_seconds", 300)),
+            max_time_minutes=max_time_minutes,
+            max_tool_calls=int(sub_eval.get("max_tool_calls", 100)),
+            max_turns=int(turns_raw) if turns_raw is not None else None,
+            limits=limits,
+            generation_constraints=gen_constraints,
+            adapter_manifest=adapter_manifest,
+            context_cache_config=ContextCacheConfig(min_tokens=2048, ttl_seconds=1800, cache_intervals=10),
+            events_compaction_config=EventsCompactionConfig(
+                compaction_interval=15, overlap_size=2, token_threshold=14336, event_retention_size=5
+            ),
+            graph_dir=cfg.eval.graphs_dir,
+            embeddings_dir=cfg.eval.embeddings_dir,
+            wheels_dir=Path(cfg.eval.wheels_dir) if cfg.eval.wheels_dir else None,
+            verbose=False,
+        )
+    )
+    return evaluator, swe_tasks, chosen_ids
+
+
 def run_eval_phase(
     ctx: RunContext,
     cfg: PipelineConfig | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
-    """Runs final-hour vLLM parity + 3-task smoke eval when `eval.enabled` is True."""
+    """Runs the final-hour vLLM parity check when `eval.enabled` is True, plus the 3-task smoke eval when
+    `eval.smoke_tasks` is also True."""
     logger = configure_phase_logging(ctx.log_path("eval"))
     t_start = time.time()
     cfg = cfg or load_config(ctx.resolved_config_path)
+    smoke = cfg.eval.smoke_tasks
 
+    skip_reason = None
     if not cfg.eval.enabled:
+        skip_reason = "eval.enabled is False"
+    elif not smoke and not cfg.parity.enabled:
+        skip_reason = "eval.smoke_tasks and parity.enabled are both False: nothing to run"
+    if skip_reason is not None:
         t_end = time.time()
         status = PhaseStatus(
             phase="eval",
@@ -338,10 +418,10 @@ def run_eval_phase(
             planned_deadline=utc_iso(deadline) if deadline else None,
             planned_deadline_ts=deadline,
             actual_duration_sec=round(t_end - t_start, 2),
-            notes=["eval.enabled is False"],
+            notes=[skip_reason],
         )
         ctx.write_status(status)
-        logger.info("Eval phase skipped (eval.enabled=False)")
+        logger.info("Eval phase skipped (%s)", skip_reason)
         return status.to_dict()
 
     notes: list[str] = []
@@ -355,23 +435,20 @@ def run_eval_phase(
         # explicitly, so a signature change raises at once instead of being silently dropped.
         import adk_submission  # type: ignore[import-not-found]
         import litellm  # type: ignore[import-not-found]
-        from google.adk.agents.context_cache_config import ContextCacheConfig  # type: ignore[import-not-found]
-        from google.adk.apps._configs import EventsCompactionConfig  # type: ignore[import-not-found]
-        from swegemma.config import (  # type: ignore[import-not-found]
-            ALLOWED_ADAPTER_EXTENSIONS,
-            EvalConfig,
-            build_submission_limits,
-        )
-        from swegemma.evaluate import Evaluator  # type: ignore[import-not-found]
-        from swegemma.models import load_tasks as load_swe_tasks  # type: ignore[import-not-found]
+        from swegemma.config import ALLOWED_ADAPTER_EXTENSIONS  # type: ignore[import-not-found]
 
         litellm.drop_params = True
         served_id = cfg.effective_served_model_id()
         served_model_path = cfg.model.served_path or served_id
-        if not cfg.data.tasks_file or not Path(cfg.data.tasks_file).is_file():
-            raise FileNotFoundError(f"data.tasks_file not found: {cfg.data.tasks_file}")
-        if not cfg.eval.snapshots_dir or not Path(cfg.eval.snapshots_dir).is_dir():
-            raise FileNotFoundError(f"eval.snapshots_dir not found: {cfg.eval.snapshots_dir}")
+        if smoke:
+            # Only the smoke tasks need the task list and repo snapshots; parity runs without them.
+            if not cfg.data.tasks_file or not Path(cfg.data.tasks_file).is_file():
+                raise FileNotFoundError(f"data.tasks_file not found: {cfg.data.tasks_file}")
+            if not cfg.eval.snapshots_dir or not Path(cfg.eval.snapshots_dir).is_dir():
+                raise FileNotFoundError(f"eval.snapshots_dir not found: {cfg.eval.snapshots_dir}")
+        else:
+            notes.append("Smoke tasks skipped (eval.smoke_tasks=false): vLLM start-up + parity check only")
+            logger.info(notes[-1])
 
         adapter_paths, adapter_ranks = _discover_staged_adapters(ctx.submission_dir)
         # Same discovery the scorer runs: adapters/<name>/ is served as LoRA module <name>, which `adapter: <name>`
@@ -421,61 +498,15 @@ def run_eval_phase(
             aliases=[served_id], model_prefix="openai/", api_key=os.environ.get("LOCAL_API_KEY", "EMPTY")
         )
 
-        # Build the whole evaluator before vLLM loads (5+ min on 31B), so an API mismatch fails in seconds.
-        swe_tasks = {t.instance_id: t for t in load_swe_tasks(Path(cfg.data.tasks_file))}
-        target_count = 1 if cfg.run.mode == "calibration" else 3
-        chosen_ids = list(cfg.eval.task_ids[:target_count])
-        if not chosen_ids:
-            # Deterministic tasks from distinct repos when none are configured
-            seen_repos: set[str] = set()
-            for tid in sorted(swe_tasks):
-                if swe_tasks[tid].repo not in seen_repos:
-                    chosen_ids.append(tid)
-                    seen_repos.add(swe_tasks[tid].repo)
-                    if len(chosen_ids) >= target_count:
-                        break
-
-        sub_eval: dict[str, Any] = {}
-        eval_cfg_yaml = ctx.submission_dir / "eval_config.yaml"
-        if eval_cfg_yaml.is_file():
-            loaded_ec = yaml.safe_load(eval_cfg_yaml.read_text(encoding="utf-8")) or {}
-            sub_eval = loaded_ec.get("evaluation", loaded_ec) if isinstance(loaded_ec, dict) else {}
-        max_time_minutes = float(sub_eval.get("max_time_minutes", 60.0))
-        if deadline is not None and chosen_ids:
-            # Smoke eval only: shrink the per-task agent budget so every chosen task can finish before the phase
-            # deadline (~6 min vLLM startup, ~5 min pytest verification per task). The packaged zip keeps its budget.
-            fair_share = (deadline - time.time() - 360.0) / 60.0 / len(chosen_ids) - 5.0
-            if fair_share < max_time_minutes:
-                max_time_minutes = max(2.0, fair_share)
-                notes.append(f"Smoke eval agent budget capped at {max_time_minutes:.1f} min/task to fit the deadline")
-        turns_raw = sub_eval.get("max_turns", sub_eval.get("max_llm_calls"))
-        limits, gen_constraints = build_submission_limits()
-        evaluator = Evaluator(
-            EvalConfig(
-                tasks_path=Path(cfg.data.tasks_file),
-                snapshots_dir=Path(cfg.eval.snapshots_dir),
-                results_dir=ctx.eval_results_dir,
-                submission_dir=ctx.submission_dir,
-                models=model_registry,
-                sandbox=cfg.eval.sandbox,
-                timeout_seconds=int(sub_eval.get("timeout_seconds", 300)),
-                verification_timeout_seconds=int(sub_eval.get("verification_timeout_seconds", 300)),
-                max_time_minutes=max_time_minutes,
-                max_tool_calls=int(sub_eval.get("max_tool_calls", 100)),
-                max_turns=int(turns_raw) if turns_raw is not None else None,
-                limits=limits,
-                generation_constraints=gen_constraints,
-                adapter_manifest=adapter_manifest,
-                context_cache_config=ContextCacheConfig(min_tokens=2048, ttl_seconds=1800, cache_intervals=10),
-                events_compaction_config=EventsCompactionConfig(
-                    compaction_interval=15, overlap_size=2, token_threshold=14336, event_retention_size=5
-                ),
-                graph_dir=cfg.eval.graphs_dir,
-                embeddings_dir=cfg.eval.embeddings_dir,
-                wheels_dir=Path(cfg.eval.wheels_dir) if cfg.eval.wheels_dir else None,
-                verbose=False,
+        evaluator: Any = None
+        swe_tasks: dict[str, Any] = {}
+        chosen_ids: list[str] = []
+        if smoke:
+            # Build the whole evaluator before vLLM loads (5+ min on 31B), so an API mismatch fails in seconds.
+            evaluator, swe_tasks, chosen_ids = _build_smoke_evaluator(
+                ctx, cfg, model_registry=model_registry, adapter_manifest=adapter_manifest, deadline=deadline,
+                notes=notes,
             )
-        )
         if hasattr(adk_submission, "install_litellm_reasoning_patch"):
             adk_submission.install_litellm_reasoning_patch()
 
@@ -588,6 +619,7 @@ def run_eval_phase(
         score_payload = {
             "disclaimer": "Smoke eval verifies adapter loading, end-to-end execution, and patch application; a 3-task sample cannot rank models.",
             "served_model_id": served_id,
+            "smoke_tasks": smoke,
             "tasks_evaluated": n_tasks,
             "tasks_passed": passed_cnt,
             "pass_rate": round(passed_cnt / max(1, n_tasks), 4),

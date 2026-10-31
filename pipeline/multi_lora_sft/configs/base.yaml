@@ -18,7 +18,8 @@ resume:
 budget:
   session_hours: 12.0
   safety_margin_min: 20.0
-  eval_min: 60.0
+  eval_min: 60.0                          # eval reserve with eval.smoke_tasks on
+  eval_parity_min: 20.0                   # eval reserve with eval.smoke_tasks off (vLLM start-up + parity only)
   package_min: 5.0
   export_min: 10.0
   setup_max_min: 10.0
@@ -127,7 +128,8 @@ submission:
   working_zip_path: /kaggle/working/submission.zip
 
 eval:
-  enabled: true
+  enabled: true                           # vLLM start-up + adapter parity check on the packaged submission
+  smoke_tasks: false                      # true = also run the 3 swegemma smoke tasks (needs tasks_file + snapshots)
   task_ids: []
   snapshots_dir: null
   graphs_dir: null

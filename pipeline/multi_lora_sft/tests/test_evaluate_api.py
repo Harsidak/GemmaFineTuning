@@ -152,6 +152,7 @@ def test_eval_phase_uses_official_api_and_builds_evaluator_before_vllm(tmp_path:
         f"eval.snapshots_dir={(tmp_path / 'snapshots').as_posix()}",
         "model.served_path=/models/gemma-4-31b-it-qat-w4a16-ct/2",
         "model.served_model_id=gemma-4-31b-it-qat-w4a16-ct",
+        "eval.smoke_tasks=true",
     ])
     ctx = RunContext.create(cfg, t0=1000.0)
     lora = ctx.submission_dir / "adapters" / "main_lora"
@@ -186,3 +187,38 @@ def test_eval_phase_uses_official_api_and_builds_evaluator_before_vllm(tmp_path:
     rows = st["outputs"]["tasks"]
     assert [r["result"] for r in rows] == ["PASS", "FAIL", "FAIL"]
     assert rows[0]["patch_applied"] is True and rows[0]["tool_calls"] == 7
+
+
+def test_smoke_tasks_off_runs_vllm_and_parity_without_tasks_or_snapshots(
+    tmp_path: Path, fake_harness: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default: no task list, no snapshots, and the swegemma evaluator is never built.
+    monkeypatch.delitem(sys.modules, "swegemma.evaluate")
+    cfg = load_config(set_overrides=[
+        f"run.output_root={(tmp_path / 'runs').as_posix()}",
+        "run.run_id=eval_parity_only",
+        "data.tasks_file=null",
+        "model.served_path=/models/gemma-4-31b-it-qat-w4a16-ct/2",
+        "model.served_model_id=gemma-4-31b-it-qat-w4a16-ct",
+    ])
+    assert cfg.eval.smoke_tasks is False and cfg.eval.snapshots_dir is None
+    ctx = RunContext.create(cfg, t0=1000.0)
+    (ctx.submission_dir / "adapters" / "main_lora").mkdir(parents=True)
+
+    st = run_eval_phase(ctx, cfg=cfg, deadline=None)
+    assert st["state"] == "ok", st.get("error")
+    assert fake_harness["events"] == ["server.start", "server.stop"]
+    assert "eval_config" not in fake_harness
+    assert st["outputs"]["smoke_tasks"] is False and st["outputs"]["tasks"] == []
+    assert any("Smoke tasks skipped" in n for n in st["notes"])
+
+
+def test_eval_phase_skips_when_neither_smoke_tasks_nor_parity(tmp_path: Path, fake_harness: dict) -> None:
+    cfg = load_config(set_overrides=[
+        f"run.output_root={(tmp_path / 'runs').as_posix()}",
+        "run.run_id=eval_nothing",
+        "parity.enabled=false",
+    ])
+    st = run_eval_phase(RunContext.create(cfg, t0=1000.0), cfg=cfg, deadline=None)
+    assert st["state"] == "skipped"
+    assert fake_harness["events"] == []

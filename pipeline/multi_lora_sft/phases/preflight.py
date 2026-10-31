@@ -51,9 +51,9 @@ def run_preflight_phase(
         report["data_file_hashes"] = data_file_hashes
 
         # Leakage check (§7.1, §11)
-        if cfg.eval.enabled and cfg.data.tasks_file and not Path(cfg.data.tasks_file).is_file():
+        if cfg.eval.enabled and cfg.eval.smoke_tasks and cfg.data.tasks_file and not Path(cfg.data.tasks_file).is_file():
             raise DataContractError(
-                f"eval.enabled=True, but data.tasks_file does not exist: {cfg.data.tasks_file}"
+                f"eval.smoke_tasks=True, but data.tasks_file does not exist: {cfg.data.tasks_file}"
             )
         test_tasks = check_tasks_file_optional(cfg.data.tasks_file)
         report["test_tasks_checked"] = len(test_tasks)
