@@ -101,6 +101,81 @@ from the environment.
 It auto-adjusts to the detected hardware/disk/session limits, validates the full config in-process, prints the
 effective per-adapter table, and only then launches the orchestrator (`RUN["dry_run"]=True` stops after validation).
 
+## Launching from your own machine (`scripts/kaggle_push.py`)
+
+You can also run this notebook by hand on Kaggle. The script pushes it as a Kaggle kernel with the right machine, datasets and
+models attached, waits for the run, and downloads the outputs and log to `runs/kaggle/<slug>_<timestamp>/`.
+
+**One-time setup**
+
+* Kaggle API credentials in `~/.kaggle/kaggle.json`, `KAGGLE_USERNAME` / `KAGGLE_KEY` env vars, or a gitignored repo `.env`.
+* In `scripts/kaggle_settings.json`, replace the owner in `username`, `repo_dataset`, the wheelhouse / private-data /
+  bundle dataset ids with your own Kaggle username. Each key under `pipelines` becomes a `-<name>` flag.
+* Optional W&B: `WANDB_API_KEY` as a Kaggle Secret (online logging where internet is on) and in your local `.env`
+  (or `wandb login` once) so offline runs can be uploaded after the download.
+
+**Pipelines**
+
+| Flag | Model | Machine | Internet | Preset |
+| :--- | :--- | :--- | :--- | :--- |
+| `-tpu` | E4B, Tunix (JAX) | TPU v5e-8 | on | `e4b_tpu` |
+| `-multi_lora_sft` | 31B NF4 QLoRA | 4×L4 | **off** (Kaggle does not allow it) | `31b_gpu_full` |
+| `-multi_lora_sft_e4b` | E4B bf16 LoRA | 4×L4 | **off** | `e4b_gpu_full` |
+
+**1. Ship the code (before every launch).** The notebook imports the repo from the `repo_dataset`, not from git:
+
+```bash
+git add -A && git commit -m "..." && git push
+# then publish a new version of your repo dataset (e.g. kaggle datasets version -p <repo-dataset-folder> -m "...")
+```
+
+`kaggle_push.py` stamps the run with your local git SHA and warns when uncommitted or unpushed changes would make the
+run differ from the dataset.
+
+**2. Wheels (only when dependencies change).** Run `kaggle/build_train_wheels.py` in a Kaggle notebook with internet on.
+It writes `/kaggle/working/train_wheels` (PyTorch/TRL, GPUs) and `/kaggle/working/train_wheels_tpu` (JAX + Tunix).
+Publish that output as a new version of your wheels dataset. `WHEEL_BUNDLES=tpu` builds only the TPU set;
+`WHEEL_PYTHON=3.13` targets a TPU image on another Python (check `python --version` there).
+
+**3. Launch**
+
+```bash
+uv run scripts/kaggle_push.py -tpu --set probe=true        # 2-minute on-TPU check of the Tunix path, then stop
+uv run scripts/kaggle_push.py -tpu --hours 2               # E4B on TPU, whole notebook limited to 2 h
+uv run scripts/kaggle_push.py -multi_lora_sft --hours 3    # 31B QLoRA on 4×L4 (offline)
+uv run scripts/kaggle_push.py -multi_lora_sft_e4b          # E4B on 4×L4 (offline)
+```
+
+| Option | Effect |
+| :--- | :--- |
+| `--hours H` | `RUN["clock_hours"]`: wall clock for the whole notebook; training gets what export / package / eval leave |
+| `--set KEY=VALUE` | override any `RUN` key (repeatable), e.g. `--set dry_run=true`, `--set tune=true`, `--set continue_training=true` |
+| `--no-wait` | push and return immediately |
+| `--poll N` | seconds between status checks (default 60) |
+| `--no-wandb-sync` | skip uploading offline W&B runs after the download |
+| `--internet on/off` | override the pipeline's internet setting; `on` is refused on 4×L4 |
+
+**4. Check on and collect a run**
+
+```bash
+uv run scripts/kaggle_push.py -multi_lora_sft -status                    # one status check
+uv run scripts/kaggle_push.py -multi_lora_sft -output                    # download outputs + log now (+ wandb sync)
+uv run scripts/kaggle_push.py -tpu -output --publish-bundle              # ... and publish the checkpoints as a new bundle version
+```
+
+`--publish-bundle` uploads `/kaggle/working/lora_checkpoints/` as a new version of the checkpoint bundle dataset; the
+next run attaches it and resumes (the *run → update dataset → run* loop).
+
+**Local checks before pushing**
+
+```bash
+uv sync
+uv run ruff check pipeline scripts
+uv run pytest pipeline/multi_lora_sft/tests
+```
+
+Suggested first session: ship the code → `-tpu --set probe=true` → `-tpu --hours 2` → `-multi_lora_sft --hours 3`.
+
 ## CLI Usage
 
 ```bash
