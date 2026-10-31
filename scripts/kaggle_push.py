@@ -96,6 +96,32 @@ def check_sources(datasets: list[str], models: list[str]) -> None:
         sys.exit(f"inputs unreachable (deleted, private to someone else, or misspelled), not pushing: {bad}")
 
 
+def verify_attached(kid: str, meta: dict, tries: int = 3) -> None:
+    """Read the pushed kernel's metadata back: Kaggle can accept a push and silently leave an input off (it dropped
+    google/gemma-4/transformers/gemma-4-31b-it-qat-q4_0-unquantized/1 while keeping the w4a16-ct model), and the run
+    then dies in cell 3 with 'No base model matching ...'. Slugs are compared case-insensitively (Kaggle rewrites
+    'other' -> 'Other')."""
+    want = {k: {x.lower() for x in meta[k]} for k in ("dataset_sources", "model_sources")}
+    pulled = PUSH_DIR / "_pulled"
+    for attempt in range(tries):
+        shutil.rmtree(pulled, ignore_errors=True)
+        r = kaggle("kernels", "pull", kid, "-p", str(pulled), "-m", capture=True)
+        got_file = pulled / "kernel-metadata.json"
+        if r.returncode or not got_file.is_file():
+            print(f"note: could not read back {kid}'s metadata to check its inputs: {(r.stdout + r.stderr).strip()[-200:]}")
+            return
+        got = json.loads(got_file.read_text(encoding="utf-8"))
+        missing = {k: sorted(want[k] - {x.lower() for x in got.get(k, [])}) for k in want}
+        if not any(missing.values()):
+            print(f"inputs attached: {len(meta['model_sources'])} model(s), {len(meta['dataset_sources'])} dataset(s)")
+            return
+        if attempt + 1 < tries:
+            time.sleep(10)  # the new version's metadata can lag the push by a few seconds
+    sys.exit(f"Kaggle dropped inputs from the pushed kernel: {missing}. The run would fail when it looks for them; "
+             f"cancel it at https://www.kaggle.com/code/{kid} (or let it fail in cell 3), check the slug/version with "
+             "`kaggle models instances versions files <slug>`, fix scripts/kaggle_settings.json and push again.")
+
+
 def repo_state() -> dict:
     """Local git SHA plus warnings when the pushed dataset cannot match it."""
     state = {"git_sha": git("rev-parse", "--short", "HEAD"), "dirty": bool(git("status", "--porcelain"))}
@@ -335,6 +361,7 @@ def main() -> None:
     check_sources(meta["dataset_sources"], meta["model_sources"])
     kaggle("kernels", "push", "-p", str(kdir))
     print(f"https://www.kaggle.com/code/{kid}")
+    verify_attached(kid, meta)
     if args.no_wait:
         return
     final = wait(kid, args.poll)
