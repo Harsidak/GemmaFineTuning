@@ -14,6 +14,8 @@ import argparse
 import inspect
 import json
 import math
+import os
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -269,6 +271,48 @@ def _extract_task_result_fields(res: Any, task_id: str, duration_sec: float) -> 
     }
 
 
+# Lines vLLM logs when its engine dies during startup. The api_server parent can stay alive after that, so
+# VllmServer.start() (which only checks whether that process exited) waits out the whole startup_timeout.
+_FATAL_SERVER_LOG_MARKERS = (
+    "Engine core initialization failed",
+    "EngineCore failed to start",
+    "RuntimeError: Worker failed with error",
+)
+
+
+def _start_server_failing_fast(server: Any, logger: Any, poll_sec: float = 5.0) -> None:
+    """Runs `server.start()`, killing the server as soon as its log shows a fatal engine error.
+
+    On 2026-10-31 the 31B engine OOMed 5 minutes into startup and start() then waited 15 more minutes for the
+    timeout. Killing the process makes start() see the exit on its next poll and raise with the log tail.
+    """
+    stop = threading.Event()
+
+    def watch() -> None:
+        while not stop.wait(poll_sec):
+            proc = getattr(server, "process", None)
+            log_path = getattr(server, "log_path", None)
+            if proc is None or log_path is None or proc.poll() is not None:
+                continue
+            try:
+                text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            marker = next((m for m in _FATAL_SERVER_LOG_MARKERS if m in text), None)
+            if marker is not None:
+                logger.error("vLLM failed during startup (%r in %s); stopping it instead of waiting", marker, log_path)
+                proc.kill()
+                return
+
+    watcher = threading.Thread(target=watch, name="vllm-startup-watch", daemon=True)
+    watcher.start()
+    try:
+        server.start()
+    finally:
+        stop.set()
+        watcher.join(timeout=poll_sec + 1.0)
+
+
 def _build_kwargs_filtered(cls_or_fn: Any, candidate_kwargs: dict[str, Any]) -> dict[str, Any]:
     """Filters `candidate_kwargs` to parameters accepted by `cls_or_fn` so minor wheel signature shifts never break."""
     try:
@@ -326,6 +370,11 @@ def run_eval_phase(
             extra_args.extend(
                 ["--hf-overrides", '{"architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4"}']
             )
+        if cfg.eval.vllm.max_num_seqs is not None:
+            extra_args.extend(["--max-num-seqs", str(cfg.eval.vllm.max_num_seqs)])
+        # Count CUDA graph memory inside gpu_memory_utilization (vLLM 0.19 leaves it outside by default, which is
+        # what pushed 31B past 22 GiB per L4). VllmServer passes this process's environment to the server.
+        os.environ.setdefault("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
 
         vllm_cfg_cls = adk_submission.VllmConfig
         vllm_srv_cls = adk_submission.VllmServer
@@ -353,8 +402,8 @@ def run_eval_phase(
         )
         server = vllm_srv_cls(vllm_cfg_cls(**vllm_kwargs))
         logger.info("Starting VllmServer for %s (adapters=%s)", served_id, list(adapter_paths.keys()))
-        server.start()
-        api_base = f"http://{cfg.eval.vllm.host}:{cfg.eval.vllm.port}/v1"
+        _start_server_failing_fast(server, logger)
+        api_base =f"http://{cfg.eval.vllm.host}:{cfg.eval.vllm.port}/v1"
 
         # 1. Parity check (§9.3 — runs first before tasks)
         if cfg.parity.enabled:

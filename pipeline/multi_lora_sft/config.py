@@ -238,6 +238,10 @@ class VllmEvalSection:
     tensor_parallel_size: int = 4
     max_model_len: int = 32768
     startup_timeout: int = 1200
+    # vLLM's default (256) warms up the sampler for 256 dummy requests and captures CUDA graphs up to batch 512, both
+    # outside the gpu_memory_utilization budget; on 31B 4xL4 that OOMed at startup. The smoke eval runs one task at a
+    # time, so 32 is ample. null = vLLM's default (what the official scorer uses).
+    max_num_seqs: int | None = 32
 
 
 @dataclass

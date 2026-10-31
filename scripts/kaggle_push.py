@@ -43,6 +43,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -120,6 +122,38 @@ def verify_attached(kid: str, meta: dict, tries: int = 3) -> None:
     sys.exit(f"Kaggle dropped inputs from the pushed kernel: {missing}. The run would fail when it looks for them; "
              f"cancel it at https://www.kaggle.com/code/{kid} (or let it fail in cell 3), check the slug/version with "
              "`kaggle models instances versions files <slug>`, fix scripts/kaggle_settings.json and push again.")
+
+
+def publicly_readable(api_path: str) -> bool:
+    """True when Kaggle serves `api_path` to a request with no credentials, i.e. anyone can read it.
+
+    The owner's own view is no use here: `kernels pull -m` reported is_private: true for a kernel whose source and
+    outputs anonymous requests could download (2026-10-31)."""
+    try:
+        with urllib.request.urlopen(f"https://www.kaggle.com/api/v1/{api_path}", timeout=30) as r:
+            return r.status == 200
+    except urllib.error.HTTPError:
+        return False
+    except OSError as exc:
+        print(f"note: could not check whether {api_path} is public: {exc}")
+        return False
+
+
+def check_private_datasets(ids: list[str]) -> None:
+    """Refuse to push when a dataset meant to stay private (mined data, LoRA bundle) is readable by anyone."""
+    public = [d for d in ids if publicly_readable(f"datasets/view/{d}")]
+    if public:
+        sys.exit(f"these datasets must stay private but anyone can read them: {public}. Make them private on "
+                 "kaggle.com (dataset -> Settings -> Sharing) and push again.")
+
+
+def warn_if_kernel_public(kid: str) -> None:
+    """A public kernel publishes its outputs: the trained adapters, submission.zip and logs. Loud, not fatal: the run
+    has already started, and flipping it to private before it finishes is enough."""
+    user, slug = kid.split("/", 1)
+    if publicly_readable(f"kernels/pull?userName={user}&kernelSlug={slug}"):
+        print(f"\n!!! {kid} is PUBLIC: anyone can download this run's outputs (LoRA adapters, submission.zip, logs).\n"
+              f"!!! Make it private before the run finishes: https://www.kaggle.com/code/{kid} -> Settings -> Sharing\n")
 
 
 def repo_state() -> dict:
@@ -294,6 +328,9 @@ def publish_bundle(out: Path, message: str) -> None:
         kaggle("datasets", "version", "-p", str(bdir), "-m", message, "--dir-mode", "zip")
     else:
         kaggle("datasets", "create", "-p", str(bdir), "--dir-mode", "zip")  # private by default
+    if publicly_readable(f"datasets/view/{ds_id}"):
+        print(f"\n!!! {ds_id} is PUBLIC: anyone can download the LoRA adapters. Make it private now: "
+              f"https://www.kaggle.com/datasets/{ds_id} -> Settings -> Sharing\n")
     print(f"https://www.kaggle.com/datasets/{ds_id}  (delete older versions from the dataset page when you no longer need them)")
 
 
@@ -359,9 +396,11 @@ def main() -> None:
     overrides["internet"] = meta["enable_internet"]
     print(f"RUN_OVERRIDES = {overrides}  (internet {'on' if meta['enable_internet'] else 'off'})")
     check_sources(meta["dataset_sources"], meta["model_sources"])
+    check_private_datasets([*p.get("private_datasets", []), *p.get("optional_datasets", [])])
     kaggle("kernels", "push", "-p", str(kdir))
     print(f"https://www.kaggle.com/code/{kid}")
     verify_attached(kid, meta)
+    warn_if_kernel_public(kid)
     if args.no_wait:
         return
     final = wait(kid, args.poll)

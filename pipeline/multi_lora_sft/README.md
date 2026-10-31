@@ -44,7 +44,8 @@ Checkpoints survive the 12 h / 9 h session limit through a private dataset (`out
    checkpoint, `best_adapter/`, `final_adapter/` and `progress.json` (the task ledger: which training problems were
    consumed in the current epoch), plus `bundle.json` and `dataset-metadata.json`. Files containing secrets are removed.
 2. Save the notebook version and publish that folder as a new dataset version (manually, or
-   `uv run scripts/kaggle_push.py -tpu -output --publish-bundle`). Delete old versions on the dataset page.
+   `uv run scripts/kaggle_push.py -<pipeline> -output --publish-bundle`, e.g. `-multi_lora_sft`). Delete old versions
+   on the dataset page.
 3. Attach the dataset to the next run. `resume.auto_discover` finds it; training resumes from the checkpoint and skips
    the problems already trained on (10,000 problems, stopped at 4,173 → next run starts at 4,174). If the dataset grew,
    only unseen problems are trained (`resume.on_data_change`). A checkpoint from a different model / LoRA rank / alpha /

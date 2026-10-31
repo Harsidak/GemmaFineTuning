@@ -142,3 +142,4 @@ eval:
     tensor_parallel_size: 4
     max_model_len: 32768
     startup_timeout: 1200
+    max_num_seqs: 32                      # null = vLLM default 256 (OOMs 31B at startup on 4xL4)
