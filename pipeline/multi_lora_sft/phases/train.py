@@ -61,6 +61,18 @@ from ..training.device import (
     restore_rng_state,
     xla_device_count,
 )
+from ..training.distributed import (
+    SyncedClock,
+    agree_all,
+    apply_fsdp_env,
+    broadcast_float,
+    dist_ready,
+    fsdp_optim_state_to_load,
+    gather_lora_state_dict,
+    init_distributed,
+    is_fsdp_wrapped,
+    keep_buffers_in_native_dtype,
+)
 from ..training.loss import (
     WeightedLanguageModelingCollator,
     build_selective_sft_trainer_cls,
@@ -185,12 +197,20 @@ def run_train_adapter_phase(
 
         accelerator = resolve_accelerator(eff.train.accelerator)
         parallelism = eff.train.parallelism
-        if accelerator == "tpu" and parallelism in {"ddp", "model_split"}:
+        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        if accelerator == "tpu" and parallelism in {"ddp", "model_split", "fsdp"}:
             notes.append(f"parallelism={parallelism!r} is CUDA-only; using 'spmd' on TPU")
             parallelism = "spmd"
         if accelerator != "tpu" and parallelism == "spmd":
             notes.append(f"parallelism='spmd' needs a TPU; using 'single' on {accelerator}")
             parallelism = "single"
+        if parallelism == "fsdp" and accelerator != "cuda":
+            notes.append(f"parallelism='fsdp' needs CUDA GPUs; using 'single' on {accelerator}")
+            parallelism = "single"
+        if parallelism == "fsdp" and world_size <= 1:
+            # Launched as one process (one GPU, or train.num_processes=1): spread the layers instead.
+            notes.append("parallelism='fsdp' was launched with 1 process; using 'model_split'")
+            parallelism = "model_split"
         if parallelism != eff.train.parallelism:
             eff = dataclasses.replace(eff, train=dataclasses.replace(eff.train, parallelism=parallelism))
         is_tpu = accelerator == "tpu"
@@ -211,6 +231,17 @@ def run_train_adapter_phase(
             pad_multiple,
         )
 
+        multi_proc = accelerator == "cuda" and parallelism in {"ddp", "fsdp"} and world_size > 1
+        if multi_proc:
+            # Process group up before loading: binds each rank to its GPU and lets ranks share one start time,
+            # so the time-driven schedule and stop decisions match on every rank.
+            init_distributed()
+            t_start = broadcast_float(t_start)
+        if parallelism == "fsdp":
+            apply_fsdp_env()  # read by the Accelerator the Trainer creates below
+        clock = SyncedClock()
+        clock.sync()  # first (collective) read happens here, at the same point on every rank
+
         random.seed(cfg.run.seed)
         np.random.seed(cfg.run.seed)
         torch.manual_seed(cfg.run.seed)
@@ -227,7 +258,6 @@ def run_train_adapter_phase(
                 f"No training examples available for adapter {adapter_name!r} at max_seq_length={eff.train.max_seq_length}"
             )
 
-        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
         if is_tpu and parallelism == "spmd":
             n_dev = xla_device_count()
             if eff.train.per_device_batch % n_dev != 0:
@@ -253,6 +283,8 @@ def run_train_adapter_phase(
         if hasattr(base_model, "generation_config") and base_model.generation_config is not None:
             base_model.generation_config.pad_token_id = tokenizer.pad_token_id
 
+        if multi_proc:  # identical LoRA init on every rank, however much RNG the model load consumed
+            torch.manual_seed(cfg.run.seed)
         peft_model, target_regex, matched_modules = attach_lora_adapter(base_model, eff.lora)
         if is_tpu and parallelism == "single":
             import torch_xla.core.xla_model as xm
@@ -286,6 +318,7 @@ def run_train_adapter_phase(
             total_epoch_steps=total_epoch_steps,
             t_start=t_start,
             deadline=soft_deadline,
+            now_fn=clock,
         )
 
         # Shared session: resume compatibility, task ledger, guards, best-checkpoint selection, tracking.
@@ -349,11 +382,23 @@ def run_train_adapter_phase(
                 raise ValueError("No trainable parameters after attaching LoRA (all adapters frozen?)")
             opt = torch.optim.AdamW(params, lr=eff.train.lr, weight_decay=eff.train.weight_decay)
             if resume_ckpt is not None and (resume_ckpt / "optimizer.pt").is_file() and resume_info.optimizer_compatible:
-                try:
-                    opt.load_state_dict(_load_torch(resume_ckpt / "optimizer.pt"))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Could not restore optimizer state (%s); continuing with fresh moments", exc)
-                    notes.append("Optimizer state not restored (fresh Adam moments)")
+                # FSDP checkpoints hold a name-keyed full state; others hold this optimizer's own (index-keyed) state.
+                saved_fmt = str(resume_meta.get("optimizer_format", "torch"))
+                fsdp_model = is_fsdp_wrapped(model_for_opt)
+                if fsdp_model != (saved_fmt == "fsdp_full"):
+                    notes.append(
+                        f"Optimizer state not restored: checkpoint format {saved_fmt!r} does not match "
+                        f"parallelism={parallelism!r} (fresh Adam moments)"
+                    )
+                else:
+                    try:
+                        osd = _load_torch(resume_ckpt / "optimizer.pt")
+                        if fsdp_model:  # collective: every rank loads the same file and keeps its shard
+                            osd = fsdp_optim_state_to_load(model_for_opt, opt, osd)
+                        opt.load_state_dict(osd)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Could not restore optimizer state (%s); continuing with fresh moments", exc)
+                        notes.append("Optimizer state not restored (fresh Adam moments)")
             sched = create_wsd_scheduler(opt, wsd)
             if resume_ckpt is not None and (resume_ckpt / "scheduler.pt").is_file():
                 try:
@@ -363,7 +408,10 @@ def run_train_adapter_phase(
             return opt, sched
 
         use_fsdp_xla = is_tpu and parallelism == "spmd"
-        optimizers: tuple[Any, Any] = (None, None) if use_fsdp_xla else _build_optimizer_and_scheduler(peft_model)
+        use_fsdp_cuda = parallelism == "fsdp"
+        # FSDP (XLA or CUDA) needs the optimizer built on the wrapped (sharded) parameters, i.e. inside train().
+        delayed_optimizer = use_fsdp_xla or use_fsdp_cuda
+        optimizers: tuple[Any, Any] = (None, None) if delayed_optimizer else _build_optimizer_and_scheduler(peft_model)
 
         # bf16 autocast on CUDA; on TPU the weights are already bf16 and XLA handles mixed precision itself.
         use_bf16 = eff.model_quantization in {"bf16", "nf4"} and accelerator == "cuda"
@@ -439,6 +487,7 @@ def run_train_adapter_phase(
             max_nonfinite_logs=eff.train.max_nonfinite_logs,
             stop_requested=_STOP_EVENT.is_set,
             session=session,
+            clock=clock,
         )
 
         collator = WeightedLanguageModelingCollator(pad_token_id=tokenizer.pad_token_id, pad_to_multiple_of=pad_multiple)
@@ -457,9 +506,18 @@ def run_train_adapter_phase(
             checkpoint_chunks=eff.loss.checkpoint_chunks,
             custom_train_sampler=sampler,
             metrics_tracker=metrics_tracker,
-            optimizer_factory=_build_optimizer_and_scheduler if use_fsdp_xla else None,
+            optimizer_factory=_build_optimizer_and_scheduler if delayed_optimizer else None,
             tuple_outputs=use_fsdp_xla,
         )
+        if use_fsdp_cuda:
+            fsdp_plugin = getattr(trainer.accelerator.state, "fsdp_plugin", None)
+            if fsdp_plugin is None or not getattr(trainer, "is_fsdp_enabled", False):
+                raise RuntimeError(
+                    "parallelism='fsdp' but the Trainer's Accelerator did not enable FSDP (ACCELERATE_USE_FSDP was "
+                    "not picked up); refusing to fall back to unsharded data parallelism"
+                )
+            keep_buffers_in_native_dtype(fsdp_plugin)
+            logger.info("[%s] FSDP across %d GPUs (FULL_SHARD, decoder layers + LoRA units)", adapter_name, world_size)
         cb.bind_trainer(trainer)
         session.start_tracking(
             {"fingerprint": session.fingerprint, "data": session.data_fp, "train": dataclasses.asdict(eff.train),
@@ -490,7 +548,10 @@ def run_train_adapter_phase(
             except (NonFiniteLossError, LossDivergedError, NoGradientError):
                 raise  # weights corrupt / diverging / untrained: never checkpoint them; the restart resumes the last good save
             except BaseException as exc:
-                if eff.train.emergency_checkpoint and trainer.state.global_step > 0:
+                if eff.train.emergency_checkpoint and trainer.state.global_step > 0 and is_fsdp_wrapped(trainer.model):
+                    # Saving gathers shards from every rank; after a crash the other ranks may be gone or stuck.
+                    logger.warning("[%s] No emergency checkpoint under FSDP; resume uses the last wall-clock one", adapter_name)
+                elif eff.train.emergency_checkpoint and trainer.state.global_step > 0:
                     try:
                         empty_cache(accelerator)
                         saved = cb.save_checkpoint(trainer.state, trainer.model, reason="emergency")
@@ -507,17 +568,29 @@ def run_train_adapter_phase(
             if cb.stopped_by_signal:
                 notes.append("Stopped early by SIGTERM/SIGINT; final adapter saved at the last completed step")
 
+        # Below, anything that runs a forward or gathers weights is collective under FSDP, so each "should we" is
+        # agreed across ranks (time left and SIGTERM differ slightly per rank) before any rank acts on it.
+        synced = multi_proc and dist_ready()
+
         final_val_loss: float | None = None
-        if val_ds is not None and not _STOP_EVENT.is_set() and (deadline - time.time()) > 5.0:
+        do_eval = val_ds is not None and not _STOP_EVENT.is_set() and (deadline - time.time()) > 5.0
+        if synced:
+            do_eval = agree_all(do_eval)
+        if do_eval:
             eval_metrics = trainer.evaluate()
             if "eval_loss" in eval_metrics:
                 final_val_loss = round(float(eval_metrics["eval_loss"]), 6)
 
         final_adapter_dir = ckpt_root / "final_adapter"
         parity_path: Path | None = None
+        fsdp_model = is_fsdp_wrapped(trainer.model)
+        final_lora = gather_lora_state_dict(trainer.model)  # collective under FSDP, None otherwise
+        want_parity = cfg.parity.enabled and not is_tpu and not _STOP_EVENT.is_set() and (deadline - time.time()) > 3.0
+        if synced:
+            want_parity = agree_all(want_parity)
         if is_main:
             final_adapter_dir.mkdir(parents=True, exist_ok=True)
-            save_adapter_weights(trainer.model, final_adapter_dir, accelerator)
+            save_adapter_weights(trainer.model, final_adapter_dir, accelerator, state_dict=final_lora)
             (final_adapter_dir / "matched_target_modules.json").write_text(
                 json.dumps(
                     {
@@ -531,21 +604,24 @@ def run_train_adapter_phase(
 
             if is_tpu and cfg.parity.enabled:
                 notes.append("HF parity reference skipped on TPU (token-by-token generate recompiles every step)")
-            elif cfg.parity.enabled and not _STOP_EVENT.is_set() and (deadline - time.time()) > 3.0:
-                unwrapped = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
-                gen_toks = min(cfg.parity.gen_tokens, 16 if cfg.run.mode == "calibration" else cfg.parity.gen_tokens)
-                n_prompts = min(cfg.parity.num_prompts, 2 if cfg.run.mode == "calibration" else cfg.parity.num_prompts)
-                parity_path = generate_hf_parity_reference(
-                    adapter_name=adapter_name,
-                    peft_model=unwrapped,
-                    tokenizer=tokenizer,
-                    val_records=val_rows,
-                    train_records=train_rows,
-                    output_path=ctx.parity_dir / f"{adapter_name}_hf.json",
-                    num_prompts=n_prompts,
-                    max_prompt_tokens=cfg.parity.max_prompt_tokens,
-                    gen_tokens=gen_toks,
-                )
+
+        # Under FSDP every rank runs the same greedy decode in lockstep (each forward all-gathers the layers);
+        # rank 0 writes the JSON. Otherwise only rank 0 decodes on its own full copy of the model.
+        if want_parity and (is_main or fsdp_model):
+            gen_toks = min(cfg.parity.gen_tokens, 16 if cfg.run.mode == "calibration" else cfg.parity.gen_tokens)
+            n_prompts = min(cfg.parity.num_prompts, 2 if cfg.run.mode == "calibration" else cfg.parity.num_prompts)
+            parity_path = generate_hf_parity_reference(
+                adapter_name=adapter_name,
+                peft_model=trainer.model,
+                tokenizer=tokenizer,
+                val_records=val_rows,
+                train_records=train_rows,
+                output_path=ctx.parity_dir / f"{adapter_name}_hf.json",
+                num_prompts=n_prompts,
+                max_prompt_tokens=cfg.parity.max_prompt_tokens,
+                gen_tokens=gen_toks,
+                write=is_main,
+            )
 
         steps_completed = resumed_step + segment_steps
         session_out: dict[str, Any] = {}
@@ -562,6 +638,7 @@ def run_train_adapter_phase(
             "adapter": adapter_name,
             "accelerator": accelerator,
             "parallelism": parallelism,
+            "world_size": world_size,
             "loss_impl": loss_impl,
             "steps_completed": steps_completed,
             "segment_steps": segment_steps,

@@ -26,7 +26,13 @@ from pathlib import Path
 from typing import Any
 
 from .clock import SessionClock
-from .config import AdapterSpec, ConfigError, PipelineConfig, load_config
+from .config import (
+    AdapterSpec,
+    ConfigError,
+    PipelineConfig,
+    apply_oom_override,
+    load_config,
+)
 from .runctx import (
     PhaseStatus,
     RunContext,
@@ -103,7 +109,8 @@ def default_phase_command_builder(
         extra = extra or {}
         if phase.startswith("train:"):
             adapter_name = phase.split(":", 1)[1]
-            eff = cfg.resolve_adapter(adapter_name)
+            # An OOM fallback may switch parallelism (e.g. fsdp -> model_split), which changes the launcher.
+            eff = apply_oom_override(cfg.resolve_adapter(adapter_name), extra.get("oom_override"))
             manifest = ctx.read_manifest()
             gpu_cnt = len(manifest.get("gpus") or [])
             n_proc = eff.train.num_processes if eff.train.num_processes is not None else gpu_cnt
@@ -113,7 +120,9 @@ def default_phase_command_builder(
             )
             if backend == "tunix":  # torch-free entry: the PyTorch train module imports torch/transformers at import time
                 cmd = [sys.executable, "-m", "tpu_training.phase"]
-            elif eff.train.parallelism == "ddp" and n_proc and n_proc > 1:
+            elif eff.train.parallelism in {"ddp", "fsdp"} and n_proc and n_proc > 1:
+                # One process per GPU. FSDP itself is switched on inside the train phase (training/distributed.py),
+                # so the phase behaves the same under torchrun or a bare `accelerate launch`.
                 cmd = [
                     sys.executable,
                     "-m",

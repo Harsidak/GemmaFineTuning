@@ -88,6 +88,17 @@ def _run_chunk(
     return _chunk_weighted_ce(lm_head, softcap, h_chunk, y_chunk, w_chunk)
 
 
+def module_device(module: nn.Module) -> torch.device:
+    """Device of a module's weights. Under FSDP (flat parameters) a wrapped module's weights are plain tensor views,
+    not registered parameters, so `next(module.parameters())` is empty there."""
+    for p in module.parameters():
+        return p.device
+    weight = getattr(module, "weight", None)
+    if torch.is_tensor(weight):
+        return weight.device
+    raise RuntimeError(f"{type(module).__name__} has no parameters or weight tensor to take a device from")
+
+
 def _normalise(weighted_sum: torch.Tensor, weight_sum: torch.Tensor | float | None, fallback: torch.Tensor) -> torch.Tensor:
     if weight_sum is not None:
         denom = (
@@ -129,7 +140,7 @@ def static_cross_entropy_loss(
         w = w * weights[:, 1:].to(torch.float32)
     y_safe = torch.where(mask, y_shift, torch.zeros_like(y_shift))
 
-    head_device = next(lm_head.parameters()).device
+    head_device = module_device(lm_head)
     bsz, seq = y_shift.shape
     tokens_per_chunk = max(1, int(chunk_rows) // max(1, bsz))
 
@@ -181,7 +192,7 @@ def selective_cross_entropy_loss(
     y_sel = y_shift[mask]  # [N]
     w_sel = weights[:, 1:].to(h_device)[mask].float() if weights is not None else None
 
-    head_device = next(lm_head.parameters()).device
+    head_device = module_device(lm_head)
     step = max(1, int(chunk_rows))
     weighted_sum: torch.Tensor | None = None
 
@@ -292,6 +303,20 @@ def build_selective_sft_trainer_cls() -> type:
                 return
             self.optimizer, self.lr_scheduler = self._optimizer_factory(self.model)
 
+        # Newer transformers call create_optimizer(model) / create_scheduler() directly after wrapping the model
+        # instead of create_optimizer_and_scheduler, so the factory hooks in at both levels.
+        def create_optimizer(self, model: Any = None) -> Any:
+            if self._optimizer_factory is None:
+                return super().create_optimizer(model) if model is not None else super().create_optimizer()
+            if self.optimizer is None:
+                self.optimizer, self.lr_scheduler = self._optimizer_factory(model if model is not None else self.model)
+            return self.optimizer
+
+        def create_scheduler(self, num_training_steps: int, optimizer: Any = None) -> Any:
+            if self._optimizer_factory is None or self.lr_scheduler is None:
+                return super().create_scheduler(num_training_steps=num_training_steps, optimizer=optimizer)
+            return self.lr_scheduler
+
         def _get_train_sampler(self, train_dataset: Any | None = None) -> Any:
             if self.custom_train_sampler is not None:
                 return self.custom_train_sampler
@@ -380,6 +405,12 @@ def build_selective_sft_trainer_cls() -> type:
                 checkpoint_chunks=self.checkpoint_chunks,
             )
 
+            if self._fsdp_root_anchor(model, outputs):
+                # FSDP queues its end-of-backward step (gradient reduce-scatter wait, reshard, state reset) from a
+                # hook on the root module's *outputs*. The loss above reads the captured hidden states, not the
+                # 1-token logits the root returned, so tie those logits in with weight 0 to make the hook fire.
+                loss = loss + outputs_logits(outputs).float().sum() * 0.0
+
             if (
                 model.training
                 and self.args.world_size > 1
@@ -390,4 +421,25 @@ def build_selective_sft_trainer_cls() -> type:
 
             return (loss, outputs) if return_outputs else loss
 
+        @staticmethod
+        def _fsdp_root_anchor(model: nn.Module, outputs: Any) -> bool:
+            if not torch.is_grad_enabled():
+                return False
+            try:
+                from torch.distributed.fsdp import FullyShardedDataParallel
+            except ImportError:
+                return False
+            if not isinstance(model, FullyShardedDataParallel):
+                return False
+            logits = outputs_logits(outputs)
+            return logits is not None and logits.requires_grad
+
     return SelectiveLossSFTTrainer
+
+
+def outputs_logits(outputs: Any) -> torch.Tensor | None:
+    """`logits` of a model output (ModelOutput or the tuple form used with `return_dict=False`)."""
+    logits = getattr(outputs, "logits", None)
+    if logits is None and isinstance(outputs, (tuple, list)) and outputs and torch.is_tensor(outputs[0]):
+        logits = outputs[0]
+    return logits

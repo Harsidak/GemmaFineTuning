@@ -384,12 +384,18 @@ def load_base_model_for_training(
                     "quantization='nf4' requires bitsandbytes, which is not installed; add it to the wheelhouse "
                     "or use model.quantization=bf16"
                 ) from exc
+            bnb_kwargs: dict[str, Any] = {}
+            if eff_adapter.train.parallelism == "fsdp":
+                # FSDP flattens each decoder layer into one tensor that needs a single dtype: pack the 4-bit codes
+                # into bf16 storage (same bits, same kernels) so they flatten alongside the bf16 norms.
+                bnb_kwargs["bnb_4bit_quant_storage"] = torch.bfloat16
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
                 llm_int8_skip_modules=["lm_head", "vision_tower", "audio_tower", "embed_vision", "embed_audio"],
+                **bnb_kwargs,
             )
 
     local_only = Path(model_path).is_dir()
@@ -423,7 +429,9 @@ def load_base_model_for_training(
             load_kwargs["max_memory"] = {
                 i: f"{int(cfg.model.max_memory_gib)}GiB" for i in range(n_gpus)
             }
-        elif parallelism == "ddp":
+        elif parallelism in {"ddp", "fsdp"}:
+            # FSDP: each rank loads (and quantizes) the whole model onto its own GPU, then the Trainer shards it.
+            # The 31B in NF4 is ~18 GB, which fits one 22.5 GiB L4 before sharding.
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
             load_kwargs["device_map"] = {"": local_rank}
         else:
@@ -451,7 +459,14 @@ def load_base_model_for_training(
             for p in sub.parameters():
                 p.requires_grad_(False)
 
-    if quant == "nf4":
+    if quant == "nf4" and parallelism == "fsdp":
+        # Not `prepare_model_for_kbit_training`: it upcasts the norms/embeddings to fp32, and FSDP cannot flatten
+        # fp32 norms with the bf16-packed 4-bit weights of the same layer. The base is frozen by PEFT anyway.
+        for p in model.parameters():
+            p.requires_grad_(False)
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()
+    elif quant == "nf4":
         from peft import prepare_model_for_kbit_training
 
         model = prepare_model_for_kbit_training(

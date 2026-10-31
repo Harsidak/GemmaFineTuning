@@ -7,6 +7,8 @@ Implements design_doc.md §7.10 and §9.3:
   recording each chosen token's log-prob and top-5 log-probs.
 - Compares vLLM greedy token sequences and log-probs against the HF reference to detect int4 + LoRA
   serving regressions (e.g. vllm#50059).
+- Under FSDP the decode runs on every rank in lockstep through the sharded model (each forward all-gathers the
+  layers); rank 0 picks each token and broadcasts it so all ranks feed the same next input and stop together.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from ...src.data.processor import IGNORE_INDEX
+from .distributed import broadcast_int, is_fsdp_wrapped
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +73,10 @@ def greedy_decode_with_logprobs(
     was_training = model.training
     model.eval()
     try:
-        unwrapped = model.module if hasattr(model, "module") else model
+        # An FSDP root must run its own forward (it un-shards the embeddings / lm_head it holds); calling `.module`
+        # would read freed shards. Other wrappers (DDP) are bypassed as before.
+        lockstep = is_fsdp_wrapped(model)
+        unwrapped = model if lockstep else (model.module if hasattr(model, "module") else model)
         dev = next(unwrapped.parameters()).device
         cur_ids = torch.tensor([prompt_ids], dtype=torch.long, device=dev)
         steps: list[dict[str, Any]] = []
@@ -82,6 +88,8 @@ def greedy_decode_with_logprobs(
             logprobs = F.log_softmax(next_logits, dim=-1)
 
             chosen_id = int(torch.argmax(logprobs).item())
+            if lockstep:
+                chosen_id = broadcast_int(chosen_id)
             chosen_lp = float(logprobs[chosen_id].item())
             k = min(top_k, logprobs.numel())
             top_vals, top_idxs = torch.topk(logprobs, k=k)
@@ -123,8 +131,12 @@ def generate_hf_parity_reference(
     num_prompts: int = 8,
     max_prompt_tokens: int = 4096,
     gen_tokens: int = 64,
+    write: bool = True,
 ) -> Path:
-    """Generates HF greedy tokens + logprobs with and without the adapter and saves JSON (§7.10)."""
+    """Generates HF greedy tokens + logprobs with and without the adapter and saves JSON (§7.10).
+
+    `peft_model` may be FSDP-wrapped, in which case every rank must call this together and only the rank with
+    `write=True` writes the file."""
     source_records = val_records if val_records else train_records
     prompts = extract_parity_prompts(
         source_records,
@@ -133,15 +145,16 @@ def generate_hf_parity_reference(
         max_prompt_tokens=max_prompt_tokens,
     )
 
-    unwrapped = peft_model.module if hasattr(peft_model, "module") else peft_model
+    unwrapped = peft_model.module if hasattr(peft_model, "module") else peft_model  # the PeftModel
+    runner = peft_model if is_fsdp_wrapped(peft_model) else unwrapped  # what the forward is called on
     items: list[dict[str, Any]] = []
     for p in prompts:
         with_adapter = greedy_decode_with_logprobs(
-            unwrapped, tokenizer, p["prompt_token_ids"], gen_tokens=gen_tokens
+            runner, tokenizer, p["prompt_token_ids"], gen_tokens=gen_tokens
         )
         with unwrapped.disable_adapter():
             without_adapter = greedy_decode_with_logprobs(
-                unwrapped, tokenizer, p["prompt_token_ids"], gen_tokens=gen_tokens
+                runner, tokenizer, p["prompt_token_ids"], gen_tokens=gen_tokens
             )
         items.append(
             {
@@ -159,8 +172,9 @@ def generate_hf_parity_reference(
         "gen_tokens": gen_tokens,
         "prompts": items,
     }
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if write:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return output_path
 
 

@@ -122,11 +122,17 @@ class LoraSection:
     export_target_modules_mode: str = "explicit"  # "explicit" | "regex"
 
 
+# Multi-GPU CUDA strategies (TPU uses "spmd").
+GPU_PARALLELISM: frozenset[str] = frozenset({"fsdp", "ddp", "model_split"})
+
+
 @dataclass
 class TrainSection:
     backend: str = "auto"  # "auto" | "trl" (PyTorch) | "tunix" (JAX); auto = tunix for E4B/E2B on a TPU, trl otherwise
     accelerator: str = "auto"  # "auto" | "cuda" | "tpu" | "cpu"
-    parallelism: str = "model_split"  # "ddp" | "model_split" | "single" | "spmd" (TPU FSDPv2)
+    # "fsdp" (all GPUs compute, weights sharded) | "model_split" (one process, layers spread, GPUs take turns) |
+    # "ddp" (full model per GPU) | "single" | "spmd" (TPU FSDPv2)
+    parallelism: str = "model_split"
     num_processes: int | None = None
     lr: float = 1.0e-4
     max_epochs: float = 2.0
@@ -644,7 +650,7 @@ def _validate_train_section(train: TrainSection, label: str, quantization: str |
     if train.backend not in {"auto", "trl", "tunix"}:
         raise ConfigError(f"{label}.backend must be 'auto', 'trl' or 'tunix', got {train.backend!r}")
     if train.backend == "tunix":
-        if train.accelerator == "cuda" or train.parallelism in {"ddp", "model_split"}:
+        if train.accelerator == "cuda" or train.parallelism in {"ddp", "model_split", "fsdp"}:
             raise ConfigError(
                 f"{label}: backend 'tunix' is the JAX path for TPU (JAX-CPU for tests); use accelerator 'tpu'/'auto'/'cpu' with "
                 "parallelism 'spmd' or 'single', or backend 'trl' for GPUs"
@@ -657,14 +663,14 @@ def _validate_train_section(train: TrainSection, label: str, quantization: str |
         raise ConfigError(
             f"{label}.accelerator must be 'auto', 'cuda', 'tpu', or 'cpu', got {train.accelerator!r}"
         )
-    if train.parallelism not in {"ddp", "model_split", "single", "spmd"}:
+    if train.parallelism not in GPU_PARALLELISM | {"single", "spmd"}:
         raise ConfigError(
-            f"{label}.parallelism must be 'ddp', 'model_split', 'single', or 'spmd', got {train.parallelism!r}"
+            f"{label}.parallelism must be 'fsdp', 'ddp', 'model_split', 'single', or 'spmd', got {train.parallelism!r}"
         )
     if train.parallelism == "spmd" and train.accelerator not in {"tpu", "auto"}:
         raise ConfigError(f"{label}.parallelism='spmd' (XLA FSDPv2) requires accelerator 'tpu'")
     if train.accelerator == "tpu":
-        if train.parallelism in {"ddp", "model_split"}:
+        if train.parallelism in GPU_PARALLELISM:
             raise ConfigError(
                 f"{label}.parallelism={train.parallelism!r} is CUDA-only; with accelerator 'tpu' use 'spmd' "
                 "(shard over all TPU cores) or 'single' (one core)"
@@ -674,6 +680,10 @@ def _validate_train_section(train: TrainSection, label: str, quantization: str |
         for idx, fb in enumerate(train.oom_fallbacks):
             if isinstance(fb, dict) and fb.get("quantization") == "nf4":
                 raise ConfigError(f"{label}.oom_fallbacks[{idx}] switches to nf4, which is unavailable on TPU")
+    for idx, fb in enumerate(train.oom_fallbacks):
+        par = fb.get("parallelism") if isinstance(fb, dict) else None
+        if par is not None and par not in GPU_PARALLELISM | {"single", "spmd"}:
+            raise ConfigError(f"{label}.oom_fallbacks[{idx}].parallelism={par!r} is not a known parallelism")
     if train.pad_to_multiple_of is not None and train.pad_to_multiple_of < 1:
         raise ConfigError(f"{label}.pad_to_multiple_of must be >= 1 when set, got {train.pad_to_multiple_of}")
     if train.max_nonfinite_logs < 1:
@@ -701,7 +711,8 @@ def _validate_train_section(train: TrainSection, label: str, quantization: str |
     if train.max_restarts < 0:
         raise ConfigError(f"{label}.max_restarts must be >= 0")
 
-    allowed_oom_keys = {"quantization", "max_seq_length", "per_device_batch", "grad_accum"}
+    # parallelism: e.g. fsdp -> model_split, which spreads activations over the GPUs instead of replicating them.
+    allowed_oom_keys = {"quantization", "max_seq_length", "per_device_batch", "grad_accum", "parallelism"}
     for idx, fb in enumerate(train.oom_fallbacks):
         if not isinstance(fb, dict) or not fb:
             raise ConfigError(f"{label}.oom_fallbacks[{idx}] must be a non-empty mapping")
@@ -918,6 +929,10 @@ def apply_oom_override(eff: EffectiveAdapterConfig, override: dict[str, Any] | N
     for k, v in override.items():
         if k == "quantization":
             quant = str(v)
+        elif k == "max_seq_length":
+            # A fallback only ever shortens: an adapter whose own override is already shorter (tool_lora: 8192)
+            # must not be lengthened by a global {max_seq_length: 12288} entry.
+            train_dict[k] = min(int(v), int(train_dict[k]))
         elif k in train_dict:
             train_dict[k] = v
     return EffectiveAdapterConfig(

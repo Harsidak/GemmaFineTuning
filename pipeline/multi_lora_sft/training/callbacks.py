@@ -12,6 +12,9 @@ Implements design_doc.md §7.8 and §7.9:
 - Aborts with `NonFiniteLossError` after `max_nonfinite_logs` consecutive NaN/Inf loss or grad-norm logs, so the
   orchestrator restarts from the last good checkpoint instead of training on (and saving) corrupt weights.
 - Stops cleanly when `stop_requested()` turns true (SIGTERM from the orchestrator's deadline).
+- Multi-process (FSDP/DDP): every time-based or signal-based decision (stop, validate, checkpoint) is taken from rank
+  0's clock and an any-rank signal flag, so all ranks run the same collectives; under FSDP the LoRA weights and
+  optimizer state are gathered on every rank before rank 0 writes them (see `distributed.py`).
 """
 
 from __future__ import annotations
@@ -43,19 +46,31 @@ from ..shared.checkpoints import (  # noqa: F401 - re-exported: the orchestrator
 from ..shared.guards import NonFiniteGuard, NonFiniteLossError  # noqa: F401
 from ..shared.sysmon import read_latest, wandb_system_metrics
 from .device import capture_rng_state, cpu_state_dict, peak_memory_mb, save_object
+from .distributed import (
+    SyncedClock,
+    agree_any,
+    fsdp_full_optim_state_dict,
+    gather_lora_state_dict,
+)
 from .loss import unwrap_causal_lm
 from .schedule import WSDScheduleController
 
 logger = logging.getLogger(__name__)
 
 
-def save_adapter_weights(model: Any, out_dir: Path, accelerator: str = "cpu") -> None:
+def save_adapter_weights(
+    model: Any, out_dir: Path, accelerator: str = "cpu", state_dict: dict[str, Any] | None = None
+) -> None:
     """PEFT `save_pretrained`; on XLA the LoRA tensors are synced and copied to host first.
 
     The host copy keeps the raw (adapter-name-qualified) keys so PEFT's own filtering in `save_pretrained`
-    still selects them; passing an already-converted PEFT state dict would filter everything out.
+    still selects them; passing an already-converted PEFT state dict would filter everything out. `state_dict` is the
+    LoRA tensors already gathered from an FSDP-sharded model (`distributed.gather_lora_state_dict`).
     """
     unwrapped = model.module if hasattr(model, "module") else model
+    if state_dict is not None:
+        unwrapped.save_pretrained(out_dir, state_dict=state_dict)
+        return
     if accelerator != "tpu":
         unwrapped.save_pretrained(out_dir)
         return
@@ -63,14 +78,17 @@ def save_adapter_weights(model: Any, out_dir: Path, accelerator: str = "cpu") ->
     unwrapped.save_pretrained(out_dir, state_dict=cpu_state_dict(raw, accelerator))
 
 
-def inspect_dead_lora_modules(model: Any) -> dict[str, Any]:
-    """Checks `‖lora_B‖` across all LoRA modules, grouping any exact-zero B weights (§7.9)."""
+def inspect_dead_lora_modules(model: Any, state_dict: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Checks `‖lora_B‖` across all LoRA modules, grouping any exact-zero B weights (§7.9).
+
+    `state_dict` (gathered LoRA tensors) replaces the model's own parameters, which are flat shards under FSDP."""
     cur = model.module if hasattr(model, "module") else model
     zero_by_proj: dict[str, list[int]] = defaultdict(list)
     total_modules = 0
     zero_count = 0
 
-    for name, param in cur.named_parameters():
+    params = state_dict.items() if state_dict is not None else cur.named_parameters()
+    for name, param in params:
         if ".lora_B." not in name:
             continue
         total_modules += 1
@@ -118,6 +136,8 @@ def save_wallclock_checkpoint(
     reason: str = "wallclock",
     extra_meta: dict[str, Any] | None = None,
     progress_fn: Callable[[Path], None] | None = None,
+    adapter_state: dict[str, Any] | None = None,
+    optimizer_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Writes a self-contained resumable checkpoint directory `step_<n>/` and prunes old ones (§7.8).
 
@@ -125,13 +145,17 @@ def save_wallclock_checkpoint(
     `write_checkpoint`; this function only supplies the PyTorch-specific state. `extra_meta` is merged into
     `trainer_resume.json` (fingerprints, best-loss state) and `progress_fn(tmp_dir)` writes the task ledger.
     Returns None when nothing was written (not the main process, or the disk is too full).
+    `adapter_state` / `optimizer_state` are pre-gathered from an FSDP model; the optimizer state is then the
+    name-keyed full state (`optimizer_format: fsdp_full` in `trainer_resume.json`) rather than `optimizer.state_dict()`.
     """
     if not is_main_process:
         return None
 
     def _write(tmp_dir: Path) -> None:
-        save_adapter_weights(model, tmp_dir / "adapter", accelerator)
-        if optimizer is not None:
+        save_adapter_weights(model, tmp_dir / "adapter", accelerator, state_dict=adapter_state)
+        if optimizer_state is not None:
+            torch.save(optimizer_state, tmp_dir / "optimizer.pt")
+        elif optimizer is not None:
             save_object(optimizer.state_dict(), tmp_dir / "optimizer.pt", accelerator)
         if scheduler is not None:
             torch.save(scheduler.state_dict(), tmp_dir / "scheduler.pt")
@@ -147,11 +171,15 @@ def save_wallclock_checkpoint(
             "saved_at_ts": time.time(),
             "reason": reason,
             "accelerator": accelerator,
+            "optimizer_format": "fsdp_full" if optimizer_state is not None else "torch",
             **(extra_meta or {}),
         }
         (tmp_dir / "trainer_resume.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    trainable_bytes = 4 * sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
+    if adapter_state is not None:  # FSDP parameters are shards; size the estimate from the gathered tensors
+        trainable_bytes = 3 * sum(t.numel() * t.element_size() for t in adapter_state.values())
+    else:
+        trainable_bytes = 4 * sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
     return write_checkpoint(
         checkpoint_root,
         step,
@@ -190,8 +218,12 @@ class MultiLoraTrainingCallback(TrainerCallback):
         max_nonfinite_logs: int = 3,
         stop_requested: Callable[[], bool] | None = None,
         session: Any | None = None,
+        clock: SyncedClock | None = None,
     ) -> None:
         self.session = session
+        # Rank-0 wall clock shared by all ranks (also the WSD controller's now_fn); None = local time.
+        self.clock = clock
+        self._gathered_lora: dict[str, Any] | None = None
         self.adapter_name = adapter_name
         self.step_offset = max(0, int(step_offset))
         self.accelerator = accelerator
@@ -241,7 +273,7 @@ class MultiLoraTrainingCallback(TrainerCallback):
         self._trainer_ref = trainer
 
     def _save_best(self, tmp_dir: Path) -> None:
-        save_adapter_weights(self._trainer_ref.model, tmp_dir, self.accelerator)
+        save_adapter_weights(self._trainer_ref.model, tmp_dir, self.accelerator, state_dict=self._gathered_lora)
 
     def _progress_writer(self, state: TrainerState) -> Callable[[Path], None] | None:
         """Writes the task ledger (which examples this epoch has consumed) next to a checkpoint."""
@@ -262,6 +294,11 @@ class MultiLoraTrainingCallback(TrainerCallback):
         """Writes a resumable checkpoint at the current global step (used by timers, SIGTERM, and crashes)."""
         if self._trainer_ref is None or model is None:
             return None
+        # Collective under FSDP (every rank reaches this from the same agreed decision); None for other models.
+        adapter_state = gather_lora_state_dict(model)
+        optimizer_state = (
+            fsdp_full_optim_state_dict(model, self._trainer_ref.optimizer) if adapter_state is not None else None
+        )
         return save_wallclock_checkpoint(
             checkpoint_root=self.checkpoint_root,
             step=self.global_step(state),
@@ -279,7 +316,15 @@ class MultiLoraTrainingCallback(TrainerCallback):
             reason=reason,
             extra_meta=self.session.checkpoint_meta() if self.session is not None else None,
             progress_fn=self._progress_writer(state),
+            adapter_state=adapter_state,
+            optimizer_state=optimizer_state,
         )
+
+    def _dead_check(self, model: Any) -> dict[str, Any]:
+        gathered = gather_lora_state_dict(model)  # collective under FSDP
+        if gathered is not None and not gathered:  # non-zero rank: rank 0 holds the tensors and reports
+            return {"total_lora_b_modules": 0, "dead_lora_b_modules": 0, "dead_grouped": {}, "reported_by": "rank 0"}
+        return inspect_dead_lora_modules(model, state_dict=gathered)
 
     def on_epoch_begin(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
@@ -291,7 +336,8 @@ class MultiLoraTrainingCallback(TrainerCallback):
     def on_step_end(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
     ) -> TrainerControl:
-        now = self.wsd.now()
+        # Same timestamp on every rank (one tiny broadcast per optimizer step in multi-process runs).
+        now = self.clock.sync() if self.clock is not None else self.wsd.now()
         self.wsd.on_step_end(self.global_step(state), now=now)
 
         step_all = float(self.metrics_tracker.get("step_total_tokens", 0.0)) * max(1, args.world_size)
@@ -307,7 +353,7 @@ class MultiLoraTrainingCallback(TrainerCallback):
 
         # Dead-adapter check (§7.9)
         if state.global_step == self.dead_check_step and model is not None and self.dead_check_result is None:
-            self.dead_check_result = inspect_dead_lora_modules(model)
+            self.dead_check_result = self._dead_check(model)
             if is_main and self.dead_check_result["dead_lora_b_modules"] > 0:
                 logger.warning(
                     "[%s] Dead-adapter check at step %d: %d/%d lora_B modules still zero: %s",
@@ -352,7 +398,11 @@ class MultiLoraTrainingCallback(TrainerCallback):
             self._last_ckpt_ts = now
 
         # External stop (SIGTERM at the orchestrator's hard deadline): stop now, the caller saves final weights.
-        if self.stop_requested is not None and self.stop_requested():
+        # Signals reach ranks at slightly different times; any rank having one stops all of them at this step.
+        signalled = self.stop_requested() if self.stop_requested is not None else False
+        if self.clock is not None and self.clock.distributed:
+            signalled = agree_any(signalled)
+        if signalled:
             if is_main and not self.stopped_by_signal:
                 logger.warning("[%s] Stop requested by signal at step %d", self.adapter_name, self.global_step(state))
             self.stopped_by_signal = True
@@ -393,14 +443,22 @@ class MultiLoraTrainingCallback(TrainerCallback):
             else:
                 self._guard.observe(float(logs["loss"]), gn_val, self.global_step(state))
 
+        # Every rank sees the same (already reduced) eval loss, so every rank reaches the same best/early-stop
+        # decision; under FSDP the LoRA weights are gathered first because saving the best adapter is collective.
+        if "eval_loss" in logs and self.session is not None:
+            model = self._trainer_ref.model if self._trainer_ref is not None else None
+            self._gathered_lora = gather_lora_state_dict(model)
+            try:
+                decision = self.session.on_eval(self.global_step(state), float(logs["eval_loss"]), self._save_best)
+            finally:
+                self._gathered_lora = None
+            if decision.should_stop:
+                control.should_training_stop = True
+
         if not state.is_world_process_zero:
             return
 
         now = self.wsd.now()
-        if "eval_loss" in logs and self.session is not None:
-            decision = self.session.on_eval(self.global_step(state), float(logs["eval_loss"]), self._save_best)
-            if decision.should_stop:
-                control.should_training_stop = True
         if "eval_loss" in logs:
             self.val_losses.append(
                 {
@@ -452,4 +510,4 @@ class MultiLoraTrainingCallback(TrainerCallback):
         """Ensures dead-adapter check still runs at training end if fewer than `dead_check_step` steps ran."""
         if self.dead_check_result is None and model is not None:
             _ = unwrap_causal_lm(model)
-            self.dead_check_result = inspect_dead_lora_modules(model)
+            self.dead_check_result = self._dead_check(model)
