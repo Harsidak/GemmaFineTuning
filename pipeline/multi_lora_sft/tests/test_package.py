@@ -99,6 +99,48 @@ def test_package_sample_template_rewrites_model_preserves_include_and_validates(
         assert "adapters/tool_lora/adapter_model.safetensors" in names
 
 
+@pytest.mark.parametrize("trained", [True, False])
+def test_package_without_any_sample_template_still_ships_the_trained_adapters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trained: bool
+) -> None:
+    """Kaggle case: build/ is not in the repo dataset, so there is no sample template to copy. The scaffolded template
+    must declare the adapter slots (else trained adapters never reach the zip) and must not leave empty slot folders
+    (else validation fails and NO zip is written). Regression for the 2026-10-30 Kaggle run that ended without a zip."""
+    import pipeline.multi_lora_sft.phases.package as pkg
+
+    monkeypatch.setattr(pkg, "default_sample_template_dir", lambda: None)
+    cfg = load_config(
+        set_overrides=[
+            f"run.output_root={(tmp_path / 'runs').as_posix()}",
+            f"run.run_id=pkg_no_template_{int(trained)}",
+            "model.served_model_id=gemma-4-e4b-it-qat-w4a16-ct",
+            "submission.template_dir=null",
+            "submission.working_zip_path=null",
+        ]
+    )
+    ctx = RunContext.create(cfg, t0=1000.0)
+    cfg.save_yaml(ctx.resolved_config_path)
+    if trained:
+        _make_fake_exported_adapter(ctx.adapters_dir / "main_lora", r=16)
+        _make_fake_exported_adapter(ctx.adapters_dir / "tool_lora", r=8)
+
+    st = run_package_phase(ctx, cfg=cfg)
+    assert st["state"] == "ok", st.get("error")
+    assert ctx.submission_zip_path.is_file()
+    agent_txt = (ctx.submission_dir / "agent.yaml").read_text(encoding="utf-8")
+    sub_txt = (ctx.submission_dir / "sub_agents" / "code_analyzer.yaml").read_text(encoding="utf-8")
+    with zipfile.ZipFile(ctx.submission_zip_path) as zf:
+        names = set(zf.namelist())
+    if trained:
+        assert "adapter: main_lora" in agent_txt and "adapter: tool_lora" in sub_txt
+        assert {"adapters/main_lora/adapter_model.safetensors", "adapters/tool_lora/adapter_model.safetensors"} <= names
+        assert st["outputs"]["adapter_sources"] == {"main_lora": "exported:main_lora", "tool_lora": "exported:tool_lora"}
+    else:
+        assert "adapter:" not in agent_txt and "adapter:" not in sub_txt
+        assert not any(n.startswith("adapters/") for n in names)
+        assert not (ctx.submission_dir / "adapters").exists()
+
+
 def test_package_fallback_order_checkpoint_fallback_dir_and_bare_model(
     tmp_path: Path, repo_root: Path
 ) -> None:

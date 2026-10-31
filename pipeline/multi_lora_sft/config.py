@@ -262,6 +262,8 @@ class TrackingSection:
     group: str | None = None
     run_name: str | None = None
     disable_during_tuning: bool = True  # Optuna trials never log to W&B
+    system_every_sec: float = 30.0  # host / GPU / TPU sample -> metrics/system.jsonl and W&B `sys/*` (0 = off)
+    heartbeat_sec: float = 180.0  # one progress line (phase, clock, last loss, utilisation) in the notebook log (0 = off)
 
 
 @dataclass

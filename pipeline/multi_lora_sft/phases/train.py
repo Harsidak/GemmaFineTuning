@@ -40,6 +40,7 @@ from ..runctx import PhaseStatus, RunContext, configure_phase_logging, utc_iso
 from ..shared.backend import resolve_backend
 from ..shared.bundle import discover_bundles
 from ..shared.bundle import resume_candidates as shared_resume_candidates
+from ..shared.guards import LossDivergedError, NoGradientError
 from ..shared.session import TrainingSession
 from ..training.callbacks import (
     MultiLoraTrainingCallback,
@@ -486,8 +487,8 @@ def run_train_adapter_phase(
             )
             try:
                 train_result = trainer.train()
-            except NonFiniteLossError:
-                raise  # weights may be corrupt: never checkpoint them; the restart resumes the last good save
+            except (NonFiniteLossError, LossDivergedError, NoGradientError):
+                raise  # weights corrupt / diverging / untrained: never checkpoint them; the restart resumes the last good save
             except BaseException as exc:
                 if eff.train.emergency_checkpoint and trainer.state.global_step > 0:
                     try:

@@ -319,3 +319,27 @@ def run_tunix_adapter_phase(
         _write_status(ctx, phase_name, state="failed", t_start=t_start, deadline=deadline, notes=notes,
                       error=f"{type(exc).__name__}: {exc}")
         raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Same CLI as `pipeline.multi_lora_sft.phases.train`, without importing it: that module pulls in torch +
+    transformers at import time, which a JAX-only TPU image may not have."""
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Multi-LoRA SFT Phase 3 on the Tunix (JAX) backend: train one adapter")
+    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--adapter", required=True)
+    ap.add_argument("--deadline", type=float, required=True)
+    ap.add_argument("--oom-override-json", default=None)
+    args = ap.parse_args(argv)
+    ctx = RunContext(args.run_dir)
+    oom = json.loads(args.oom_override_json) if args.oom_override_json else None
+    try:
+        run_tunix_adapter_phase(ctx, args.adapter, deadline=args.deadline, oom_override=oom)
+        return 0
+    except BaseException:  # noqa: BLE001 - the status JSON already holds the error
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

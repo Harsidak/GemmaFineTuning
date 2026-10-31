@@ -70,6 +70,27 @@ from the environment.
   newest checkpoints are skipped on resume, already-finished checkpoints are exported without retraining.
 * **Served agent**: `submission.generation` writes `configs/sampling.yaml` and `submission.eval_budget` writes
   `eval_config.yaml` (the sample template's 1-minute / 10-call budget is never shipped).
+* **No gradient**: 3 consecutive supervised steps with a grad norm of exactly 0 abort the run (`NoGradientError`): the
+  LoRA is not in the forward pass, and training on would only export an untrained adapter.
+* **Always a zip**: without a sample template (Kaggle: `build/` is not in the repo dataset) the package phase scaffolds one
+  that declares the `main_lora` / `tool_lora` slots, fills them from export → checkpoint → fallback, else strips them.
+* **Torch-free Tunix path**: a Tunix run launches `python -m tpu_training.phase`, setup never opens torch_xla, and export
+  casts to bf16 with numpy + ml_dtypes when torch is absent (a JAX-only TPU image).
+
+## Feedback while it runs
+
+* **Heartbeat** (`tracking.heartbeat_sec`, 180 s): one line in the notebook log per interval with the phase, time left
+  (phase and session), the newest step / loss / grad norm / lr / tokens per second, and utilisation.
+* **System monitor** (`tracking.system_every_sec`, 30 s): host CPU/RAM/disk (psutil), GPU utilisation/memory/power (NVML,
+  else `nvidia-smi`), TPU HBM + TensorCore duty cycle per chip (`tpu-info`, read from libtpu's metrics service without
+  opening the TPU) → `metrics/system.jsonl` and W&B `sys/*`.
+* **REPORT.md §5**: loss first → last, grad norm range, zero-grad and skipped-NaN counts, tokens/s, peak memory, W&B mode,
+  and resource peaks.
+* **W&B**: the notebook verifies the `WANDB_API_KEY` secret with a real login before training and says whether the run logs
+  online or offline. An online start that fails falls back to offline. Offline runs (no internet, e.g. GPU sessions) are
+  uploaded by `scripts/kaggle_push.py` after it downloads the output (`wandb sync`, needs a local key; `--no-wandb-sync`).
+* **Clock**: `RUN["clock_hours"]` (or `kaggle_push.py --hours 4`) is the whole notebook's wall clock from the first cell;
+  training gets what remains after export / package / eval / the safety margin, and a backstop stops the run at the clock.
 
 ## Notebook
 

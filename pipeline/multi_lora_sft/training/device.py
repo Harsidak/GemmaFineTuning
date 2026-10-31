@@ -108,17 +108,26 @@ def resolve_accelerator(requested: str = "auto") -> str:
     return "cpu"
 
 
-def accelerator_inventory() -> dict[str, Any]:
-    """Describes every accelerator visible to this process (used by setup + manifest)."""
-    import torch
+def accelerator_inventory(query_xla: bool = True) -> dict[str, Any]:
+    """Describes every accelerator visible to this process (used by setup + manifest).
 
-    inv: dict[str, Any] = {"cuda": [], "tpu": None, "xla_installed": xla_installed()}
-    if torch.cuda.is_available():
+    `query_xla=False` (Tunix/JAX runs) never touches torch_xla: asking it for the device count opens the TPU runtime in
+    this process, which a JAX-only run does not need. Without torch installed the CUDA list is simply empty."""
+    inv: dict[str, Any] = {"cuda": [], "tpu": None, "xla_installed": xla_installed() if query_xla else None}
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None and torch.cuda.is_available():
         for idx in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(idx)
             inv["cuda"].append(
                 {"index": idx, "name": props.name, "total_memory_gib": round(props.total_memory / (1024**3), 2)}
             )
+    if not query_xla:
+        if os.environ.get("TPU_ACCELERATOR_TYPE") or os.environ.get("TPU_NAME"):
+            inv["tpu"] = {"accelerator_type": os.environ.get("TPU_ACCELERATOR_TYPE"), "queried": "env only (JAX backend)"}
+        return inv
     if tpu_available():
         try:
             import torch_xla.runtime as xr

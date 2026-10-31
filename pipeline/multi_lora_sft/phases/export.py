@@ -28,7 +28,7 @@ from ..runctx import (
     utc_iso,
 )
 from ..shared.adapter_contract import check_adapter_contract
-from ..training.callbacks import find_latest_checkpoint
+from ..shared.checkpoints import find_latest_checkpoint
 
 EXPORT_KEY_RE = re.compile(
     r"^base_model\.model\.model\.language_model\.layers\.(\d+)\.(.+)\.lora_([AB])\.weight$"
@@ -37,6 +37,37 @@ EXPORT_KEY_RE = re.compile(
 
 class ExportValidationError(ValueError):
     """Raised when an adapter checkpoint violates export key, dtype, rank, or numerical sanity rules."""
+
+
+def _tensor_ops() -> tuple[Any, Any, Any, Any, Any]:
+    """(load_file, save_file, to_bf16, all_finite, l2_norm) on torch, or on numpy + ml_dtypes when torch is absent
+    (a JAX-only TPU image; ml_dtypes ships with jax). Both write the same bf16 safetensors."""
+    try:
+        import torch
+        from safetensors.torch import load_file, save_file
+
+        return (
+            lambda p: load_file(p, device="cpu"),
+            save_file,
+            lambda t: t.detach().to(device="cpu", dtype=torch.bfloat16).contiguous(),
+            lambda t: bool(torch.isfinite(t).all()),
+            lambda t: float(t.float().norm().item()),
+        )
+    except ImportError:
+        import ml_dtypes
+        import numpy as np
+        from safetensors.numpy import load_file, save_file
+
+        def f32(t: Any) -> Any:
+            return np.asarray(t, dtype=np.float32)
+
+        return (
+            load_file,
+            save_file,
+            lambda t: np.ascontiguousarray(f32(t).astype(ml_dtypes.bfloat16)),
+            lambda t: bool(np.isfinite(f32(t)).all()),
+            lambda t: float(np.linalg.norm(f32(t))),
+        )
 
 
 def format_served_base_model_id(served_model_id: str) -> str:
@@ -62,8 +93,7 @@ def export_single_adapter(
     allow_all_zero_b: bool = False,
 ) -> dict[str, Any]:
     """Exports and validates a single PEFT LoRA adapter directory on CPU in `bfloat16` (§8.1)."""
-    import torch
-    from safetensors.torch import load_file, save_file
+    load_file, save_file, to_bf16, all_finite, l2_norm = _tensor_ops()
 
     if not ADAPTER_NAME_RE.match(adapter_name):
         raise ExportValidationError(f"Invalid adapter name {adapter_name!r}")
@@ -77,11 +107,11 @@ def export_single_adapter(
         raise ExportValidationError(f"Missing adapter_config.json in {src_dir}")
 
     raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    raw_tensors = load_file(str(st_path), device="cpu")
+    raw_tensors = load_file(str(st_path))
     if not raw_tensors:
         raise ExportValidationError(f"adapter_model.safetensors in {src_dir} contains 0 tensors")
 
-    cast_tensors: dict[str, torch.Tensor] = {}
+    cast_tensors: dict[str, Any] = {}
     modules_with_a: dict[str, tuple[int, int]] = {}
     modules_with_b: dict[str, tuple[int, int]] = {}
     non_zero_b_count = 0
@@ -100,11 +130,11 @@ def export_single_adapter(
 
         if tensor.ndim != 2:
             raise ExportValidationError(f"Expected 2D LoRA weight for {key!r}, got shape {tuple(tensor.shape)}")
-        if not torch.isfinite(tensor).all():
+        if not all_finite(tensor):
             raise ExportValidationError(f"NaN or Inf detected in adapter {adapter_name!r} tensor {key!r}")
 
-        bf16_t = tensor.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
-        if not torch.isfinite(bf16_t).all():
+        bf16_t = to_bf16(tensor)
+        if not all_finite(bf16_t):
             raise ExportValidationError(f"Overflow when casting {key!r} to bfloat16")
 
         cast_tensors[key] = bf16_t
@@ -115,7 +145,7 @@ def export_single_adapter(
             modules_with_a[mod_rel] = (int(bf16_t.shape[0]), int(bf16_t.shape[1]))
         else:
             modules_with_b[mod_rel] = (int(bf16_t.shape[0]), int(bf16_t.shape[1]))
-            if float(bf16_t.float().norm().item()) > 0.0:
+            if l2_norm(bf16_t) > 0.0:
                 non_zero_b_count += 1
 
     if set(modules_with_a.keys()) != set(modules_with_b.keys()):

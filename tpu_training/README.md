@@ -68,6 +68,9 @@ Verified (JAX-CPU, tiny Gemma 4 checkpoint, `tests/`):
   checkpoint fallback, NaN abort without checkpointing
 * an adapter written by this package, loaded with Hugging Face + PEFT, reproduces Tunix's logits to 1.7e-6
 * the whole suite also passes in an environment holding only the packages in `kaggle/build_train_wheels.py::TPU_TESTED`
+* the full orchestrator (setup → preflight → Tunix train ×2 → export → package → report) in an environment **without
+  torch**: both adapters train (grad norm > 0, loss falls), export writes bf16 via numpy + ml_dtypes (loads in PyTorch as
+  `torch.bfloat16`), and `submission.zip` contains both adapters
 
 **Not verified: anything on a real TPU** (HBM use and tokens/s of the real E4B, XLA compile times, the Kaggle TPU image's
 Python/libtpu). Run `python -m tpu_training.probe` (or `RUN["probe"]=True` in the notebook) first.
@@ -87,8 +90,10 @@ TUNIX_TINY_FIXTURE=fixture/<created dir> JAX_PLATFORMS=cpu python -m pytest tpu_
 
 ## Wheels
 
-`kaggle/build_train_wheels.py` builds two wheelhouses in one notebook run: `train_wheels/` (PyTorch stack) and
-`train_wheels_tpu/` (JAX + Tunix + libtpu; `google-tunix` is installed `--no-deps` because it declares tensorflow-datasets,
-numba, … that the trainer never imports). The training notebook installs the TPU wheelhouse only for the Tunix backend and
-falls back to pip when the notebook has internet. `WHEEL_BUNDLES=tpu WHEEL_PYTHON=3.13` rebuilds only the TPU bundle for
-another Python version.
+`kaggle/build_train_wheels.py` builds two wheelhouses in one notebook run: `train_wheels/` (PyTorch stack + psutil /
+nvidia-ml-py for the run monitor) and `train_wheels_tpu/` (JAX + Tunix + libtpu + wandb / optuna + tpu-info / psutil;
+`google-tunix` is installed `--no-deps` because it declares tensorflow-datasets, numba, … that the trainer never imports).
+The TPU wheelhouse is self-sufficient: a Tunix run installs it instead of `train_wheels/`, by name==version from its
+`requirements.lock.txt`. Its CPython-specific wheels are also fetched for Python 3.11 and 3.13
+(`WHEEL_TPU_EXTRA_PYTHONS`), so it installs whatever Python the TPU image runs; the notebook falls back to pip when it has
+internet. `WHEEL_BUNDLES=tpu WHEEL_PYTHON=3.13` rebuilds only the TPU bundle with another primary Python.

@@ -17,11 +17,24 @@ from pathlib import Path
 from typing import Any
 
 from pipeline.multi_lora_sft.shared.checkpoints import write_checkpoint
+from pipeline.multi_lora_sft.shared.sysmon import read_latest, wandb_system_metrics
 
 from .batching import batch_stats, collate
 from .peft_io import OPT_FILE, write_adapter_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _peak_device_mem_mb() -> float | None:
+    """Peak bytes in use on the first local accelerator (TPU HBM), from inside the process that owns it."""
+    try:
+        import jax
+
+        stats = jax.local_devices()[0].memory_stats() or {}
+        peak = stats.get("peak_bytes_in_use")
+        return round(peak / 1024**2, 1) if peak else None
+    except Exception:  # noqa: BLE001 - CPU backends have no memory_stats
+        return None
 
 
 @dataclass
@@ -191,12 +204,16 @@ class TrainLoop:
             "grad_norm": step_res["grad_norm"],
             "tokens_per_sec": round(self._win_tokens / dt, 2),
             "supervised_tokens_in_step": int(step_res.get("supervised", 0)),
-            "peak_gpu_mem_mb": None,
+            "peak_gpu_mem_mb": _peak_device_mem_mb(),  # TPU HBM on device 0 (same column the GPU backend fills)
+            "skipped_nonfinite_steps": self.res.skipped_nonfinite_steps,
         }
         self.session.spike.observe(loss, self._global_step)
         self.session.log_metrics(
             self._global_step,
-            {"train/loss": loss, "train/grad_norm": entry["grad_norm"], "train/lr": lr, "perf/tokens_per_sec": entry["tokens_per_sec"]},
+            {"train/loss": loss, "train/grad_norm": entry["grad_norm"], "train/lr": lr, "train/epoch": entry["epoch"],
+             "train/skipped_nonfinite_steps": self.res.skipped_nonfinite_steps,
+             "perf/tokens_per_sec": entry["tokens_per_sec"], "perf/peak_mem_mb": entry["peak_gpu_mem_mb"],
+             **wandb_system_metrics(read_latest(self.metrics_path.parent / "system.jsonl"))},
         )
         try:
             self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -237,6 +254,7 @@ class TrainLoop:
                 if not step_res["applied"]:
                     res.skipped_nonfinite_steps += 1
                 else:
+                    self.session.zerograd.observe(step_res["grad_norm"], step_res["supervised"], self._global_step)
                     self._loss_sum += step_res["loss"]
                     self._loss_n += 1
                     self._win_loss += step_res["loss"]
@@ -280,7 +298,7 @@ class TrainLoop:
                     logger.info("[%s] stopping at step %d (schedule / time budget)", self.session.adapter, self._global_step)
                     break
         except BaseException as exc:
-            if type(exc).__name__ in {"NonFiniteLossError", "LossDivergedError"}:
+            if type(exc).__name__ in {"NonFiniteLossError", "LossDivergedError", "NoGradientError"}:
                 raise  # weights may be corrupt / diverging: never checkpoint them; the restart resumes the last good save
             if s.emergency_checkpoint and res.segment_steps > 0:
                 try:

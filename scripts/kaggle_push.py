@@ -1,11 +1,14 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["kaggle>=1.7"]
+# dependencies = ["kaggle>=1.7", "wandb>=0.17"]
 # ///
 """Push a pipeline notebook to Kaggle, run it, and bring its outputs and logs home.
 
     uv run scripts/kaggle_push.py -multi_lora_sft                # 31B QLoRA on 4xL4 (PyTorch), full pipeline
     uv run scripts/kaggle_push.py -tpu                           # E4B on a TPU VM (Tunix / JAX), full pipeline
+    uv run scripts/kaggle_push.py -tpu --hours 4                 # whole notebook limited to 4 h (clock_hours)
+    uv run scripts/kaggle_push.py -tpu --set probe=true          # 2-minute on-TPU check of the Tunix path, then stop
+    uv run scripts/kaggle_push.py -multi_lora_sft --internet on  # this push with internet (live W&B charts)
     uv run scripts/kaggle_push.py -tpu --set tune=true           # Optuna search on the TPU instead of a training run
     uv run scripts/kaggle_push.py -training                      # push, wait for the run, download outputs + log
     uv run scripts/kaggle_push.py -training --set dry_run=true   # RUN overrides baked into the pushed notebook
@@ -21,6 +24,10 @@ unpushed commits would make the run differ from it.
 Pipelines are declared in scripts/kaggle_settings.json; each key under "pipelines" becomes a -<name> flag. Runs are
 saved to runs/kaggle/<slug>_<timestamp>/ (gitignored). Credentials: ~/.kaggle/kaggle.json, KAGGLE_* env vars, or the
 gitignored repo .env.
+
+W&B: a run without internet logs offline into its output. After the download, every `wandb/offline-run-*` folder is
+uploaded with `wandb sync` when a W&B key is available here (WANDB_API_KEY in the environment / .env, or a prior
+`wandb login`), so offline GPU runs still end up as normal charts in the W&B project. --no-wandb-sync skips it.
 """
 
 from __future__ import annotations
@@ -120,7 +127,27 @@ def existing_datasets(ids: list[str]) -> list[str]:
     return keep
 
 
-def build_kernel(s: dict, name: str, overrides: dict) -> tuple[Path, dict]:
+def wandb_sync(out: Path) -> None:
+    """Upload the offline W&B runs found in a downloaded output. Never fails the command."""
+    runs = sorted(p for p in out.rglob("offline-run-*") if p.is_dir())
+    if not runs:
+        return
+    netrc = Path.home() / (".netrc" if os.name != "nt" else "_netrc")
+    has_key = bool(os.environ.get("WANDB_API_KEY")) or (netrc.is_file() and "api.wandb.ai" in netrc.read_text(errors="ignore"))
+    if not has_key:
+        print(f"{len(runs)} offline W&B run(s) in {out}; set WANDB_API_KEY (or `wandb login`) and re-run with -output to upload")
+        return
+    exe = Path(sys.executable).parent / ("wandb.exe" if os.name == "nt" else "wandb")
+    cmd = [str(exe) if exe.exists() else "wandb", "sync", *map(str, runs)]
+    print(f"uploading {len(runs)} offline W&B run(s): " + " ".join(cmd[:2]) + " ...", flush=True)
+    try:
+        r = subprocess.run(cmd, check=False, env=UTF8_ENV, timeout=1800)
+        print("W&B sync " + ("done: the charts are in your W&B project" if r.returncode == 0 else f"failed ({r.returncode})"))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"W&B sync failed: {exc}")
+
+
+def build_kernel(s: dict, name: str, overrides: dict, internet: bool | None = None) -> tuple[Path, dict]:
     """Copy the notebook into kaggle/.push/<name> with RUN_OVERRIDES filled in, plus its kernel-metadata.json."""
     p = s["pipelines"][name]
     nb_path = REPO / p["notebook"]
@@ -153,7 +180,7 @@ def build_kernel(s: dict, name: str, overrides: dict) -> tuple[Path, dict]:
         "is_private": p.get("is_private", True),
         "enable_gpu": not p["machine_shape"].startswith("Tpu"),
         "enable_tpu": p["machine_shape"].startswith("Tpu"),
-        "enable_internet": p.get("enable_internet", True),
+        "enable_internet": p.get("enable_internet", True) if internet is None else internet,
         "competition_sources": [s["competition"]],
         "dataset_sources": [s["repo_dataset"], *p.get("wheelhouses", []), *p.get("private_datasets", []),
                             *existing_datasets(p.get("optional_datasets", []))],
@@ -260,6 +287,11 @@ def main() -> None:
     ap.add_argument("--publish-bundle", action="store_true",
                     help="after downloading outputs, upload the checkpoint bundle as a new dataset version (explicit opt-in)")
     ap.add_argument("--poll", type=int, default=60, help="seconds between status checks (default 60)")
+    ap.add_argument("--hours", type=float, default=None, metavar="H",
+                    help="whole-notebook wall clock in hours, e.g. 4 or 11.3 (sets RUN clock_hours; Kaggle caps 12 GPU / 9 TPU)")
+    ap.add_argument("--internet", choices=["on", "off"], default=None,
+                    help="override the pipeline's enable_internet for this push (on = live W&B charts)")
+    ap.add_argument("--no-wandb-sync", action="store_true", help="do not upload offline W&B runs after downloading outputs")
     args = ap.parse_args()
 
     p = s["pipelines"][args.pipeline]
@@ -269,13 +301,19 @@ def main() -> None:
         return
     if args.action == "output":
         out = download(kid, p["kernel_slug"])
+        if not args.no_wandb_sync:
+            wandb_sync(out)
         if args.publish_bundle:
             publish_bundle(out, f"{p['kernel_slug']} {time.strftime('%Y-%m-%d %H:%M')}")
         return
 
-    overrides = {**repo_state(), **p.get("run_defaults", {}), **parse_sets(args.set)}
-    kdir, meta = build_kernel(s, args.pipeline, overrides)
-    print(f"RUN_OVERRIDES = {overrides}")
+    if args.hours is not None and not 0.25 <= args.hours <= 12.0:
+        sys.exit(f"--hours must be between 0.25 and 12, got {args.hours}")
+    clock = {"clock_hours": args.hours} if args.hours is not None else {}
+    overrides = {**repo_state(), **p.get("run_defaults", {}), **clock, **parse_sets(args.set)}
+    internet = None if args.internet is None else args.internet == "on"
+    kdir, meta = build_kernel(s, args.pipeline, overrides, internet)
+    print(f"RUN_OVERRIDES = {overrides}  (internet {'on' if meta['enable_internet'] else 'off'})")
     check_sources(meta["dataset_sources"], meta["model_sources"])
     kaggle("kernels", "push", "-p", str(kdir))
     print(f"https://www.kaggle.com/code/{kid}")
@@ -283,6 +321,8 @@ def main() -> None:
         return
     final = wait(kid, args.poll)
     out = download(kid, p["kernel_slug"])
+    if not args.no_wandb_sync:
+        wandb_sync(out)
     if args.publish_bundle:
         publish_bundle(out, f"{p['kernel_slug']} {time.strftime('%Y-%m-%d %H:%M')}")
     if final != "complete":

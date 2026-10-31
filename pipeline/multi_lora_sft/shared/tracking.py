@@ -95,21 +95,31 @@ class Tracker:
         logger.info("Tracking: %s (%s)", self.mode, self.decision.reason)
         if self.mode == "off":
             return
-        try:
-            import wandb
+        for attempt in ([self.mode, "offline"] if self.mode == "online" else [self.mode]):
+            try:
+                import wandb
 
-            wdir = Path(run_dir) / "wandb"
-            wdir.mkdir(parents=True, exist_ok=True)
-            os.environ["WANDB_MODE"] = self.mode
-            os.environ.setdefault("WANDB_SILENT", "true")
-            os.environ.setdefault("WANDB_DIR", str(wdir))
-            os.environ.setdefault("WANDB_CONSOLE", "off")
-            self._run = wandb.init(
-                project=project, name=run_name, group=group, dir=str(wdir), config=config or {},
-                reinit=True, settings=wandb.Settings(silent=True, console="off"),
-            )
-        except BaseException as exc:  # noqa: BLE001 - W&B must never take a training run down
-            self._disable(exc)
+                wdir = Path(run_dir) / "wandb"
+                wdir.mkdir(parents=True, exist_ok=True)
+                os.environ["WANDB_MODE"] = attempt
+                os.environ.setdefault("WANDB_SILENT", "true")
+                os.environ.setdefault("WANDB_DIR", str(wdir))
+                os.environ.setdefault("WANDB_CONSOLE", "off")
+                self._run = wandb.init(
+                    project=project, name=run_name, group=group, dir=str(wdir), config=config or {},
+                    reinit=True, mode=attempt, settings=wandb.Settings(silent=True, console="off", init_timeout=120),
+                )
+                self.mode = attempt
+                where = getattr(self._run, "url", None) if attempt == "online" else getattr(self._run, "dir", wdir)
+                logger.info("W&B %s run: %s%s", attempt, where,
+                            "" if attempt == "online" else "  (upload later: wandb sync <run_dir>/wandb/offline-run-*)")
+                return
+            except BaseException as exc:  # noqa: BLE001 - W&B must never take a training run down
+                if attempt == "online":  # bad key / blocked network: keep the curves locally instead of losing them
+                    logger.warning("W&B online start failed (%s: %s); falling back to offline", type(exc).__name__, exc)
+                    self.decision = TrackingDecision("offline", f"online start failed: {type(exc).__name__}")
+                    continue
+                self._disable(exc)
 
     def _disable(self, exc: BaseException) -> None:
         self.failed = f"{type(exc).__name__}: {exc}"

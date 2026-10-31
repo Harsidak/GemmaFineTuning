@@ -18,6 +18,7 @@ from typing import Any
 
 from ..config import PipelineConfig, load_config
 from ..runctx import PhaseStatus, RunContext, configure_phase_logging, utc_iso
+from ..shared.sysmon import summarize as summarize_system
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -183,7 +184,53 @@ def build_report_markdown(
         lines.append("_Smoke evaluation did not run or was disabled._")
         lines.append("")
 
+    try:
+        lines.extend(training_health_lines(ctx, cfg, manifest))
+    except Exception as exc:  # noqa: BLE001 - the report must always be written
+        lines.extend(["## 5. Training Health & Resources", "", f"_Not available: {type(exc).__name__}: {exc}_", ""])
     return "\n".join(lines)
+
+
+def training_health_lines(ctx: RunContext, cfg: PipelineConfig, manifest: dict[str, Any]) -> list[str]:
+    """Section 5: did training actually learn (loss trend, gradients), how fast, W&B mode, and resource peaks."""
+    lines = [
+        "## 5. Training Health & Resources",
+        "",
+        "| Adapter | Loss first → last logged | Grad norm min / max | Zero-grad logs | Skipped NaN steps | Mean tok/s | Peak mem MiB | W&B |",
+        "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | :--- |",
+    ]
+    tr_summaries = manifest.get("training_summaries") or {}
+    for spec in cfg.adapters:
+        rows = [r for r in _read_jsonl(ctx.metrics_dir / f"{spec.name}.jsonl") if isinstance(r.get("train_loss"), (int, float))]
+        ts = tr_summaries.get(spec.name) or {}
+        track = ((ts.get("session") or {}).get("tracking") or {})
+        wb = track.get("mode", "—") + (f" ({track['reason']})" if track.get("reason") else "")
+        if not rows:
+            lines.append(f"| `{spec.name}` | no steps logged | — | — | — | — | — | {wb} |")
+            continue
+        first, last = rows[0]["train_loss"], rows[-1]["train_loss"]
+        trend = "↓" if last < first else ("=" if last == first else "↑")
+        gns = [float(r["grad_norm"]) for r in rows if isinstance(r.get("grad_norm"), (int, float))]
+        tps = [float(r["tokens_per_sec"]) for r in rows[1:] if isinstance(r.get("tokens_per_sec"), (int, float))]
+        mems = [float(r["peak_gpu_mem_mb"]) for r in rows if isinstance(r.get("peak_gpu_mem_mb"), (int, float))]
+        gn_s = f"{min(gns):.3g} / {max(gns):.3g}" if gns else "—"
+        lines.append(
+            f"| `{spec.name}` | {first:.4f} → {last:.4f} {trend} ({len(rows)} logs) | {gn_s} | {sum(1 for g in gns if g == 0.0)} | "
+            f"{rows[-1].get('skipped_nonfinite_steps', 0)} | {sum(tps) / len(tps) if tps else 0:.0f} | "
+            f"{f'{max(mems):.0f}' if mems else '—'} | {wb} |"
+        )
+    lines.append("")
+    lines.append("> Grad norm must be > 0 (an exactly-zero norm means the LoRA is not in the forward pass; the run aborts "
+                 "after 3 such steps). A flat or rising loss over a long run means the learning rate or data needs a look.")
+    lines.append("")
+    sysum = summarize_system(ctx.metrics_dir / "system.jsonl")
+    if sysum:
+        lines.append("**Resources** (`metrics/system.jsonl`, sampled every "
+                     f"{cfg.tracking.system_every_sec:.0f}s): " + ", ".join(f"{k}={v}" for k, v in sysum.items()))
+    else:
+        lines.append("_No system samples (tracking.system_every_sec=0 or the monitor could not start)._")
+    lines.append("")
+    return lines
 
 
 def run_report_phase(

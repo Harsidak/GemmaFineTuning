@@ -34,12 +34,14 @@ from .runctx import (
     configure_phase_logging,
     utc_iso,
 )
+from .shared.backend import resolve_backend
 from .shared.bundle import (
     discover_bundles,
     previous_session_count,
     sync_bundle,
     tuning_source,
 )
+from .shared.sysmon import SystemMonitor, format_system, read_latest, tail_line
 from .shared.tuning import apply_best_params
 from .training.device import OOM_SIGNATURES, is_oom_text
 
@@ -106,7 +108,12 @@ def default_phase_command_builder(
             gpu_cnt = len(manifest.get("gpus") or [])
             n_proc = eff.train.num_processes if eff.train.num_processes is not None else gpu_cnt
 
-            if eff.train.parallelism == "ddp" and n_proc and n_proc > 1:
+            backend = resolve_backend(
+                eff.train.backend, served_model_id=cfg.effective_served_model_id(), accelerator=eff.train.accelerator
+            )
+            if backend == "tunix":  # torch-free entry: the PyTorch train module imports torch/transformers at import time
+                cmd = [sys.executable, "-m", "tpu_training.phase"]
+            elif eff.train.parallelism == "ddp" and n_proc and n_proc > 1:
                 cmd = [
                     sys.executable,
                     "-m",
@@ -200,6 +207,40 @@ class Orchestrator:
         self.command_builder = command_builder or default_phase_command_builder(cfg)
         self.poll_interval_sec = max(0.05, float(poll_interval_sec))
         self.logger = configure_phase_logging(self.ctx.log_path("orchestrator"))
+        self.monitor: SystemMonitor | None = None
+        self._last_beat = 0.0
+
+    def _heartbeat(self, phase: str, t_start: float, deadline: float) -> None:
+        """One progress line in the notebook log while a phase runs: phase phase/session time left, the newest
+        training metrics (step, loss, grad norm, lr, tokens/s) and host/GPU/TPU utilisation. Never raises."""
+        try:
+            now = self.clock.now()
+
+            def hm(sec: float) -> str:
+                sec = max(0, int(sec))
+                return f"{sec // 3600}:{sec % 3600 // 60:02d}"
+
+            parts = [(f"[heartbeat] {phase} running {hm(now - t_start)}, phase left {hm(deadline - now)}, "
+                      f"session left {hm(self.clock.plan.session_hard_limit - now)}")]
+            if phase.startswith("train:"):
+                m = read_latest(self.ctx.metrics_dir / f"{phase.split(':', 1)[1]}.jsonl", max_age_sec=None)
+                if m:
+                    gn = m.get("grad_norm")
+                    parts.append(
+                        f"step {m.get('step')} epoch {m.get('epoch')} loss {m.get('train_loss', float('nan')):.4f} "
+                        f"grad_norm {gn if gn is None else round(float(gn), 4)} lr {float(m.get('lr') or 0):.2e} "
+                        f"tok/s {m.get('tokens_per_sec')}"
+                    )
+                else:
+                    parts.append("no optimizer step logged yet (loading / compiling); last log: "
+                                 + tail_line(self.ctx.log_path(phase))[-160:])
+            else:
+                parts.append("last log: " + tail_line(self.ctx.log_path(phase))[-160:])
+            if self.monitor is not None:
+                parts.append(format_system(self.monitor.latest()))
+            self.logger.info(" | ".join(p for p in parts if p))
+        except Exception as exc:  # noqa: BLE001 - feedback only
+            self.logger.debug("heartbeat failed: %s", exc)
 
     def _run_subprocess_phase(
         self,
@@ -256,6 +297,11 @@ class Orchestrator:
                     )
                     _terminate_process_tree(proc, grace_sec=grace_sec)
                     break
+                beat = self.cfg.tracking.heartbeat_sec
+                if beat > 0 and time.monotonic() - self._last_beat >= beat:
+                    if self._last_beat:  # not at launch: the "==> Phase" line just said it
+                        self._heartbeat(phase, t_start, deadline)
+                    self._last_beat = time.monotonic()
                 time.sleep(self.poll_interval_sec)
 
             rc = proc.returncode if proc.returncode is not None else -9
@@ -411,6 +457,13 @@ class Orchestrator:
         """Executes `setup -> preflight -> train:* -> export -> package -> eval -> report`."""
         self.ctx.ensure_dirs()
         self.cfg.save_yaml(self.ctx.resolved_config_path)
+        if self.cfg.tracking.system_every_sec > 0 and not self.cfg.tuning.active:
+            try:
+                self.monitor = SystemMonitor(
+                    self.ctx.metrics_dir / "system.jsonl", self.cfg.tracking.system_every_sec, disk_path=self.cfg.run.output_root
+                ).start()
+            except Exception as exc:  # noqa: BLE001 - monitoring must never stop a run
+                self.logger.warning("system monitor not started: %s", exc)
 
         git_sha = self.cfg.run.git_sha or os.environ.get("GIT_SHA")
         self.ctx.update_manifest(
@@ -511,6 +564,8 @@ class Orchestrator:
                 self._run_subprocess_phase("eval", self.clock.phase_deadline("eval"))
 
             # 7. Report — ALWAYS runs last
+            if self.monitor is not None:
+                self.monitor.stop()
             self._run_subprocess_phase("report", self.clock.phase_deadline("report"))
 
         if self.ctx.report_path.is_file():

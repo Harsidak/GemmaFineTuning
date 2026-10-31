@@ -49,6 +49,33 @@ class NonFiniteGuard:
         return bad
 
 
+class NoGradientError(RuntimeError):
+    """The LoRA weights received an exactly-zero gradient on several consecutive supervised steps."""
+
+
+class ZeroGradGuard:
+    """Raises after `limit` consecutive steps with supervised tokens but a gradient norm of exactly 0.
+
+    LoRA B starts at zero but A's partner gradient (dL/dB) does not, so a healthy first step always has a positive
+    norm. Exactly 0 means the adapter is not in the forward pass (e.g. the LoRA interception missed the method that
+    runs the model): without this guard such a run would burn its whole session and export an untrained adapter."""
+
+    def __init__(self, limit: int = 3, label: str = "") -> None:
+        self.limit = max(1, int(limit))
+        self.label = label
+        self.streak = 0
+
+    def observe(self, grad_norm: float | None, supervised: int | None = None, step: int | None = None) -> None:
+        if grad_norm is None or not math.isfinite(float(grad_norm)) or supervised == 0:
+            return  # unknown, non-finite (NonFiniteGuard's job) or nothing to learn from: no evidence either way
+        self.streak = self.streak + 1 if float(grad_norm) == 0.0 else 0
+        if self.streak >= self.limit:
+            raise NoGradientError(
+                f"{self.label} gradient norm was exactly 0 on {self.streak} consecutive supervised steps (step {step}): "
+                "the LoRA adapter is not receiving gradients, training would not change it. Check the LoRA attachment."
+            )
+
+
 class LossSpikeGuard:
     """EMA-based divergence detector. `factor <= 0` disables it. Warm-up logs never count."""
 

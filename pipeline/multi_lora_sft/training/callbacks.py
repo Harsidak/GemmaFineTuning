@@ -41,6 +41,7 @@ from ..shared.checkpoints import (  # noqa: F401 - re-exported: the orchestrator
     write_checkpoint,
 )
 from ..shared.guards import NonFiniteGuard, NonFiniteLossError  # noqa: F401
+from ..shared.sysmon import read_latest, wandb_system_metrics
 from .device import capture_rng_state, cpu_state_dict, peak_memory_mb, save_object
 from .loss import unwrap_causal_lm
 from .schedule import WSDScheduleController
@@ -439,7 +440,9 @@ class MultiLoraTrainingCallback(TrainerCallback):
             self.session.log_metrics(
                 entry["step"],
                 {"train/loss": entry["train_loss"], "train/grad_norm": entry["grad_norm"], "train/lr": entry["lr"],
-                 "perf/tokens_per_sec": entry["tokens_per_sec"], "perf/peak_mem_mb": entry["peak_gpu_mem_mb"]},
+                 "train/epoch": entry["epoch"], "perf/tokens_per_sec": entry["tokens_per_sec"],
+                 "perf/supervised_tokens_per_sec": entry["supervised_tokens_per_sec"], "perf/peak_mem_mb": entry["peak_gpu_mem_mb"],
+                 **wandb_system_metrics(read_latest(self.metrics_jsonl_path.parent / "system.jsonl"))},
             )
         self.metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.metrics_jsonl_path, "a", encoding="utf-8") as fh:

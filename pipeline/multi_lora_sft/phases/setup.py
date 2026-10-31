@@ -160,7 +160,7 @@ def run_setup_phase(ctx: RunContext, cfg: PipelineConfig | None = None, deadline
 
         from ..training.device import accelerator_inventory, resolve_accelerator
 
-        inventory = accelerator_inventory()
+        inventory = accelerator_inventory(query_xla=uses_trl)
         gpus: list[dict[str, Any]] = inventory["cuda"]
         gpu_count = len(gpus)
         accelerators: dict[str, str] = {}

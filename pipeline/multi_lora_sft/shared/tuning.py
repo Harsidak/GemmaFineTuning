@@ -173,6 +173,9 @@ def build_trial_sets(cfg: Any, adapter: str, tuned_sets: list[str], *, study_dir
         f"run.run_id={json.dumps(f'trial_{trial_no:04d}')}",
         "run.mode=\"calibration\"",
         f"run.calibration_minutes={json.dumps(float(tu.trial_minutes))}",
+        # Each trial's clock starts when the trial starts. Inheriting the notebook's SESSION_T0 would measure every
+        # trial window from the notebook's first cell, so all trials after the first would start with no time left.
+        "run.session_start_env=\"\"",
         "run.resume_from=null",
         "resume.auto_discover=false",
         "resume.bundle_dirs=[]",
@@ -243,6 +246,10 @@ def run_study(
     )
 
     t0 = time.time()
+    try:  # the session clock starts at the notebook's first cell (SESSION_T0), not when the study starts
+        t0 = min(t0, float(os.environ.get(cfg.run.session_start_env) or t0))
+    except ValueError:
+        pass
     session_cap = cfg.budget.session_hours * 3600.0 - cfg.budget.safety_margin_min * 60.0
     cap_sec = min(tu.total_minutes * 60.0 if tu.total_minutes else session_cap, session_cap)
     shared_cache = study_dir / "shared_cache"

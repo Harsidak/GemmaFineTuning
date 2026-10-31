@@ -42,7 +42,13 @@ from .compat import (
     training_fingerprint,
 )
 from .fsio import atomic_write_json, read_json
-from .guards import BestDecision, BestTracker, LossSpikeGuard, NonFiniteGuard
+from .guards import (
+    BestDecision,
+    BestTracker,
+    LossSpikeGuard,
+    NonFiniteGuard,
+    ZeroGradGuard,
+)
 from .ledger import ProgressLedger, ResumePlan, example_keys
 from .tracking import Tracker
 
@@ -109,6 +115,7 @@ class TrainingSession:
         t = eff.train
         self.nonfinite = NonFiniteGuard(t.max_nonfinite_logs, label=self.label)
         self.spike = LossSpikeGuard(t.loss_spike_factor, label=self.label)
+        self.zerograd = ZeroGradGuard(3, label=self.label)
         self.best = BestTracker(t.early_stop_patience, t.early_stop_min_delta)
         self.ledger = ProgressLedger(adapter_name)
         self.tracker: Tracker | None = None
@@ -191,10 +198,12 @@ class TrainingSession:
         )
 
     # ------------------------------------------------------------------ per-step hooks (called by TRL callback / Tunix loop)
-    def check_health(self, step: int, loss: float | None, grad_norm: float | None = None) -> None:
-        """NaN/Inf and divergence guards; call on EVERY rank so all ranks abort together. Raises NonFiniteLossError /
-        LossDivergedError, which make the orchestrator restart from the last good checkpoint."""
+    def check_health(self, step: int, loss: float | None, grad_norm: float | None = None, supervised: int | None = None) -> None:
+        """NaN/Inf, divergence and zero-gradient guards; call on EVERY rank so all ranks abort together. Raises
+        NonFiniteLossError / LossDivergedError (the orchestrator restarts from the last good checkpoint) or
+        NoGradientError (the adapter is not being trained at all)."""
         self.nonfinite.observe(loss, grad_norm, step)
+        self.zerograd.observe(grad_norm, supervised, step)
         if loss is not None:
             self.spike.observe(float(loss), step)
 

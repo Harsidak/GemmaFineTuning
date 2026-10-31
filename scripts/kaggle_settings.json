@@ -25,7 +25,9 @@
         "metric/gemma-4-developer-agent-wheelhouse",
         "banwait13/gemmafinetunewheels"
       ],
-      "private_datasets": [],
+      "private_datasets": [
+        "banwait13/gemmafinetuning-private-data"
+      ],
       "model_sources": [
         "google/gemma-4/transformers/gemma-4-31b-it-qat-q4_0-unquantized/1",
         "google/gemma-4/other/gemma-4-31b-it-qat-w4a16-ct/2"

@@ -441,10 +441,19 @@ def run_package_phase(
                 copy_template_without_adapters(sample_tpl, ctx.submission_dir)
                 template_source = str(sample_tpl)
             else:
+                # No sample template (e.g. on Kaggle when it was not passed: build/ is not in the repo dataset). Scaffold
+                # one WITH the adapter slots declared (`adapter: main_lora` / `adapter: tool_lora`), as in the official
+                # sample, so the slot resolution below fills them (or strips them for a bare base model). `build()`
+                # without adapter dirs would declare no slots, and the trained adapters would never reach the zip.
                 shutil.rmtree(ctx.submission_dir, ignore_errors=True)
                 builder = ADKSubmissionBuilder(base_model_name=served_id, output_dir=ctx.submission_dir)
-                builder.build()
-                template_source = "ADKSubmissionBuilder.build"
+                builder.prepare_scaffold()
+                builder.write_prompts()
+                builder.write_sub_agents(tool_adapter="tool_lora")
+                builder.write_sampling_config()
+                builder.write_root_agent_yaml(main_adapter="main_lora")
+                builder.write_eval_config()
+                template_source = "ADKSubmissionBuilder (slots main_lora, tool_lora)"
 
         # 2. Rewrite `model:` in root and sub-agent YAMLs preserving `!include`
         agent_files = _agent_yaml_files(ctx.submission_dir)
@@ -483,10 +492,15 @@ def run_package_phase(
                 notes.append(msg)
                 logger.warning(msg)
 
-        # Remove empty `adapters/` folder if all slots fell back to bare base model
+        # Drop empty slot folders (a scaffold creates them up front; a bare-base-model slot leaves one behind), then the
+        # `adapters/` folder itself if every slot fell back to the bare base model
         adapters_dir = ctx.submission_dir / "adapters"
-        if adapters_dir.is_dir() and not any(adapters_dir.iterdir()):
-            adapters_dir.rmdir()
+        if adapters_dir.is_dir():
+            for slot_dir in list(adapters_dir.iterdir()):
+                if slot_dir.is_dir() and not any(slot_dir.iterdir()):
+                    slot_dir.rmdir()
+            if not any(adapters_dir.iterdir()):
+                adapters_dir.rmdir()
 
         # Served-agent decoding + per-task scorer budgets from the run config
         for msg in write_generation_and_eval_configs(cfg, ctx.submission_dir):
