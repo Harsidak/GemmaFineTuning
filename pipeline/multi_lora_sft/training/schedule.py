@@ -65,6 +65,20 @@ class WSDScheduleController:
     def now(self) -> float:
         return float(self._now_fn())
 
+    def reset_start(self, now: float) -> None:
+        """Re-anchors `t_start` and `_last_step_ts` once model loading / FSDP wrapping finishes before step 1."""
+        new_t = float(now)
+        delta = new_t - self.t_start
+        self.t_start = new_t
+        self._last_step_ts = new_t
+        if self._in_resume_quick_decay and delta != 0.0:
+            if self.decay_start_time is not None:
+                self.decay_start_time += delta
+            if self.frozen_t_end is not None:
+                self.frozen_t_end = min(self.deadline, self.frozen_t_end + delta)
+            if self._resume_quick_end is not None:
+                self._resume_quick_end = min(self.deadline, self._resume_quick_end + delta)
+
     def total_elapsed_sec(self, now: float | None = None) -> float:
         cur = self.now() if now is None else float(now)
         return self.prior_elapsed_sec + max(0.0, cur - self.t_start)

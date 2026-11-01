@@ -212,7 +212,15 @@ def training_health_lines(ctx: RunContext, cfg: PipelineConfig, manifest: dict[s
         trend = "↓" if last < first else ("=" if last == first else "↑")
         gns = [float(r["grad_norm"]) for r in rows if isinstance(r.get("grad_norm"), (int, float))]
         tps = [float(r["tokens_per_sec"]) for r in rows[1:] if isinstance(r.get("tokens_per_sec"), (int, float))]
-        mems = [float(r["peak_gpu_mem_mb"]) for r in rows if isinstance(r.get("peak_gpu_mem_mb"), (int, float))]
+        mems: list[float] = []
+        for r in rows:
+            pm = r.get("peak_gpu_mem_mb")
+            if isinstance(pm, (int, float)):
+                mems.append(float(pm))
+            elif isinstance(pm, list) and pm:
+                vals = [float(x) for x in pm if isinstance(x, (int, float))]
+                if vals:
+                    mems.append(max(vals))
         gn_s = f"{min(gns):.3g} / {max(gns):.3g}" if gns else "—"
         lines.append(
             f"| `{spec.name}` | {first:.4f} → {last:.4f} {trend} ({len(rows)} logs) | {gn_s} | {sum(1 for g in gns if g == 0.0)} | "

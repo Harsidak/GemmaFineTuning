@@ -90,6 +90,9 @@ parity:
   enabled: true
   num_prompts: 8
   gen_tokens: 64
+  fsdp_num_prompts: 2                     # FSDP all-gathers layers every token step (no KV cache); cap decode cost
+  fsdp_gen_tokens: 16
+  max_duration_sec: 180.0
   max_agreement_drop: 0.10
 
 submission:

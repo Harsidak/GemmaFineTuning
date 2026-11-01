@@ -183,11 +183,89 @@ def _worker(rank: int, port: int, model_dir: str, out_dir: str) -> None:
                 diffs.append(float((adam.state[p][key] - adam2.state[p][key]).abs().max()))
         res["optim_roundtrip_max_diff"] = max(diffs)
 
-        # ---------------------------------------------------------------- lockstep greedy parity decode
-        # (AdamW stepped the FSDP copy once more; give the reference the same weights before comparing)
+        # ---------------------------------------------------------------- adapter save + reload + checkpoint + best
+        # Regression for Bug 1: PEFT 0.21 filters `state_dict` against `model.named_modules()`, which under FSDP1
+        # contain `_fsdp_wrapped_module.` and matched 0 keys. Verify all three save paths write all LoRA tensors and
+        # reload identically onto a fresh unsharded base model + pass export validation.
         gathered = gather_lora_state_dict(model)
         if rank == 0:
+            from peft import PeftModel, set_peft_model_state_dict
+            from safetensors.torch import load_file as load_safetensors
+            from transformers import Gemma4ForConditionalGeneration
+
+            from pipeline.multi_lora_sft.phases.export import export_single_adapter
+            from pipeline.multi_lora_sft.shared.checkpoints import (
+                checkpoint_is_loadable,
+                read_best_adapter,
+                write_best_adapter,
+            )
+            from pipeline.multi_lora_sft.training.callbacks import (
+                save_adapter_weights,
+                save_wallclock_checkpoint,
+            )
+            from pipeline.multi_lora_sft.training.schedule import WSDScheduleController
+
             ref.load_state_dict(gathered, strict=False)
+
+            saved_dir = Path(out_dir) / "saved_final_adapter"
+            save_adapter_weights(model, saved_dir, state_dict=gathered)
+            saved_st = load_safetensors(str(saved_dir / "adapter_model.safetensors"), device="cpu")
+            res["saved_tensor_count"] = len(saved_st)
+
+            fresh_base = Gemma4ForConditionalGeneration.from_pretrained(model_dir, dtype=torch.float32)
+            fresh_base.eval()
+            reloaded = PeftModel.from_pretrained(fresh_base, str(saved_dir))
+            reloaded.eval()
+            ref.eval()
+            with torch.no_grad():
+                ref_logits = ref(input_ids=batch["input_ids"]).logits
+                rel_logits = reloaded(input_ids=batch["input_ids"]).logits
+            res["reloaded_max_logit_diff"] = float((ref_logits - rel_logits).abs().max())
+
+            # Resume path (`set_peft_model_state_dict`) must match every key with 0 unexpected keys
+            resume_target = _load(model_dir, torch.float32)
+            incompat = set_peft_model_state_dict(resume_target, saved_st)
+            res["resume_unexpected_keys"] = list(getattr(incompat, "unexpected_keys", []) or [])
+
+            # Export validation (`export_single_adapter`) must accept the saved adapter directory
+            export_meta = export_single_adapter(
+                adapter_name="main_lora",
+                source_adapter_dir=saved_dir,
+                output_adapter_dir=Path(out_dir) / "exported_main_lora",
+                served_model_id="gemma-4-31b-it-qat-w4a16-ct",
+            )
+            res["exported_module_count"] = int(export_meta["module_count"])
+
+            # Wall-clock checkpoint + best_adapter paths under FSDP
+            wsd_tmp = WSDScheduleController(total_epoch_steps=10, t_start=0.0, deadline=100.0)
+            ckpt_dir = save_wallclock_checkpoint(
+                checkpoint_root=Path(out_dir) / "ckpts",
+                step=4,
+                epoch=0.5,
+                model=model,
+                optimizer=adam,
+                scheduler=None,
+                wsd_controller=wsd_tmp,
+                sampler=None,
+                samples_in_epoch=0,
+                keep_checkpoints=2,
+                is_main_process=True,
+                adapter_state=gathered,
+                optimizer_state=full,
+            )
+            res["wallclock_ckpt_loadable"] = bool(ckpt_dir is not None and checkpoint_is_loadable(ckpt_dir))
+            write_best_adapter(
+                Path(out_dir) / "ckpts",
+                step=4,
+                val_loss=1.25,
+                copy_fn=lambda d, m=model, g=gathered: save_adapter_weights(m, d, state_dict=g),
+            )
+            res["best_adapter_loadable"] = read_best_adapter(Path(out_dir) / "ckpts") is not None
+            del fresh_base, reloaded, resume_target
+
+        # ---------------------------------------------------------------- lockstep greedy parity decode + budget
+        from pipeline.multi_lora_sft.training.parity import generate_hf_parity_reference
+
         prompt = batch["input_ids"][0, :10].tolist()
         tok = SimpleNamespace(eos_token_id=None, decode=lambda ids, skip_special_tokens=False: str(ids))
         with_adapter = greedy_decode_with_logprobs(model, tok, prompt, gen_tokens=5)
@@ -195,6 +273,26 @@ def _worker(rank: int, port: int, model_dir: str, out_dir: str) -> None:
             base = greedy_decode_with_logprobs(model, tok, prompt, gen_tokens=5)
         res["parity_tokens"] = [s["token_id"] for s in with_adapter]
         res["parity_base_tokens"] = [s["token_id"] for s in base]
+
+        # Rank-agreed stop/deadline on FSDP parity: rank 1 signalling stop halts all ranks cleanly without deadlock
+        stopped_steps = greedy_decode_with_logprobs(
+            model, tok, prompt, gen_tokens=5, stop_requested=lambda: rank == 1
+        )
+        res["parity_stopped_len"] = len(stopped_steps)
+        parity_recs = [{"task_id": "t0", "input_ids": batch["input_ids"][0].tolist(), "labels": batch["labels"][0].tolist()}]
+        expired_out = generate_hf_parity_reference(
+            adapter_name="main_lora",
+            peft_model=model,
+            tokenizer=tok,
+            val_records=parity_recs,
+            train_records=parity_recs,
+            output_path=Path(out_dir) / "expired_parity.json",
+            num_prompts=2,
+            gen_tokens=4,
+            write=(rank == 0),
+            deadline=0.0,
+        )
+        res["parity_expired_none"] = expired_out is None
         if rank == 0:
             res["ref_parity_tokens"] = [s["token_id"] for s in greedy_decode_with_logprobs(ref, tok, prompt, gen_tokens=5)]
             with ref.disable_adapter():
@@ -271,6 +369,18 @@ def test_fsdp_lockstep_parity_decode(fsdp_results: list[dict[str, Any]]) -> None
     r0, r1 = fsdp_results
     assert r0["parity_tokens"] == r1["parity_tokens"] == r0["ref_parity_tokens"]
     assert r0["parity_base_tokens"] == r1["parity_base_tokens"] == r0["ref_parity_base_tokens"]
+    assert [r["parity_stopped_len"] for r in fsdp_results] == [0, 0]
+    assert [r["parity_expired_none"] for r in fsdp_results] == [True, True]
+
+
+def test_fsdp_saved_adapter_reloads_and_exports_nonempty(fsdp_results: list[dict[str, Any]]) -> None:
+    r0 = fsdp_results[0]
+    assert r0["saved_tensor_count"] == r0["n_lora_tensors"] > 0
+    assert r0["reloaded_max_logit_diff"] < 1e-5
+    assert r0["resume_unexpected_keys"] == []
+    assert r0["exported_module_count"] == r0["n_lora_tensors"] // 2
+    assert r0["wallclock_ckpt_loadable"] is True
+    assert r0["best_adapter_loadable"] is True
 
 
 def test_fsdp_bf16_mixed_precision_keeps_rope_buffers(fsdp_results: list[dict[str, Any]]) -> None:
@@ -321,3 +431,156 @@ def test_collective_device_handles_hybrid_fsdp_backend_and_env_precedes_init(mon
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"apply_fsdp_env", "init_distributed"}
     }
     assert call_lines["apply_fsdp_env"] < call_lines["init_distributed"]
+
+
+def test_save_adapter_weights_and_best_adapter_fail_on_zero_tensors(
+    tiny_gemma4_dir: Path, tmp_path: Path
+) -> None:
+    from safetensors.torch import save_file as save_safetensors
+
+    from pipeline.multi_lora_sft.shared.checkpoints import (
+        CheckpointError,
+        write_best_adapter,
+    )
+    from pipeline.multi_lora_sft.training.callbacks import save_adapter_weights
+
+    peft_model = _load(str(tiny_gemma4_dir), torch.float32)
+    with pytest.raises(CheckpointError, match="0 LoRA tensors"):
+        save_adapter_weights(peft_model, tmp_path / "empty_adapter", state_dict={})
+
+    with pytest.raises(CheckpointError, match="0 tensors"):
+        write_best_adapter(
+            tmp_path / "ckpts",
+            step=1,
+            val_loss=1.0,
+            copy_fn=lambda d: save_safetensors({}, str(d / "adapter_model.safetensors")),
+        )
+
+
+def test_callback_resyncs_stale_clock_after_model_load(tmp_path: Path) -> None:
+    from transformers import TrainerControl, TrainerState, TrainingArguments
+
+    from pipeline.multi_lora_sft.training.callbacks import MultiLoraTrainingCallback
+    from pipeline.multi_lora_sft.training.distributed import SyncedClock
+    from pipeline.multi_lora_sft.training.schedule import WSDScheduleController
+
+    fake_now = [1000.0]
+    clock = SyncedClock(now_fn=lambda: fake_now[0])
+    # Simulate distributed mode where `clock()` caches `_value` from the last `sync()`.
+    clock._value = 1000.0
+    wsd = WSDScheduleController(
+        warmup_steps=2,
+        decay_frac=0.15,
+        final_lr_ratio=0.1,
+        total_epoch_steps=100,
+        t_start=1000.0,
+        deadline=3000.0,
+        now_fn=clock,
+    )
+    tracker = {"step_total_tokens": 2048.0, "step_supervised_tokens": 1024.0}
+    cb = MultiLoraTrainingCallback(
+        adapter_name="main_lora",
+        wsd_controller=wsd,
+        metrics_jsonl_path=tmp_path / "metrics.jsonl",
+        checkpoint_root=tmp_path / "ckpts",
+        metrics_tracker=tracker,
+        sampler=None,
+        dataset_total_tokens=100_000,
+        samples_per_step=4,
+        log_every_steps=1,
+        val_every_min=5.0,
+        checkpoint_every_min=5.0,
+        has_eval_dataset=True,
+        clock=clock,
+    )
+
+    # 7-minute model load + FSDP wrapping happens before `on_train_begin`
+    fake_now[0] = 1420.0
+    args = TrainingArguments(output_dir=str(tmp_path / "hf"), per_device_train_batch_size=1, report_to="none")
+    state = TrainerState(global_step=0, epoch=0.0, is_world_process_zero=True)
+    control = TrainerControl()
+    cb.on_train_begin(args, state, control)
+    assert wsd.t_start == 1420.0
+    assert cb._last_ckpt_ts == 1420.0
+    assert cb._last_val_ts == 1420.0
+    assert cb._window_start_ts == 1420.0
+
+    # Step 1 takes 20s -> 2048 tok / 20s = 102.4 tok/s (NOT 2048 / 440s = 4.65 tok/s) and does not trigger 5m val/ckpt!
+    fake_now[0] = 1440.0
+    state.global_step = 1
+    control = cb.on_step_end(args, state, TrainerControl())
+    assert not control.should_evaluate
+    cb.on_log(args, state, control, logs={"loss": 1.5, "grad_norm": 0.5, "learning_rate": 1e-4})
+    logged = json.loads((tmp_path / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert logged["tokens_per_sec"] == pytest.approx(102.4, rel=1e-3)
+
+
+def test_gather_peak_memory_mb_and_report_list_handling(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import torch.distributed as dist
+
+    from pipeline.multi_lora_sft.config import PipelineConfig
+    from pipeline.multi_lora_sft.phases.report import training_health_lines
+    from pipeline.multi_lora_sft.runctx import RunContext
+    from pipeline.multi_lora_sft.training import distributed as dist_mod
+
+    monkeypatch.setattr(dist_mod, "dist_ready", lambda: True)
+    monkeypatch.setattr(dist_mod, "world_size", lambda: 4)
+    monkeypatch.setattr(dist_mod, "rank", lambda: 2)
+    monkeypatch.setattr(dist_mod, "_collective_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda idx: (18000 * 1024 * 1024) if idx == 2 else 0)
+
+    def _fake_all_reduce(tensor: torch.Tensor, op: Any = None) -> None:
+        # Simulate the other 3 ranks contributing their own peak allocations into MAX all-reduce
+        other = torch.tensor([18034.2, 17990.5, 0.0, 18012.8], dtype=tensor.dtype)
+        tensor.copy_(torch.maximum(tensor, other))
+
+    monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce)
+    peaks = dist_mod.gather_peak_memory_mb("cuda")
+    assert peaks == [18034.2, 17990.5, 18000.0, 18012.8]
+
+    ctx = RunContext(tmp_path / "run")
+    ctx.ensure_dirs()
+    (ctx.metrics_dir / "main_lora.jsonl").write_text(
+        json.dumps({"step": 1, "train_loss": 2.0, "grad_norm": 1.0, "tokens_per_sec": 340.0, "peak_gpu_mem_mb": peaks})
+        + "\n",
+        encoding="utf-8",
+    )
+    lines = "\n".join(training_health_lines(ctx, PipelineConfig(), {}))
+    assert "| 18034 |" in lines
+
+
+def test_orchestrator_preserves_completed_training_status_if_post_train_parity_times_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import sys
+    import time
+
+    from pipeline.multi_lora_sft.config import PipelineConfig
+    from pipeline.multi_lora_sft.run import Orchestrator
+
+    cfg = PipelineConfig()
+    cfg.run.output_root = str(tmp_path)
+    cfg.train.sigterm_grace_sec = 0.2
+    orch = Orchestrator(cfg, poll_interval_sec=0.02)
+    orch.ctx.ensure_dirs()
+
+    phase = "train:main_lora"
+    final_dir = orch.ctx.checkpoints_dir / "main_lora" / "final_adapter"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    status_path = orch.ctx.status_path(phase)
+
+    # Child writes `state="ok"` + `final_adapter_dir` first, then simulates slow parity exceeding the hard deadline.
+    snippet = (
+        "import json, time; "
+        f"p = {str(status_path)!r}; "
+        f"d = {str(final_dir)!r}; "
+        "json.dump({'phase': 'train:main_lora', 'state': 'ok', 'outputs': {'final_adapter_dir': d}, 'notes': []}, open(p, 'w')); "
+        "time.sleep(10)"
+    )
+    monkeypatch.setattr(orch, "command_builder", lambda _p, _c, _d, _e=None: [sys.executable, "-c", snippet])
+    st = orch._run_subprocess_phase(phase, time.time() + 0.35)
+    assert st["state"] == "ok"
+    assert st["outputs"]["final_adapter_dir"] == str(final_dir)
+    assert any("Hard phase deadline reached after training completed" in n for n in st["notes"])

@@ -169,7 +169,9 @@ def write_best_adapter(root: str | Path, step: int, val_loss: float, copy_fn: Ca
         copy_fn(tmp)
         if not (tmp / ADAPTER_FILE).is_file():
             raise CheckpointError("best-adapter writer did not produce adapter_model.safetensors")
-        read_safetensors_header(tmp / ADAPTER_FILE)
+        hdr = read_safetensors_header(tmp / ADAPTER_FILE)
+        if not hdr["tensors"]:
+            raise CheckpointError("best-adapter safetensors contains 0 tensors")
         atomic_write_json(tmp / "best.json", {"step": int(step), "val_loss": float(val_loss), "saved_at_ts": time.time()})
     except BaseException:
         safe_rmtree(tmp)
@@ -181,7 +183,9 @@ def read_best_adapter(root: str | Path) -> tuple[Path, dict[str, Any]] | None:
     d = Path(root) / "best_adapter"
     try:
         meta = json.loads((d / "best.json").read_text(encoding="utf-8"))
-        read_safetensors_header(d / ADAPTER_FILE)
+        hdr = read_safetensors_header(d / ADAPTER_FILE)
+        if not hdr["tensors"]:
+            raise ValueError("best_adapter has 0 tensors")
         return d, meta
     except Exception:  # noqa: BLE001
         return None

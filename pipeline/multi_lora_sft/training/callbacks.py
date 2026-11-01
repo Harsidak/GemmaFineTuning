@@ -19,6 +19,7 @@ Implements design_doc.md §7.8 and §7.9:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors.torch import save_file as save_safetensors
 from transformers import (
     TrainerCallback,
     TrainerControl,
@@ -38,44 +40,118 @@ from transformers import (
 )
 
 from ..shared.checkpoints import (  # noqa: F401 - re-exported: the orchestrator, export phase and tests import them from here
+    CheckpointError,
     checkpoint_is_loadable,
     find_latest_checkpoint,
     list_checkpoints,
+    read_safetensors_header,
     write_checkpoint,
 )
 from ..shared.guards import NonFiniteGuard, NonFiniteLossError  # noqa: F401
 from ..shared.sysmon import read_latest, wandb_system_metrics
-from .device import capture_rng_state, cpu_state_dict, peak_memory_mb, save_object
+from .device import capture_rng_state, cpu_state_dict, peak_memory_mb, save_object  # noqa: F401
 from .distributed import (
     SyncedClock,
     agree_any,
     fsdp_full_optim_state_dict,
     gather_lora_state_dict,
+    gather_peak_memory_mb,
 )
 from .loss import unwrap_causal_lm
 from .schedule import WSDScheduleController
 
 logger = logging.getLogger(__name__)
 
+_WRAPPER_SEGMENTS = ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "_orig_mod.")
+
+
+def _peft_save_key(raw_key: str, adapter_name: str = "default") -> str:
+    """Normalises a raw / gathered `PeftModel` parameter key into PEFT's on-disk safetensors key format."""
+    key = raw_key
+    for seg in _WRAPPER_SEGMENTS:
+        key = key.replace(seg, "")
+    key = key.removeprefix("module.")
+    if not key.startswith("base_model.model."):
+        key = f"base_model.model.{key}"
+    return re.sub(
+        rf"\.(lora_[A-Za-z0-9_]+)\.{re.escape(adapter_name)}(\.|$)",
+        r".\1\2",
+        key,
+    )
+
 
 def save_adapter_weights(
     model: Any, out_dir: Path, accelerator: str = "cpu", state_dict: dict[str, Any] | None = None
 ) -> None:
-    """PEFT `save_pretrained`; on XLA the LoRA tensors are synced and copied to host first.
+    """Writes `adapter_model.safetensors` and `adapter_config.json` directly and fails if 0 tensors are written.
 
-    The host copy keeps the raw (adapter-name-qualified) keys so PEFT's own filtering in `save_pretrained`
-    still selects them; passing an already-converted PEFT state dict would filter everything out. `state_dict` is the
-    LoRA tensors already gathered from an FSDP-sharded model (`distributed.gather_lora_state_dict`).
+    PEFT's `save_pretrained(..., state_dict=...)` matches incoming keys against `model.named_modules()`, which under
+    FSDP1 carry `_fsdp_wrapped_module.` segments that `gather_lora_state_dict` strips — causing PEFT to filter out
+    every tensor and silently write an empty safetensors file. Writing the normalised safetensors + `PeftConfig`
+    directly avoids `named_modules()` completely across FSDP, DDP, `model_split`, TPU/XLA, and single-device runs.
     """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
     unwrapped = model.module if hasattr(model, "module") else model
+
+    # Synthetic non-PEFT test fixtures (e.g. `_TinyAdapterModel` in `test_robustness.py`) implement `save_pretrained`
+    # directly without `peft_config`; delegate to them and still enforce the non-empty safetensors invariant.
+    if state_dict is None and not hasattr(unwrapped, "peft_config") and hasattr(unwrapped, "save_pretrained"):
+        unwrapped.save_pretrained(out_path)
+        st_path = out_path / "adapter_model.safetensors"
+        if not st_path.is_file():
+            raise CheckpointError(f"save_adapter_weights did not create {st_path}")
+        hdr = read_safetensors_header(st_path)
+        if not hdr["tensors"]:
+            raise CheckpointError(f"save_adapter_weights wrote 0 tensors to {st_path}")
+        return
+
+    peft_configs: dict[str, Any] = getattr(unwrapped, "peft_config", None) or {}
+    active = getattr(unwrapped, "active_adapter", "default")
+    if isinstance(active, (list, tuple)):
+        adapter_key = str(active[0]) if active else "default"
+    else:
+        adapter_key = str(active or "default")
+    if peft_configs and adapter_key not in peft_configs:
+        adapter_key = "default" if "default" in peft_configs else next(iter(peft_configs))
+    other_adapters = {k for k in peft_configs if k != adapter_key}
+
     if state_dict is not None:
-        unwrapped.save_pretrained(out_dir, state_dict=state_dict)
-        return
-    if accelerator != "tpu":
-        unwrapped.save_pretrained(out_dir)
-        return
-    raw = {k: v for k, v in unwrapped.state_dict().items() if "lora_" in k}
-    unwrapped.save_pretrained(out_dir, state_dict=cpu_state_dict(raw, accelerator))
+        raw_tensors = state_dict
+    else:
+        raw = {k: v for k, v in unwrapped.state_dict().items() if "lora_" in k}
+        raw_tensors = cpu_state_dict(raw, accelerator)
+
+    tensors_to_save: dict[str, torch.Tensor] = {}
+    for raw_k, tensor in raw_tensors.items():
+        if "lora_" not in raw_k:
+            continue
+        if any(f".{other}." in raw_k or raw_k.endswith(f".{other}") for other in other_adapters):
+            continue
+        clean_k = _peft_save_key(raw_k, adapter_key)
+        tensors_to_save[clean_k] = tensor.detach().to("cpu").contiguous().clone()
+
+    if not tensors_to_save:
+        raise CheckpointError(
+            f"Refusing to write empty adapter to {out_path}: 0 LoRA tensors selected "
+            f"(source had {len(raw_tensors)} tensor(s))"
+        )
+
+    st_path = out_path / "adapter_model.safetensors"
+    save_safetensors(tensors_to_save, str(st_path), metadata={"format": "pt"})
+    hdr = read_safetensors_header(st_path)
+    if not hdr["tensors"]:
+        raise CheckpointError(f"Saved adapter {st_path} contains 0 tensors after write")
+
+    if adapter_key in peft_configs:
+        peft_cfg = copy.deepcopy(peft_configs[adapter_key])
+        if getattr(peft_cfg, "base_model_name_or_path", None) is None:
+            base_inner = getattr(getattr(unwrapped, "base_model", None), "model", None)
+            peft_cfg.base_model_name_or_path = getattr(base_inner, "__dict__", {}).get("name_or_path", None)
+        peft_cfg.inference_mode = True
+        peft_cfg.save_pretrained(str(out_path))
+        if not (out_path / "adapter_config.json").is_file():
+            raise CheckpointError(f"save_adapter_weights did not create {out_path / 'adapter_config.json'}")
 
 
 def inspect_dead_lora_modules(model: Any, state_dict: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -326,6 +402,17 @@ class MultiLoraTrainingCallback(TrainerCallback):
             return {"total_lora_b_modules": 0, "dead_lora_b_modules": 0, "dead_grouped": {}, "reported_by": "rank 0"}
         return inspect_dead_lora_modules(model, state_dict=gathered)
 
+    def on_train_begin(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
+    ) -> TrainerControl:
+        now = self.clock.sync() if self.clock is not None else self.wsd.now()
+        if self.wsd.step == 0:
+            self.wsd.reset_start(now)
+        self._last_ckpt_ts = now
+        self._last_val_ts = now
+        self._window_start_ts = now
+        return control
+
     def on_epoch_begin(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
     ) -> TrainerControl:
@@ -435,6 +522,7 @@ class MultiLoraTrainingCallback(TrainerCallback):
             return
 
         # NaN/Inf + divergence guards run on every rank so all ranks abort together (requires logging_nan_inf_filter=False).
+        gpu_peak_mb: list[float] = []
         if "loss" in logs:
             gn = logs.get("grad_norm")
             gn_val = float(gn) if gn is not None else None
@@ -442,6 +530,7 @@ class MultiLoraTrainingCallback(TrainerCallback):
                 self.session.check_health(self.global_step(state), float(logs["loss"]), gn_val)
             else:
                 self._guard.observe(float(logs["loss"]), gn_val, self.global_step(state))
+            gpu_peak_mb = gather_peak_memory_mb(self.accelerator)
 
         # Every rank sees the same (already reduced) eval loss, so every rank reaches the same best/early-stop
         # decision; under FSDP the LoRA weights are gathered first because saving the best adapter is collective.
@@ -478,8 +567,6 @@ class MultiLoraTrainingCallback(TrainerCallback):
         self._window_all_tokens = 0.0
         self._window_sup_tokens = 0.0
 
-        gpu_peak_mb = peak_memory_mb(self.accelerator)
-
         entry = {
             "step": self.global_step(state),
             "segment_step": state.global_step,
@@ -495,11 +582,12 @@ class MultiLoraTrainingCallback(TrainerCallback):
         }
         self.train_losses.append({"step": state.global_step, "train_loss": entry["train_loss"]})
         if self.session is not None:
+            peak_scalar = max(gpu_peak_mb) if gpu_peak_mb else None
             self.session.log_metrics(
                 entry["step"],
                 {"train/loss": entry["train_loss"], "train/grad_norm": entry["grad_norm"], "train/lr": entry["lr"],
                  "train/epoch": entry["epoch"], "perf/tokens_per_sec": entry["tokens_per_sec"],
-                 "perf/supervised_tokens_per_sec": entry["supervised_tokens_per_sec"], "perf/peak_mem_mb": entry["peak_gpu_mem_mb"],
+                 "perf/supervised_tokens_per_sec": entry["supervised_tokens_per_sec"], "perf/peak_mem_mb": peak_scalar,
                  **wandb_system_metrics(read_latest(self.metrics_jsonl_path.parent / "system.jsonl"))},
             )
         self.metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from ...src.data.processor import IGNORE_INDEX
-from .distributed import broadcast_int, is_fsdp_wrapped
+from .distributed import agree_any, broadcast_int, is_fsdp_wrapped
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,8 @@ def greedy_decode_with_logprobs(
     *,
     gen_tokens: int = 64,
     top_k: int = 5,
+    deadline: float | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Runs exact step-by-step greedy decoding on `model`, recording chosen and top-k logprobs."""
     was_training = model.training
@@ -83,6 +87,14 @@ def greedy_decode_with_logprobs(
         eos_id = tokenizer.eos_token_id
 
         for _ in range(max(1, int(gen_tokens))):
+            if deadline is not None or stop_requested is not None:
+                over = (deadline is not None and time.time() >= deadline) or (
+                    stop_requested is not None and stop_requested()
+                )
+                if lockstep:
+                    over = agree_any(over)
+                if over:
+                    break
             out = unwrapped(input_ids=cur_ids, use_cache=False, logits_to_keep=1)
             next_logits = out.logits[0, -1, :].float()
             logprobs = F.log_softmax(next_logits, dim=-1)
@@ -132,11 +144,14 @@ def generate_hf_parity_reference(
     max_prompt_tokens: int = 4096,
     gen_tokens: int = 64,
     write: bool = True,
-) -> Path:
+    deadline: float | None = None,
+    stop_requested: Callable[[], bool] | None = None,
+) -> Path | None:
     """Generates HF greedy tokens + logprobs with and without the adapter and saves JSON (§7.10).
 
     `peft_model` may be FSDP-wrapped, in which case every rank must call this together and only the rank with
-    `write=True` writes the file."""
+    `write=True` writes the file. When `deadline` or `stop_requested` cuts decoding short, all ranks agree at each
+    prompt/token boundary; if 0 complete prompts fit in the budget, returns `None` without writing an empty file."""
     source_records = val_records if val_records else train_records
     prompts = extract_parity_prompts(
         source_records,
@@ -146,16 +161,51 @@ def generate_hf_parity_reference(
     )
 
     unwrapped = peft_model.module if hasattr(peft_model, "module") else peft_model  # the PeftModel
-    runner = peft_model if is_fsdp_wrapped(peft_model) else unwrapped  # what the forward is called on
+    fsdp_wrapped = is_fsdp_wrapped(peft_model)
+    runner = peft_model if fsdp_wrapped else unwrapped  # what the forward is called on
     items: list[dict[str, Any]] = []
     for p in prompts:
+        if deadline is not None or stop_requested is not None:
+            over = (deadline is not None and time.time() >= deadline) or (
+                stop_requested is not None and stop_requested()
+            )
+            if fsdp_wrapped:
+                over = agree_any(over)
+            if over:
+                if write:
+                    logger.warning(
+                        "[%s] Parity time budget reached after %d/%d prompt(s); stopping parity decode cleanly",
+                        adapter_name,
+                        len(items),
+                        len(prompts),
+                    )
+                break
         with_adapter = greedy_decode_with_logprobs(
-            runner, tokenizer, p["prompt_token_ids"], gen_tokens=gen_tokens
+            runner,
+            tokenizer,
+            p["prompt_token_ids"],
+            gen_tokens=gen_tokens,
+            deadline=deadline,
+            stop_requested=stop_requested,
         )
         with unwrapped.disable_adapter():
             without_adapter = greedy_decode_with_logprobs(
-                runner, tokenizer, p["prompt_token_ids"], gen_tokens=gen_tokens
+                runner,
+                tokenizer,
+                p["prompt_token_ids"],
+                gen_tokens=gen_tokens,
+                deadline=deadline,
+                stop_requested=stop_requested,
             )
+        if not with_adapter or not without_adapter:
+            if write:
+                logger.warning(
+                    "[%s] Parity budget expired mid-prompt (%d/%d complete); dropping partial prompt",
+                    adapter_name,
+                    len(items),
+                    len(prompts),
+                )
+            break
         items.append(
             {
                 "task_id": p["task_id"],
@@ -165,6 +215,11 @@ def generate_hf_parity_reference(
                 "without_adapter": without_adapter,
             }
         )
+
+    if not items and (deadline is not None or stop_requested is not None):
+        if write and prompts:
+            logger.warning("[%s] Parity budget expired before completing 1 prompt; skipping parity file", adapter_name)
+        return None
 
     payload = {
         "adapter": adapter_name,

@@ -196,6 +196,9 @@ class ParitySection:
     num_prompts: int = 8
     max_prompt_tokens: int = 4096
     gen_tokens: int = 64
+    fsdp_num_prompts: int = 2
+    fsdp_gen_tokens: int = 16
+    max_duration_sec: float = 180.0
     max_agreement_drop: float = 0.10
 
 
@@ -901,6 +904,12 @@ def validate_config(cfg: PipelineConfig) -> None:
         raise ConfigError(f"submission.eval_budget.max_turns must be in 1..500, got {eb.max_turns}")
 
     # Eval validation
+    if cfg.parity.num_prompts < 1 or cfg.parity.gen_tokens < 1:
+        raise ConfigError("parity.num_prompts and parity.gen_tokens must be >= 1")
+    if cfg.parity.fsdp_num_prompts < 1 or cfg.parity.fsdp_gen_tokens < 1:
+        raise ConfigError("parity.fsdp_num_prompts and parity.fsdp_gen_tokens must be >= 1")
+    if cfg.parity.max_duration_sec <= 0.0:
+        raise ConfigError(f"parity.max_duration_sec must be > 0, got {cfg.parity.max_duration_sec}")
     if cfg.eval.vllm.max_model_len > MAX_CONTEXT_TOKENS or cfg.eval.vllm.max_model_len < 512:
         raise ConfigError(
             f"eval.vllm.max_model_len must be in 512..{MAX_CONTEXT_TOKENS}, got {cfg.eval.vllm.max_model_len}"

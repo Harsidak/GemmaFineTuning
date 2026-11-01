@@ -335,6 +335,22 @@ class Orchestrator:
         existing_status = self.ctx.read_status(phase)
 
         if timed_out:
+            if (
+                existing_status is not None
+                and existing_status.get("state") == "ok"
+                and (existing_status.get("outputs") or {}).get("final_adapter_dir")
+            ):
+                existing_status["ended"] = utc_iso(t_end)
+                existing_status["ended_ts"] = t_end
+                existing_status["actual_duration_sec"] = round(t_end - t_start, 2)
+                existing_status["notes"] = [
+                    *(existing_status.get("notes") or []),
+                    "Hard phase deadline reached after training completed; post-training parity/cleanup terminated",
+                ]
+                self.ctx.status_path(phase).write_text(
+                    json.dumps(existing_status, indent=2), encoding="utf-8"
+                )
+                return existing_status
             status = PhaseStatus(
                 phase=phase,
                 state="timeout",

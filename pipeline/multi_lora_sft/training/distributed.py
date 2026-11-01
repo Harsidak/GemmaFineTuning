@@ -314,3 +314,30 @@ def keep_buffers_in_native_dtype(fsdp_plugin: Any) -> None:
     fsdp_plugin.set_mixed_precision = _patched
     fsdp_plugin._buffers_native_patch = True
     _strip()
+
+
+def gather_peak_memory_mb(accelerator: str) -> list[float]:
+    """Per-rank peak device memory (MiB) gathered across all distributed ranks (`[gpu0, gpu1, ...]`).
+
+    `torch.cuda.max_memory_allocated(i)` only tracks allocations made by the calling process, so reading all device
+    ordinals on rank 0 reports `[rank0_mib, 0.0, 0.0, ...]`. When `torch.distributed` is active on CUDA, each rank
+    writes its own device peak into its rank slot and an `all_reduce(MAX)` assembles the full vector on every rank.
+    """
+    from .device import peak_memory_mb
+
+    if not dist_ready() or world_size() <= 1:
+        return peak_memory_mb(accelerator)
+    if accelerator != "cuda":
+        return peak_memory_mb(accelerator)
+    import torch
+    import torch.distributed as dist
+
+    if not torch.cuda.is_available():
+        return []
+    n = world_size()
+    r = rank()
+    vec = torch.zeros(n, dtype=torch.float64, device=_collective_device())
+    dev_idx = torch.cuda.current_device()
+    vec[r] = float(torch.cuda.max_memory_allocated(dev_idx)) / (1024.0 * 1024.0)
+    dist.all_reduce(vec, op=dist.ReduceOp.MAX)
+    return [round(float(x), 1) for x in vec.cpu().tolist()]

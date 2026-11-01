@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import logging
 import math
 import os
 import random
@@ -165,7 +166,10 @@ def run_train_adapter_phase(
     phase_name = f"train:{adapter_name}"
     rank = int(os.environ.get("RANK", "0"))
     is_main = rank == 0
-    logger = configure_phase_logging(ctx.log_path(phase_name) if is_main else None)
+    logger = configure_phase_logging(
+        ctx.log_path(phase_name) if is_main else None,
+        level=logging.INFO if is_main else logging.WARNING,
+    )
 
     t_start = time.time()
     cfg = cfg or load_config(ctx.resolved_config_path)
@@ -194,9 +198,14 @@ def run_train_adapter_phase(
         import datasets as hf_datasets
         import numpy as np
         import torch
+        import transformers
         from peft import set_peft_model_state_dict
         from safetensors.torch import load_file as load_safetensors
         from trl import SFTConfig
+
+        if not is_main:
+            hf_datasets.utils.logging.set_verbosity_warning()
+            transformers.utils.logging.set_verbosity_warning()
 
         accelerator = resolve_accelerator(eff.train.accelerator)
         parallelism = eff.train.parallelism
@@ -311,10 +320,19 @@ def run_train_adapter_phase(
             seed=cfg.run.seed,
         )
 
-        # Reserve ~30s before hard phase kill so final save + parity reference finish cleanly
-        raw_window = max(5.0, deadline - t_start)
-        soft_guard = min(30.0, raw_window * 0.12)
-        soft_deadline = t_start + max(2.0, raw_window - soft_guard)
+        # Re-sync rank-0 wall clock after model loading (5-8 min on 31B NF4) so throughput, WSD step-time EMA,
+        # and wall-clock checkpoint / validation intervals start at actual training start rather than phase launch.
+        train_t0 = clock.sync()
+
+        # Reserve wrap-up + agreed parity time budget before hard phase kill so final save, status write, and parity
+        # reference finish cleanly without overrunning the orchestrator's hard deadline.
+        parity_reserve = (
+            min(float(cfg.parity.max_duration_sec), 180.0) if (cfg.parity.enabled and not is_tpu) else 0.0
+        )
+        raw_window = max(5.0, deadline - train_t0)
+        wrapup_target = 30.0 + parity_reserve
+        soft_guard = min(wrapup_target, raw_window * (0.25 if parity_reserve > 0.0 else 0.12))
+        soft_deadline = train_t0 + max(2.0, raw_window - soft_guard)
 
         wsd = WSDScheduleController(
             warmup_steps=eff.schedule.warmup_steps,
@@ -322,7 +340,7 @@ def run_train_adapter_phase(
             final_lr_ratio=eff.schedule.final_lr_ratio,
             ema_beta=eff.schedule.step_time_ema_beta,
             total_epoch_steps=total_epoch_steps,
-            t_start=t_start,
+            t_start=train_t0,
             deadline=soft_deadline,
             now_fn=clock,
         )
@@ -369,7 +387,7 @@ def run_train_adapter_phase(
             if resume_meta.get("schedule_state"):
                 wsd.load_resume_state(
                     resume_meta["schedule_state"],
-                    new_t_start=t_start,
+                    new_t_start=train_t0,
                     new_deadline=soft_deadline,
                     extend=cfg.resume.extend,
                 )
@@ -591,9 +609,6 @@ def run_train_adapter_phase(
         parity_path: Path | None = None
         fsdp_model = is_fsdp_wrapped(trainer.model)
         final_lora = gather_lora_state_dict(trainer.model)  # collective under FSDP, None otherwise
-        want_parity = cfg.parity.enabled and not is_tpu and not _STOP_EVENT.is_set() and (deadline - time.time()) > 3.0
-        if synced:
-            want_parity = agree_all(want_parity)
         if is_main:
             final_adapter_dir.mkdir(parents=True, exist_ok=True)
             save_adapter_weights(trainer.model, final_adapter_dir, accelerator, state_dict=final_lora)
@@ -611,24 +626,8 @@ def run_train_adapter_phase(
             if is_tpu and cfg.parity.enabled:
                 notes.append("HF parity reference skipped on TPU (token-by-token generate recompiles every step)")
 
-        # Under FSDP every rank runs the same greedy decode in lockstep (each forward all-gathers the layers);
-        # rank 0 writes the JSON. Otherwise only rank 0 decodes on its own full copy of the model.
-        if want_parity and (is_main or fsdp_model):
-            gen_toks = min(cfg.parity.gen_tokens, 16 if cfg.run.mode == "calibration" else cfg.parity.gen_tokens)
-            n_prompts = min(cfg.parity.num_prompts, 2 if cfg.run.mode == "calibration" else cfg.parity.num_prompts)
-            parity_path = generate_hf_parity_reference(
-                adapter_name=adapter_name,
-                peft_model=trainer.model,
-                tokenizer=tokenizer,
-                val_records=val_rows,
-                train_records=train_rows,
-                output_path=ctx.parity_dir / f"{adapter_name}_hf.json",
-                num_prompts=n_prompts,
-                max_prompt_tokens=cfg.parity.max_prompt_tokens,
-                gen_tokens=gen_toks,
-                write=is_main,
-            )
-
+        # Persist final session state, manifest summary, and phase `ok` status BEFORE running parity so any slow
+        # parity decode or late deadline signal cannot lose finished training work.
         steps_completed = resumed_step + segment_steps
         session_out: dict[str, Any] = {}
         if is_main:
@@ -658,7 +657,7 @@ def run_train_adapter_phase(
             "throughput_projection": cb.throughput_projection,
             "matched_module_count": len(matched_modules),
             "final_adapter_dir": str(final_adapter_dir),
-            "parity_hf_path": str(parity_path) if parity_path else None,
+            "parity_hf_path": None,
             "oom_override": oom_override,
             "resumed_from": str(resume_ckpt) if resume_ckpt else None,
             "stopped_by_signal": cb.stopped_by_signal,
@@ -680,6 +679,68 @@ def run_train_adapter_phase(
             result_dict = _write_status(
                 ctx, phase_name, state="ok", t_start=t_start, deadline=deadline, outputs=summary, notes=notes
             )
+        else:
+            result_dict = {"phase": phase_name, "state": "ok", "outputs": summary}
+
+        # Under FSDP every rank runs the same greedy decode in lockstep (each forward all-gathers the layers);
+        # rank 0 writes the JSON. Ranks agree on one `parity_deadline` and use smaller prompt/token caps under FSDP.
+        if cfg.parity.enabled and not is_tpu:
+            parity_t0 = clock.sync()
+            parity_deadline = min(parity_t0 + float(cfg.parity.max_duration_sec), deadline - 10.0)
+            if synced:
+                parity_deadline = broadcast_float(parity_deadline)
+            want_parity = not _STOP_EVENT.is_set() and (parity_deadline - parity_t0) > 3.0
+            if synced:
+                want_parity = agree_all(want_parity)
+            if want_parity and (is_main or fsdp_model):
+                gen_toks = cfg.parity.gen_tokens
+                n_prompts = cfg.parity.num_prompts
+                if cfg.run.mode == "calibration":
+                    gen_toks = min(gen_toks, 16)
+                    n_prompts = min(n_prompts, 2)
+                if fsdp_model:
+                    gen_toks = min(gen_toks, cfg.parity.fsdp_gen_tokens)
+                    n_prompts = min(n_prompts, cfg.parity.fsdp_num_prompts)
+                logger.info(
+                    "[%s] Running HF parity reference (%d prompt(s) x %d token(s), budget=%.1fs, fsdp=%s)",
+                    adapter_name,
+                    n_prompts,
+                    gen_toks,
+                    max(0.0, parity_deadline - parity_t0),
+                    fsdp_model,
+                )
+                try:
+                    parity_path = generate_hf_parity_reference(
+                        adapter_name=adapter_name,
+                        peft_model=trainer.model,
+                        tokenizer=tokenizer,
+                        val_records=val_rows,
+                        train_records=train_rows,
+                        output_path=ctx.parity_dir / f"{adapter_name}_hf.json",
+                        num_prompts=n_prompts,
+                        max_prompt_tokens=cfg.parity.max_prompt_tokens,
+                        gen_tokens=gen_toks,
+                        write=is_main,
+                        deadline=parity_deadline,
+                        stop_requested=_STOP_EVENT.is_set,
+                    )
+                except Exception as parity_exc:  # noqa: BLE001 - never lose completed training to a parity failure
+                    logger.warning("[%s] HF parity reference failed (%s); keeping trained adapter", adapter_name, parity_exc)
+                    notes.append(f"HF parity reference failed: {type(parity_exc).__name__}: {parity_exc}")
+            elif not want_parity and is_main:
+                notes.append("HF parity reference skipped (insufficient time remaining before deadline or stop requested)")
+
+            if is_main:
+                summary["parity_hf_path"] = str(parity_path) if parity_path else None
+                manifest = ctx.read_manifest()
+                tr_map = dict(manifest.get("training_summaries", {}))
+                tr_map[adapter_name] = summary
+                ctx.update_manifest({"training_summaries": tr_map})
+                result_dict = _write_status(
+                    ctx, phase_name, state="ok", t_start=t_start, deadline=deadline, outputs=summary, notes=notes
+                )
+
+        if is_main:
             logger.info(
                 "[%s] Finished %d step(s) in %.2fs (train_loss=%s, val_loss=%s)",
                 adapter_name,
@@ -688,8 +749,6 @@ def run_train_adapter_phase(
                 final_train_loss,
                 final_val_loss,
             )
-        else:
-            result_dict = {"phase": phase_name, "state": "ok", "outputs": summary}
 
         del trainer, peft_model, base_model
         empty_cache(accelerator)
