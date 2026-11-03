@@ -344,6 +344,82 @@ def find_matching_lora_modules(model: Any, target_regex: str) -> list[str]:
     return sorted(matched)
 
 
+FLASH_ATTN_MAX_HEAD_DIM = 256  # flash-attn 2 kernels support head_dim <= 256
+
+
+def max_attention_head_dim(hf_cfg: Any) -> int:
+    """Largest attention head dim of any layer. Gemma 4 global layers use `global_head_dim` (512 by default)."""
+    text = hf_cfg.get_text_config() if hasattr(hf_cfg, "get_text_config") else hf_cfg
+    dims = [getattr(text, "head_dim", None), getattr(text, "global_head_dim", None)]
+    return max([int(d) for d in dims if d] or [0])
+
+
+def resolve_attn_implementation(requested: str, hf_cfg: Any, has_cuda: bool) -> tuple[str, str | None]:
+    """Returns (implementation to use, reason for a fallback or None). flash_attention_2 needs CUDA, the
+    `flash_attn` package, and every attention head <= 256 wide; otherwise training uses sdpa."""
+    if requested != "flash_attention_2":
+        return requested, None
+    if not has_cuda:
+        return "sdpa", "flash_attention_2 is CUDA-only"
+    import importlib.util
+
+    if importlib.util.find_spec("flash_attn") is None:
+        return "sdpa", "flash_attention_2 requested but the flash_attn package is not installed"
+    head_dim = max_attention_head_dim(hf_cfg)
+    if head_dim > FLASH_ATTN_MAX_HEAD_DIM:
+        return "sdpa", (
+            f"flash_attention_2 supports head_dim <= {FLASH_ATTN_MAX_HEAD_DIM}, but this model has {head_dim}-wide "
+            "heads (Gemma 4 global-attention layers)"
+        )
+    return requested, None
+
+
+def is_prequantized_nf4_dir(path: str | Path | None) -> bool:
+    """True if `path` holds a bitsandbytes 4-bit checkpoint (config.json quantization_config + weights)."""
+    if not path:
+        return False
+    p = Path(path)
+    try:
+        q = json.loads((p / "config.json").read_text(encoding="utf-8")).get("quantization_config") or {}
+    except (OSError, json.JSONDecodeError):
+        return False
+    is_bnb4 = str(q.get("quant_method", "")).lower() == "bitsandbytes" and bool(q.get("load_in_4bit"))
+    has_weights = any(f.suffix == ".safetensors" and f.stat().st_size > 0 for f in p.iterdir() if f.is_file())
+    return is_bnb4 and has_weights
+
+
+def save_prequantized_base(model: Any, dest: str | Path) -> float | None:
+    """Saves the NF4-quantized base (before LoRA) to `dest` on rank 0. Returns seconds taken, or None if skipped.
+    Never raises: a failed save only costs the speed-up next time."""
+    import time
+
+    if int(os.environ.get("RANK", "0")) != 0 or is_prequantized_nf4_dir(dest):
+        return None
+    t0 = time.time()
+    try:
+        out = Path(dest)
+        out.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(out), safe_serialization=True, max_shard_size="4GB")
+    except Exception as exc:  # noqa: BLE001 - optional optimisation
+        logger.warning("Could not save the pre-quantized base to %s: %s: %s", dest, type(exc).__name__, exc)
+        return None
+    return time.time() - t0
+
+
+def apply_liger_kernels(model: Any) -> str:
+    """Patches Liger's fused RMSNorm / RoPE / MLP kernels into `model` in place. The loss is left alone (the
+    pipeline's own masked loss stays in charge). Returns a one-line status; never raises."""
+    try:
+        from liger_kernel.transformers import _apply_liger_kernel_to_instance
+    except ImportError:
+        return "liger-kernel not installed: training without it"
+    try:
+        _apply_liger_kernel_to_instance(model=model, cross_entropy=False, fused_linear_cross_entropy=False)
+    except Exception as exc:  # noqa: BLE001 - unsupported model type / kernel mismatch
+        return f"liger-kernel could not patch this model ({type(exc).__name__}: {exc}): training without it"
+    return "liger-kernel applied (RMSNorm / RoPE / MLP fused kernels)"
+
+
 def load_base_model_for_training(
     cfg: PipelineConfig,
     eff_adapter: EffectiveAdapterConfig,
@@ -398,6 +474,15 @@ def load_base_model_for_training(
                 **bnb_kwargs,
             )
 
+    pre_path = cfg.model.prequantized_path
+    if quant == "nf4" and quant_config is not None and pre_path:
+        if is_prequantized_nf4_dir(pre_path):
+            logger.info("Loading the pre-quantized NF4 base from %s (fast path)", pre_path)
+            model_path, quant_config = str(pre_path), None  # its config.json carries the quantization_config
+        else:
+            logger.warning("model.prequantized_path=%s holds no NF4 checkpoint; loading %s and quantizing on the fly",
+                           pre_path, model_path)
+
     local_only = Path(model_path).is_dir()
     hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=local_only)
     if cfg.model.skip_multimodal_towers:
@@ -406,10 +491,9 @@ def load_base_model_for_training(
         if hasattr(hf_cfg, "audio_config"):
             hf_cfg.audio_config = None
 
-    attn_impl = cfg.model.attn_implementation
-    if attn_impl == "flash_attention_2" and not has_cuda:
-        logger.warning("flash_attention_2 is CUDA-only; using sdpa on %s", accelerator)
-        attn_impl = "sdpa"
+    attn_impl, attn_reason = resolve_attn_implementation(cfg.model.attn_implementation, hf_cfg, has_cuda)
+    if attn_reason:
+        logger.warning("%s; using %s", attn_reason, attn_impl)
 
     load_kwargs: dict[str, Any] = {
         "config": hf_cfg,
@@ -448,6 +532,8 @@ def load_base_model_for_training(
         ) from exc
 
     _assert_fully_materialised(model, parallelism)
+    if cfg.model.use_liger_kernel and has_cuda:
+        logger.info(apply_liger_kernels(model))
     model.config.use_cache = False
     if hasattr(model.config, "text_config") and model.config.text_config is not None:
         model.config.text_config.use_cache = False

@@ -94,6 +94,16 @@ class ModelSection:
     attn_implementation: str = "sdpa"  # "sdpa" | "eager" | "flash_attention_2"
     max_memory_gib: float = 20.0
     skip_multimodal_towers: bool = True
+    # Liger fused Triton kernels (RMSNorm / RoPE / GeGLU) on the loaded model: less activation memory. Off until a
+    # calibration run confirms Gemma 4 support; an unsupported model logs a warning and trains unpatched.
+    use_liger_kernel: bool = False
+    # Fast load: a directory holding the base ALREADY quantized to NF4 (written by `save_prequantized_to`). It is
+    # ~1/3 the size of the bf16 base and skips on-the-fly quantization (which transformers loads single-threaded).
+    # Used only with quantization=nf4; a missing/unloadable dir falls back to train_base_path with a warning.
+    prequantized_path: str | None = None
+    # After loading the bf16 base with on-the-fly NF4 quantization, rank 0 saves the quantized base here (skipped if
+    # the dir already holds one). Publish that dir as a private dataset and point `prequantized_path` at it.
+    save_prequantized_to: str | None = None
 
 
 @dataclass

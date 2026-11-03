@@ -231,6 +231,19 @@ Precedence: `config.py` defaults < `base.yaml`-style preset YAML < `--set key=va
 | `submission.generation.*`, `submission.eval_budget.*` | | Decoding settings and per-task budgets written into the zip. |
 | `run.resume_from`, `resume.*`, `output.bundle_dir` | | Continue from a checkpoint / a previous session's bundle. |
 | `tuning.enabled` | false | Optuna search over short real trials instead of a training run. |
+| `model.prequantized_path` | null | Directory holding the base already in NF4: loads ~3x fewer bytes and multi-threaded (on-the-fly quantization is single-threaded). |
+| `model.save_prequantized_to` | null | Save the NF4 base there after the first slow load; publish it as a **private** dataset and set `prequantized_path`. |
+| `model.use_liger_kernel` | false | Liger fused RMSNorm / RoPE / MLP kernels (less activation memory). Falls back with a warning if unsupported. |
+| `model.attn_implementation` | sdpa | `flash_attention_2` installs the optional wheel, but Gemma 4's 512-wide global heads exceed flash-attn 2's limit (256), so it falls back to sdpa (logged). |
+
+**Fast model load (target < 2 min).** The report's timeline shows `Base model loaded in N s`. To cut it: run once with
+`--set model.save_prequantized_to=/kaggle/working/nf4_base`, publish that folder as a private dataset, then run with
+`--set model.prequantized_path=/kaggle/input/<that-dataset>`.
+
+**Wheels and monitoring.** `kaggle/build_train_wheels.py` (a Kaggle notebook with internet) builds `train_wheels/`:
+peft, trl, accelerate, datasets, wandb, optuna, psutil + nvidia-ml-py (GPU/CPU samples in `metrics/system.jsonl`),
+nvitop (`python -m nvitop -1` for a live GPU view), liger-kernel, and flash-attn in `optional/`. It ends with a table of
+what was fetched; publish `/kaggle/working/train_wheels` as the new wheels dataset version.
 
 Every key, its validation and its default is in `pipeline/multi_lora_sft/config.py`; the design rationale is in
 `pipeline/multi_lora_sft/design_doc.md`.

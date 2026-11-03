@@ -27,13 +27,19 @@ TESTED = ["peft==0.21.2", "trl==1.16.0", "accelerate==1.15.0", "datasets==5.1.0"
 RANGES = ["peft>=0.17,<1", "trl>=1.0,<2", "accelerate>=1.10.1,<2", "datasets>=4.7,<6"]
 EXTRAS = ["optuna>=3.6,<5", "wandb>=0.17,<1", "matplotlib>=3.5", "pandas>=1.5",
           "regex",  # transformers imports it; bundle it in case the target image lacks it
-          "psutil", "nvidia-ml-py"]  # run monitor: host CPU/RAM + GPU utilisation/memory/power (pipeline/.../shared/sysmon.py)
+          "psutil", "nvidia-ml-py",  # run monitor: host CPU/RAM + GPU utilisation/memory/power (pipeline/.../shared/sysmon.py)
+          "nvitop",  # live GPU monitor for a terminal / notebook cell: `python -m nvitop -1`
+          "liger-kernel"]  # fused Triton kernels, used when model.use_liger_kernel=true (needs the image's torch+triton)
 CANDIDATES = [("tested-pins", TESTED + EXTRAS), ("ranges", RANGES + EXTRAS)]
-# Optional GPU speed-ups, fetched best-effort as binary wheels into train_wheels/optional/ (never fails the build and is
-# NOT installed by the notebook: train_wheels/ is installed non-recursively). Install one by hand / in a calibration run
-# and switch it on in the config (flash-attn -> model.attn_implementation=flash_attention_2) only after it is verified
-# on the target image. flash-attn publishes no PyPI binary wheels, so it is usually reported as unavailable.
-OPTIONAL_GPU = [p.strip() for p in os.environ.get("WHEEL_OPTIONAL", "flash-attn,liger-kernel").split(",") if p.strip()]
+# flash-attn 2 publishes no PyPI wheels: fetch the prebuilt one matching the image's torch / CUDA 12 / C++ ABI from its
+# GitHub releases into train_wheels/optional/. Kaggle strips "+" from uploaded file names, so the wheel is stored as
+# flash_attn.whl.bin and optional/FLASH_ATTN.json records the real name; the notebook restores it and installs it only
+# when model.attn_implementation=flash_attention_2. Never fails the build. NOTE: Gemma 4 global-attention layers have
+# 512-wide heads and flash-attn 2 supports <= 256, so the trainer falls back to sdpa for Gemma 4 (logged); the wheel is
+# kept for models / future flash-attn releases that fit.
+FLASH_ATTN_VERSIONS = [v.strip() for v in os.environ.get("WHEEL_FLASH_ATTN", "2.8.3,2.8.2,2.7.4.post1").split(",") if v.strip()]
+FLASH_ATTN_URL = ("https://github.com/Dao-AILab/flash-attention/releases/download/v{v}/"
+                  "flash_attn-{v}+cu12torch{t}cxx11abi{abi}-cp{py}-cp{py}-linux_x86_64.whl")
 
 # ---- TPU bundle (JAX + Tunix). google-tunix declares ~25 dependencies (tensorflow-datasets, numba, kagglehub, ...) of
 # which the trainer imports almost none; installing it with --no-deps plus the import-time set below was verified by
@@ -282,7 +288,9 @@ os.environ.update(WANDB_MODE="offline", WANDB_SILENT="true", WANDB_DIR=tempfile.
 out = {"core": {}, "e2e": None}
 try:
     import torch, transformers, tokenizers, safetensors, peft, trl, accelerate, datasets, optuna, wandb
-    import psutil, pynvml  # run monitor (sysmon): import only, there is no GPU here
+    import psutil, pynvml, nvitop  # run monitor (sysmon) + live GPU view: import only, there is no GPU here
+    from importlib.metadata import version as _v
+    out["core"]["liger-kernel"] = _v("liger-kernel")  # needs triton + CUDA to import: presence check only
     for m in (torch, transformers, tokenizers, safetensors, peft, trl, accelerate, datasets, optuna, wandb, psutil):
         out["core"][m.__name__] = getattr(m, "__version__", "?")
     from transformers import GPT2Config, GPT2LMHeadModel
@@ -348,7 +356,8 @@ def smoke_test(official_dirs: list, official_versions: dict, bundle_names: set, 
     ours = []
     for line in chk.stdout.splitlines():
         m = re.match(r"^(\S+) \S+ (?:has requirement|requires) ([A-Za-z0-9_.\-]+)", line)
-        if m and (norm(m.group(1)) in bundle_names or norm(m.group(1)) in PREINSTALL):
+        # torch/triton/numpy belong to the GPU image (the CPU smoke venv has no triton, which liger-kernel needs)
+        if m and norm(m.group(2)) not in BASE_IMAGE and (norm(m.group(1)) in bundle_names or norm(m.group(1)) in PREINSTALL):
             ours.append(line)
     log(f"pip check: {len(chk.stdout.splitlines())} lines, {len(ours)} concern the bundle")
     r = run([py, "-I", "-c", SMOKE], capture=True, check=False)
@@ -481,18 +490,59 @@ def add_python_variants(out: Path, pythons: list) -> dict:
     return {"pythons": pythons, "added": added, "missing": missing}
 
 
-def fetch_optional_wheels(out: Path, specs: list) -> dict:
-    """Best-effort `pip download --only-binary` of `specs` (no deps) for the target Python into out/optional/."""
+def target_cxx11_abi() -> list:
+    """C++ ABI flags to try, the image's own first (torch on this notebook == the training image's torch)."""
+    try:
+        import torch
+
+        return ["TRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "FALSE"]
+    except (ImportError, AttributeError):
+        return ["TRUE", "FALSE"]  # torch >= 2.7 pip wheels use the new ABI
+
+
+def fetch_flash_attn(out: Path, torch_version: str) -> dict:
+    """Downloads the first flash-attn release wheel that exists for this torch major.minor / Python / ABI."""
+    import urllib.error
+    import urllib.request
+
     opt = out / "optional"
     opt.mkdir(parents=True, exist_ok=True)
-    got, missing = [], []
-    for spec in specs:
-        r = pip(PY, "download", "--quiet", "--no-deps", "--only-binary=:all:", "--python-version", "%d.%d" % TARGET_PY,
-                "--implementation", "cp", *[a for t in MANYLINUX for a in ("--platform", t)], "-d", str(opt), spec,
-                capture=True, check=False)
-        (got if r.returncode == 0 else missing).append(spec)
-    log(f"optional GPU wheels: fetched {got or 'none'}; unavailable as binary wheels: {missing or 'none'} (in {opt})")
-    return {"fetched": got, "unavailable": missing, "dir": str(opt)}
+    tmm = ".".join(torch_version.split("+")[0].split(".")[:2])
+    tried = []
+    if not tmm:
+        return {"ok": False, "reason": "torch version of the target image is unknown", "tried": tried}
+    py = f"{TARGET_PY[0]}{TARGET_PY[1]}"
+    for v in FLASH_ATTN_VERSIONS:
+        for abi in target_cxx11_abi():
+            url = FLASH_ATTN_URL.format(v=v, t=tmm, abi=abi, py=py)
+            tried.append(url.rsplit("/", 1)[-1])
+            try:
+                with urllib.request.urlopen(url, timeout=120) as r, open(opt / "flash_attn.whl.bin", "wb") as f:
+                    shutil.copyfileobj(r, f, 1 << 20)
+            except (urllib.error.URLError, OSError) as exc:
+                log(f"  flash-attn {v} torch{tmm} abi{abi}: not available ({exc})")
+                continue
+            wheel_name = url.rsplit("/", 1)[-1]
+            info = {"ok": True, "file": "flash_attn.whl.bin", "wheel_name": wheel_name, "version": v,
+                    "torch": tmm, "cxx11abi": abi, "sha256": sha256(opt / "flash_attn.whl.bin")}
+            (opt / "FLASH_ATTN.json").write_text(json.dumps(info, indent=2))
+            return info
+    (opt / "flash_attn.whl.bin").unlink(missing_ok=True)
+    return {"ok": False, "reason": f"no release wheel for torch {tmm} / cp{py}", "tried": tried}
+
+
+def print_summary(chosen: dict, wheels: list, flash: dict) -> None:
+    """One table: every bundled package, what is installed automatically, and what is optional."""
+    names = dict(chosen["bundle"])
+    rows = [(k, names.get(norm(k), "-"), "auto-installed") for k in
+            ("peft", "trl", "accelerate", "datasets", "optuna", "wandb", "psutil", "nvidia-ml-py", "nvitop", "liger-kernel")]
+    rows.append(("flash-attn", flash.get("version", "-"),
+                 "optional/ (installed when attn=flash_attention_2)" if flash.get("ok") else f"NOT FETCHED: {flash.get('reason')}"))
+    log("\n  package          version          status")
+    log("  " + "-" * 70)
+    for name, ver, status in rows:
+        log(f"  {name:16s} {ver:16s} {status}")
+    log(f"  {len(wheels)} wheels, {sum(w.stat().st_size for w in wheels) / 1e6:.1f} MB")
 
 
 def sha256(path: Path) -> str:
@@ -566,13 +616,13 @@ def main() -> None:
         "smoke": chosen["smoke"],
         "attempts": attempts,
     }
-    manifest["optional"] = fetch_optional_wheels(OUT, OPTIONAL_GPU) if OPTIONAL_GPU else {}
+    flash = fetch_flash_attn(OUT, fakes.get("torch", ""))
+    manifest["optional"] = {"flash_attn": flash}
     (OUT / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
     (OUT / "requirements.lock.txt").write_text("".join(f"{n}=={v}\n" for n, v in chosen["bundle"]))
     size_mb = sum(w.stat().st_size for w in wheels) / 1e6
     log(f"\nVERIFIED ({chosen['label']}): {len(wheels)} wheels, {size_mb:.1f} MB in {OUT}")
-    for key in ("peft", "trl", "accelerate", "datasets", "optuna", "wandb", "transformers"):
-        log(f"  {key:13s} {chosen['smoke']['core'].get(key)}")
+    print_summary(chosen, wheels, flash)
     log(f"  tiny SFT end-to-end: {chosen['smoke']['e2e']}")
     if failures:
         log("\nWARNING: " + "; ".join(failures))

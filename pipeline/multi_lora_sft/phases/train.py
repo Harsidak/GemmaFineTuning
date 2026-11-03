@@ -78,7 +78,12 @@ from ..training.loss import (
     WeightedLanguageModelingCollator,
     build_selective_sft_trainer_cls,
 )
-from ..training.model import attach_lora_adapter, load_base_model_for_training
+from ..training.model import (
+    attach_lora_adapter,
+    is_prequantized_nf4_dir,
+    load_base_model_for_training,
+    save_prequantized_base,
+)
 from ..training.parity import generate_hf_parity_reference
 from ..training.schedule import WSDScheduleController, create_wsd_scheduler
 
@@ -299,6 +304,14 @@ def run_train_adapter_phase(
         # Measured every run (REPORT timeline notes): the target is < 2 min; on 31B FSDP each rank reads + quantizes.
         notes.append(f"Base model loaded in {load_sec:.0f} s ({eff.model_quantization}, {parallelism})")
         logger.info("[%s] base model loaded in %.1f s", adapter_name, load_sec)
+        fast = eff.model_quantization == "nf4" and is_prequantized_nf4_dir(cfg.model.prequantized_path)
+        if fast:
+            notes.append(f"Base loaded from the pre-quantized NF4 copy {cfg.model.prequantized_path}")
+        elif cfg.model.save_prequantized_to and eff.model_quantization == "nf4":
+            save_sec = save_prequantized_base(base_model, cfg.model.save_prequantized_to)
+            if save_sec is not None:
+                notes.append(f"Saved the pre-quantized NF4 base to {cfg.model.save_prequantized_to} in {save_sec:.0f} s "
+                             "(publish it as a private dataset and set model.prequantized_path for fast loads)")
         base_model.config.get_text_config().pad_token_id = tokenizer.pad_token_id
         if hasattr(base_model, "generation_config") and base_model.generation_config is not None:
             base_model.generation_config.pad_token_id = tokenizer.pad_token_id

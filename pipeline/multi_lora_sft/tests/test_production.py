@@ -118,3 +118,44 @@ def test_diagnosis_points_preflight_failures_at_the_validator(tmp_path: Path) ->
                                  error="389 record(s) are missing the required 'agent' field and 0 matched."))
     rows = diagnosis(ctx, cfg, {})
     assert rows[0][0] == "FAIL" and "validate_dataset.py" in rows[0][2]
+
+
+# ---- speed / monitoring options ----------------------------------------------------------------------------------
+
+
+def test_flash_attention_falls_back_for_wide_heads(monkeypatch) -> None:
+    import importlib.util
+    from types import SimpleNamespace
+
+    from pipeline.multi_lora_sft.training.model import resolve_attn_implementation
+
+    gemma4 = SimpleNamespace(head_dim=256, global_head_dim=512)
+    narrow = SimpleNamespace(head_dim=128, global_head_dim=None)
+    assert resolve_attn_implementation("sdpa", gemma4, True) == ("sdpa", None)
+    assert resolve_attn_implementation("flash_attention_2", narrow, False)[0] == "sdpa"
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == "flash_attn" else object())
+    impl, why = resolve_attn_implementation("flash_attention_2", narrow, True)
+    assert impl == "sdpa" and "not installed" in why
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    impl, why = resolve_attn_implementation("flash_attention_2", gemma4, True)
+    assert impl == "sdpa" and "512" in why
+    assert resolve_attn_implementation("flash_attention_2", narrow, True) == ("flash_attention_2", None)
+
+
+def test_prequantized_dir_detection(tmp_path: Path) -> None:
+    import json
+
+    from pipeline.multi_lora_sft.config import load_config
+    from pipeline.multi_lora_sft.training.model import apply_liger_kernels, is_prequantized_nf4_dir
+
+    assert not is_prequantized_nf4_dir(None)
+    assert not is_prequantized_nf4_dir(tmp_path)
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "bitsandbytes",
+                                                                            "load_in_4bit": True}}))
+    assert not is_prequantized_nf4_dir(tmp_path)  # no weights yet
+    (tmp_path / "model.safetensors").write_bytes(b"x")
+    assert is_prequantized_nf4_dir(tmp_path)
+
+    cfg = load_config(set_overrides=["model.use_liger_kernel=true", f"model.prequantized_path={tmp_path.as_posix()}"])
+    assert cfg.model.use_liger_kernel and cfg.model.prequantized_path == tmp_path.as_posix()
+    assert isinstance(apply_liger_kernels(object()), str)  # never raises, installed or not
