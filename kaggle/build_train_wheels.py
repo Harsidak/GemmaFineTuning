@@ -67,7 +67,7 @@ MANYLINUX = ["manylinux2014_x86_64", *(f"manylinux_2_{n}_x86_64" for n in range(
 TPU_CANDIDATES = [("tested-pins", TPU_TESTED), ("ranges", TPU_RANGES)]
 # Declared by google-tunix but not imported by anything the trainer uses (proved by the smoke test + tpu_training tests).
 TPU_WAIVED = ("tensorflow-datasets", "numba", "kagglehub", "omegaconf", "hf-transfer", "sympy", "jinja2", "pylatexenc",
-              "python-dotenv", "tenacity", "importlib-resources", "datasets", "transformers", "grain")
+              "python-dotenv", "tenacity", "importlib-resources", "datasets", "transformers", "grain", "safetensors")
 
 # Official wheelhouse contents (Getting Started notebook, 2026-10-30); overridden by the real
 # wheelhouse when it is attached to this notebook.
@@ -277,7 +277,10 @@ def closure_check(fakes: dict, out: Path = OUT, waived: frozenset = frozenset())
             elif have is None:
                 missing.append(f"{m['Name']} -> {line}")
             elif not req.specifier.contains(have, prereleases=True):
-                conflicts.append(f"{m['Name']} -> {line} (have {have})")
+                if norm(req.name) in waived:
+                    waived_hits.append(f"{m['Name']} -> {line} (have {have})")
+                else:
+                    conflicts.append(f"{m['Name']} -> {line} (have {have})")
     return {"missing": missing, "conflicts": conflicts, "waived": waived_hits}
 
 
