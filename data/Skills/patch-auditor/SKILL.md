@@ -1,3 +1,8 @@
+---
+name: patch-auditor
+description: Check the pending diff before submit_patch: syntax, stray scratch files, edits to pytest.ini/conftest.py.
+---
+
 # Skill: Pre-Submit Patch & Diff Auditor (`patch_auditor.py`)
 
 ## Objective
@@ -11,7 +16,7 @@ Act as an automated final quality gate before invoking `submit_patch()`, catchin
 
 ## How to Invoke
 ```bash
-python data/Skills/patch_auditor.py --workspace /workspace
+python scripts/patch_auditor.py --workspace /workspace
 ```
 
 ## Output Schema
@@ -33,3 +38,8 @@ Returns JSON:
 
 ## Rule of Thumb
 **Never call `submit_patch()` until `patch_auditor.py` returns `"ready_to_submit": true`!**
+
+## Running it
+Preferred: `run_skill_script` with skill_name `patch-auditor` and file_path `scripts/patch_auditor.py`, passing the arguments below.
+If that tool is unavailable or fails, use `load_skill_resource` to read `scripts/patch_auditor.py`, save it to `/tmp/patch_auditor.py`
+(never inside /workspace), then `run_command`: `python /tmp/patch_auditor.py <arguments>`.

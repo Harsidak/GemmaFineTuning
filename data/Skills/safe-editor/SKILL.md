@@ -1,3 +1,8 @@
+---
+name: safe-editor
+description: Replace text in a Python file and reject the edit if the result does not parse.
+---
+
 # Skill: Resilient Syntax-Validated Editor (`safe_editor.py`)
 
 ## Objective
@@ -12,17 +17,17 @@ Apply surgical code modifications with automatic whitespace tolerance, ambiguity
 
 ### 1. Perform a direct replacement:
 ```bash
-python data/Skills/safe_editor.py --file fastapi/routing.py --old "def foo():" --new "def foo(x=None):"
+python scripts/safe_editor.py --file fastapi/routing.py --old "def foo():" --new "def foo(x=None):"
 ```
 
 ### 2. Dry run check (verify match and AST validity without modifying file):
 ```bash
-python data/Skills/safe_editor.py --file fastapi/routing.py --old "..." --new "..." --dry-run
+python scripts/safe_editor.py --file fastapi/routing.py --old "..." --new "..." --dry-run
 ```
 
 ### 3. Replace using multiline files (best for complex code blocks):
 ```bash
-python data/Skills/safe_editor.py --file rich/console.py --old-file /tmp/old_block.py --new-file /tmp/new_block.py
+python scripts/safe_editor.py --file rich/console.py --old-file /tmp/old_block.py --new-file /tmp/new_block.py
 ```
 
 ## Output Schema
@@ -31,3 +36,8 @@ Returns JSON:
 - `strategy`: `"exact"` or `"flexible_whitespace"`.
 - `diff`: Generated unified diff for verification.
 - `syntax_error_line`: Reported if a syntax error was prevented.
+
+## Running it
+Preferred: `run_skill_script` with skill_name `safe-editor` and file_path `scripts/safe_editor.py`, passing the arguments below.
+If that tool is unavailable or fails, use `load_skill_resource` to read `scripts/safe_editor.py`, save it to `/tmp/safe_editor.py`
+(never inside /workspace), then `run_command`: `python /tmp/safe_editor.py <arguments>`.

@@ -177,8 +177,63 @@ def write_generation_and_eval_configs(cfg: PipelineConfig, submission_dir: Path)
         if existing.is_file():
             data = yaml.safe_load(existing.read_text(encoding="utf-8")) or {}
             minutes = float((data.get("evaluation") or {}).get("max_time_minutes") or 60)
-            if minutes < 5:
+            if minutes < 2:
                 notes.append(f"Template eval_config.yaml caps tasks at {minutes} min; scored runs will be crippled")
+    return notes
+
+
+def default_skills_dir() -> Path | None:
+    data = Path(__file__).resolve().parents[3] / "data"
+    for name in ("skills", "Skills"):  # git tracks data/Skills; Linux (Kaggle) is case-sensitive
+        if (data / name).is_dir():
+            return data / name
+    return None
+
+
+def install_skills(cfg: PipelineConfig, submission_dir: Path) -> list[str]:
+    """Copies `submission.skills` (folders holding SKILL.md) into `skills/` and lists them under `skills:` in the
+    root agent.yaml. A missing skill is skipped with a note; never fails packaging. Returns notes."""
+    sub = cfg.submission
+    if not sub.skills:
+        return []
+    src = Path(sub.skills_dir) if sub.skills_dir else default_skills_dir()
+    if src is None or not src.is_dir():
+        return [f"No skills directory ({sub.skills_dir or '<repo>/data/skills'}); submission ships without skills"]
+    roots = [p for p in (submission_dir / n for n in ("agent.yaml", "agent.yml", "root_agent.yaml", "root_agent.yml"))
+             if p.is_file()]
+    if not roots:
+        return ["No root agent.yaml found; skills not installed"]
+    notes: list[str] = []
+    installed: list[str] = []
+    for name in sub.skills:
+        sdir = src / name
+        if not (sdir / "SKILL.md").is_file():
+            notes.append(f"Skill {name!r} has no SKILL.md under {src}; skipped")
+            continue
+        dst = submission_dir / "skills" / name
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(sdir, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        installed.append(f"skills/{name}")
+    if installed:
+        root = roots[0]
+        text = root.read_text(encoding="utf-8")
+        kept = []
+        skipping = False
+        for line in text.splitlines(keepends=True):  # drop an existing top-level skills: block
+            if re.match(r"^skills\s*:", line):
+                skipping = True
+                continue
+            if skipping and (line.startswith((" ", "\t", "-")) or not line.strip()):
+                continue
+            skipping = False
+            kept.append(line)
+        text = "".join(kept)
+        if not text.endswith("\n"):
+            text += "\n"
+        text += "skills:\n" + "".join(f"  - {p}\n" for p in installed)
+        root.write_text(text, encoding="utf-8")
+        notes.append(f"Installed skills: {', '.join(installed)}")
     return notes
 
 
@@ -506,6 +561,10 @@ def run_package_phase(
         for msg in write_generation_and_eval_configs(cfg, ctx.submission_dir):
             notes.append(msg)
             logger.warning(msg)
+
+        for msg in install_skills(cfg, ctx.submission_dir):
+            notes.append(msg)
+            logger.info(msg)
 
         # 3. Validate staged submission
         validation_info = validate_staged_submission(ctx.submission_dir, expected_served_model=served_id)

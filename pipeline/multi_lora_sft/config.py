@@ -221,9 +221,9 @@ class GenerationSection:
     temperature: float = 0.2
     top_p: float = 0.95
     top_k: int | None = None
-    seed: int | None = None
-    max_output_tokens: int = 16384
-    thinking_budget: int = 4096
+    seed: int | None = 1234  # fixed seed: reproducible scoring
+    max_output_tokens: int = 8192  # each turn is one tool call; long outputs mostly mean truncated edits
+    thinking_budget: int = 2048  # short thinking per turn (harness nudges show long thoughts cut tool calls)
     include_thoughts: bool = True
 
 
@@ -231,10 +231,12 @@ class GenerationSection:
 class EvalBudgetSection:
     """`eval_config.yaml` written into the submission: per-task scorer budgets (HARNESS §7.1)."""
 
-    timeout_seconds: int = 300
-    max_tool_calls: int = 100
-    max_time_minutes: float = 60.0
-    max_turns: int = 500
+    # The scorer's own default is 60 min / 100 calls per task. Across the hidden task set that overran the Kaggle
+    # scoring window (a scoring run ran ~20 h and ended in a submission error), so the defaults are kept tight.
+    timeout_seconds: int = 120
+    max_tool_calls: int = 60
+    max_time_minutes: float = 30.0
+    max_turns: int = 80
 
 
 @dataclass
@@ -250,6 +252,10 @@ class SubmissionSection:
     write_eval_config: bool = True  # overwrite the template's eval_config.yaml (the sample ships 1 min / 10 calls)
     generation: GenerationSection = field(default_factory=GenerationSection)
     eval_budget: EvalBudgetSection = field(default_factory=EvalBudgetSection)
+    # ADK skills (folders with SKILL.md) copied to `skills/` and listed under `skills:` in the root agent.yaml.
+    # skills_dir None -> <repo>/data/skills if it exists; an empty `skills` list ships none.
+    skills_dir: str | None = None
+    skills: list[str] = field(default_factory=lambda: ["code-locator", "repro-runner", "test-runner", "patch-auditor"])
 
 
 @dataclass

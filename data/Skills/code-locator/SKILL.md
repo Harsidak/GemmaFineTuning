@@ -1,3 +1,8 @@
+---
+name: code-locator
+description: Find the source files, symbols and tests most likely involved in an issue, from its keywords. Use first, before reading files.
+---
+
 # Skill: Code & Symbol Locator (`code_locator.py`)
 
 ## Objective
@@ -10,7 +15,7 @@ Quickly pinpoint the exact file, class, and function definitions responsible for
 
 ## How to Invoke
 ```bash
-python data/Skills/code_locator.py --query "<Problem statement or keywords>" --workspace /workspace
+python scripts/code_locator.py --query "<Problem statement or keywords>" --workspace /workspace
 ```
 
 ## Output Schema
@@ -21,7 +26,7 @@ Returns JSON with:
 
 ## Example
 ```bash
-python data/Skills/code_locator.py --query "serialize_response status_code" --workspace /workspace
+python scripts/code_locator.py --query "serialize_response status_code" --workspace /workspace
 ```
 Output:
 ```json
@@ -38,3 +43,8 @@ Output:
 }
 ```
 Use this output to immediately target `ast_reader.py` or `read_file` on lines 135–190.
+
+## Running it
+Preferred: `run_skill_script` with skill_name `code-locator` and file_path `scripts/code_locator.py`, passing the arguments below.
+If that tool is unavailable or fails, use `load_skill_resource` to read `scripts/code_locator.py`, save it to `/tmp/code_locator.py`
+(never inside /workspace), then `run_command`: `python /tmp/code_locator.py <arguments>`.

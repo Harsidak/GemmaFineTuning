@@ -159,3 +159,36 @@ def test_prequantized_dir_detection(tmp_path: Path) -> None:
     cfg = load_config(set_overrides=["model.use_liger_kernel=true", f"model.prequantized_path={tmp_path.as_posix()}"])
     assert cfg.model.use_liger_kernel and cfg.model.prequantized_path == tmp_path.as_posix()
     assert isinstance(apply_liger_kernels(object()), str)  # never raises, installed or not
+
+
+def test_install_skills_copies_folders_and_lists_them(tmp_path):
+    from pipeline.multi_lora_sft.config import PipelineConfig
+    from pipeline.multi_lora_sft.phases.package import install_skills
+
+    src = tmp_path / "skills_src"
+    (src / "code-locator" / "scripts").mkdir(parents=True)
+    (src / "code-locator" / "SKILL.md").write_text("---\nname: code-locator\ndescription: d\n---\n", encoding="utf-8")
+    (src / "code-locator" / "scripts" / "code_locator.py").write_text("print(1)\n", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "agent.yaml").write_text("name: a\nskills:\n  - skills/old\nmodel: m\n", encoding="utf-8")
+    cfg = PipelineConfig()
+    cfg.submission.skills_dir = str(src)
+    cfg.submission.skills = ["code-locator", "missing-one"]
+    notes = install_skills(cfg, sub)
+    text = (sub / "agent.yaml").read_text(encoding="utf-8")
+    assert (sub / "skills" / "code-locator" / "scripts" / "code_locator.py").is_file()
+    assert "skills/old" not in text and text.count("skills:") == 1 and "  - skills/code-locator\n" in text
+    assert "model: m" in text and any("missing-one" in n for n in notes)
+
+
+def test_repo_skills_have_valid_skill_md():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3] / "data" / "skills"
+    if not root.is_dir():
+        import pytest
+        pytest.skip("data/skills not present")
+    for d in (p for p in root.iterdir() if p.is_dir()):
+        head = (d / "SKILL.md").read_text(encoding="utf-8").split("---")[1]
+        assert f"name: {d.name}" in head and "description:" in head

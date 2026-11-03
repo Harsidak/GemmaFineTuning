@@ -1,3 +1,8 @@
+---
+name: ast-reader
+description: Print the exact line span and source of a class or function in a file.
+---
+
 # Skill: AST Code Scope Inspector (`ast_reader.py`)
 
 ## Objective
@@ -12,17 +17,17 @@ Inspect large Python files (1,000–4,500 lines) with high precision, extracting
 
 ### 1. Inspect a specific symbol:
 ```bash
-python data/Skills/ast_reader.py --file fastapi/routing.py --symbol serialize_response
+python scripts/ast_reader.py --file fastapi/routing.py --symbol serialize_response
 ```
 
 ### 2. Inspect scope around a specific line:
 ```bash
-python data/Skills/ast_reader.py --file rich/console.py --line 512 --context 20
+python scripts/ast_reader.py --file rich/console.py --line 512 --context 20
 ```
 
 ### 3. List all functions and classes in a module with line ranges:
 ```bash
-python data/Skills/ast_reader.py --file fastapi/applications.py --list-symbols
+python scripts/ast_reader.py --file fastapi/applications.py --list-symbols
 ```
 
 ## Output Schema
@@ -30,3 +35,8 @@ Returns JSON with:
 - `start_line` / `end_line`: Exact 1-indexed line numbers.
 - `code`: Line-numbered source code for the requested symbol.
 - `enclosing_symbol`: The parent function or class if searching by line number.
+
+## Running it
+Preferred: `run_skill_script` with skill_name `ast-reader` and file_path `scripts/ast_reader.py`, passing the arguments below.
+If that tool is unavailable or fails, use `load_skill_resource` to read `scripts/ast_reader.py`, save it to `/tmp/ast_reader.py`
+(never inside /workspace), then `run_command`: `python /tmp/ast_reader.py <arguments>`.

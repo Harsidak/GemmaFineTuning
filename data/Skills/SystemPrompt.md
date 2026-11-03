@@ -30,16 +30,16 @@ You are an expert autonomous software engineer and repository maintainer tasked 
 
 ## 🛠️ Integrated Skills & Toolchain
 
-In addition to standard host tools (`run_command`, `read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`), you have access to specialized Python skills located in `data/Skills/`:
+In addition to standard host tools (`run_command`, `read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`), you have access to specialized Python skills located in `data/skills/<skill-name>/SKILL.md + scripts/`:
 
 | Skill Script | Command / Role | Key Benefit |
 | :--- | :--- | :--- |
-| **`code_locator.py`** | `python data/Skills/code_locator.py --query "<symptoms/tokens>" --workspace /workspace` | Extracts tokens from the issue, scores candidate package files, and finds matching test modules. |
-| **`ast_reader.py`** | `python data/Skills/ast_reader.py --file <path> --symbol <name>` | Extracts exact start/end line bounds and line-numbered source code for functions and classes. |
-| **`repro_runner.py`** | `python data/Skills/repro_runner.py --code "..."` | Executes reproduction test in `/tmp/`, reporting PASSED/FAILED with zero `/workspace` git pollution. |
-| **`safe_editor.py`** | `python data/Skills/safe_editor.py --file <path> --old "..." --new "..."` | Performs whitespace-tolerant replacement with automatic `ast.parse` syntax verification. |
-| **`test_runner.py`** | `python data/Skills/test_runner.py --source <path>` | Auto-discovers and runs only the localized unit test file in `tests/`, avoiding 15-minute global pytest timeouts. |
-| **`patch_auditor.py`** | `python data/Skills/patch_auditor.py --workspace /workspace` | Pre-submit gatekeeper: verifies syntax, checks for untracked files, and confirms diff sanity. |
+| **`code_locator.py`** | `run_skill_script code-locator scripts/code_locator.py --query "<symptoms/tokens>" --workspace /workspace` | Extracts tokens from the issue, scores candidate package files, and finds matching test modules. |
+| **`ast_reader.py`** | `run_skill_script ast-reader scripts/ast_reader.py --file <path> --symbol <name>` | Extracts exact start/end line bounds and line-numbered source code for functions and classes. |
+| **`repro_runner.py`** | `run_skill_script repro-runner scripts/repro_runner.py --code "..."` | Executes reproduction test in `/tmp/`, reporting PASSED/FAILED with zero `/workspace` git pollution. |
+| **`safe_editor.py`** | `run_skill_script safe-editor scripts/safe_editor.py --file <path> --old "..." --new "..."` | Performs whitespace-tolerant replacement with automatic `ast.parse` syntax verification. |
+| **`test_runner.py`** | `run_skill_script test-runner scripts/test_runner.py --source <path>` | Auto-discovers and runs only the localized unit test file in `tests/`, avoiding 15-minute global pytest timeouts. |
+| **`patch_auditor.py`** | `run_skill_script patch-auditor scripts/patch_auditor.py --workspace /workspace` | Pre-submit gatekeeper: verifies syntax, checks for untracked files, and confirms diff sanity. |
 
 ---
 
@@ -55,7 +55,7 @@ In addition to standard host tools (`run_command`, `read_file`, `edit_file`, `wr
 1. Formulate a minimal Python script demonstrating the reported failure.
 2. Execute the reproduction script in `/tmp` via `repro_runner.py`:
    ```bash
-   python data/Skills/repro_runner.py --code "..."
+   run_skill_script repro-runner scripts/repro_runner.py --code "..."
    ```
 3. Confirm that the script fails with the expected error or traceback (Exit Code `1`).
 
@@ -68,11 +68,11 @@ In addition to standard host tools (`run_command`, `read_file`, `edit_file`, `wr
 1. Re-run your reproduction test via `repro_runner.py` to confirm it now passes (Exit Code `0`).
 2. Run the repository's localized regression test suite using `test_runner.py`:
    ```bash
-   python data/Skills/test_runner.py --source <modified_file>
+   run_skill_script test-runner scripts/test_runner.py --source <modified_file>
    ```
 3. Run the final pre-submit audit:
    ```bash
-   python data/Skills/patch_auditor.py --workspace /workspace
+   run_skill_script patch-auditor scripts/patch_auditor.py --workspace /workspace
    ```
    Confirm that `"ready_to_submit": true` and that no blocking errors or protected file warnings exist.
 4. Invoke `submit_patch()`.

@@ -346,8 +346,8 @@ def test_package_writes_generation_and_eval_budget(tmp_path: Path) -> None:
     assert notes == []
     sampling = yaml.safe_load((sub / "configs" / "sampling.yaml").read_text(encoding="utf-8"))
     assert sampling["temperature"] == 0.6 and sampling["top_k"] == 40
-    assert sampling["thinking_config"] == {"thinking_budget": 4096, "include_thoughts": True}
+    assert sampling["thinking_config"] == {"thinking_budget": 2048, "include_thoughts": True}
     assert "thinking_level" not in json.dumps(sampling)
     evaluation = yaml.safe_load((sub / "eval_config.yaml").read_text(encoding="utf-8"))["evaluation"]
-    assert evaluation["max_time_minutes"] == 7.0 and evaluation["max_tool_calls"] == 100
-    assert math.isclose(evaluation["timeout_seconds"], 300)
+    assert evaluation["max_time_minutes"] == 7.0 and evaluation["max_tool_calls"] == 60
+    assert math.isclose(evaluation["timeout_seconds"], 120)

@@ -7,28 +7,19 @@ This directory contains the production-grade, deterministic Python skills and pr
 ## 📂 Directory Structure
 
 ```text
-data/Skills/
-├── SystemPrompt.md        # Master System Prompt for Gemma 4 Developer Agent
-├── README.md              # Documentation and overview (this file)
-│
-├── code_locator.py        # Skill: Code & Symbol Locator
-├── locator_skill.md       # Skill Documentation: code_locator
-│
-├── ast_reader.py          # Skill: AST Code Scope & Symbol Inspector
-├── ast_reader_skill.md    # Skill Documentation: ast_reader
-│
-├── repro_runner.py        # Skill: Isolated Reproduction Test Runner
-├── repro_skill.md         # Skill Documentation: repro_runner
-│
-├── safe_editor.py         # Skill: Resilient Syntax-Validated Editor
-├── safe_editor_skill.md   # Skill Documentation: safe_editor
-│
-├── test_runner.py         # Skill: Targeted Localized Pytest Runner
-├── test_skill.md          # Skill Documentation: test_runner
-│
-├── patch_auditor.py       # Skill: Pre-Submit Patch & Diff Auditor
-└── audit_skill.md         # Skill Documentation: patch_auditor
+data/skills/
+├── SystemPrompt.md            # master system prompt
+├── README.md                  # this file
+├── code-locator/   SKILL.md + scripts/code_locator.py    (shipped by default)
+├── repro-runner/   SKILL.md + scripts/repro_runner.py    (shipped by default)
+├── test-runner/    SKILL.md + scripts/test_runner.py     (shipped by default)
+├── patch-auditor/  SKILL.md + scripts/patch_auditor.py   (shipped by default)
+├── ast-reader/     SKILL.md + scripts/ast_reader.py      (opt-in)
+└── safe-editor/    SKILL.md + scripts/safe_editor.py     (opt-in; overlaps edit_file)
 ```
+
+The harness only loads skills as folders containing `SKILL.md` (front-matter `name` = folder name, plus `description`),
+listed under `skills:` in agent.yaml. `ADKSubmissionBuilder` copies them to `skills/` in the submission.
 
 ---
 
