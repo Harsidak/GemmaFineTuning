@@ -13,14 +13,16 @@ Python 3.12, managed with `uv` (Windows dev machine; training/inference actually
 ```bash
 uv sync                                                    # install deps (+ dev group: pytest, ruff, ipykernel)
 uv run python pipeline/main.py --action status             # workspace readiness check
-uv run python pipeline/main.py --action train --mode sft --config pipeline/configs/train_lora_sft.yaml
-uv run python pipeline/main.py --action train --mode dpo   # defaults to configs/train_dpo_rl.yaml
-uv run python pipeline/main.py --action evaluate --tasks data/val_tasks.jsonl
+uv run python pipeline/main.py --action train --preset 31b_4x_l4 --dry-run   # multi_lora_sft orchestrator (default mode)
+uv run python pipeline/main.py --action validate-data --train-data <files.jsonl>  # data contract + leakage gate, no GPU
+uv run python pipeline/main.py --action train --mode sft --config pipeline/configs/train_lora_sft.yaml  # legacy trainer
 uv run python pipeline/main.py --action package --model <model> --adapter-path <dir>
+uv run python -m pytest                                    # multi_lora_sft + tpu_training tests (pyproject config), ~3 min CPU
 uv run ruff check pipeline
 ```
 
-`pipeline/main.py` is the only CLI. There is no test suite yet (pytest is installed but no tests exist).
+`pipeline/main.py` is the CLI; `--action train` runs `pipeline.multi_lora_sft.run` (the same orchestrator the Kaggle
+notebook launches). README.md documents presets, the training-data format, outputs and the report.
 
 Real end-to-end evaluation uses the official `swegemma` harness (not installed in `.venv`; offline wheels live in `build/gemma-4-developer-agent/wheels/`):
 

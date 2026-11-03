@@ -29,6 +29,11 @@ EXTRAS = ["optuna>=3.6,<5", "wandb>=0.17,<1", "matplotlib>=3.5", "pandas>=1.5",
           "regex",  # transformers imports it; bundle it in case the target image lacks it
           "psutil", "nvidia-ml-py"]  # run monitor: host CPU/RAM + GPU utilisation/memory/power (pipeline/.../shared/sysmon.py)
 CANDIDATES = [("tested-pins", TESTED + EXTRAS), ("ranges", RANGES + EXTRAS)]
+# Optional GPU speed-ups, fetched best-effort as binary wheels into train_wheels/optional/ (never fails the build and is
+# NOT installed by the notebook: train_wheels/ is installed non-recursively). Install one by hand / in a calibration run
+# and switch it on in the config (flash-attn -> model.attn_implementation=flash_attention_2) only after it is verified
+# on the target image. flash-attn publishes no PyPI binary wheels, so it is usually reported as unavailable.
+OPTIONAL_GPU = [p.strip() for p in os.environ.get("WHEEL_OPTIONAL", "flash-attn,liger-kernel").split(",") if p.strip()]
 
 # ---- TPU bundle (JAX + Tunix). google-tunix declares ~25 dependencies (tensorflow-datasets, numba, kagglehub, ...) of
 # which the trainer imports almost none; installing it with --no-deps plus the import-time set below was verified by
@@ -476,6 +481,20 @@ def add_python_variants(out: Path, pythons: list) -> dict:
     return {"pythons": pythons, "added": added, "missing": missing}
 
 
+def fetch_optional_wheels(out: Path, specs: list) -> dict:
+    """Best-effort `pip download --only-binary` of `specs` (no deps) for the target Python into out/optional/."""
+    opt = out / "optional"
+    opt.mkdir(parents=True, exist_ok=True)
+    got, missing = [], []
+    for spec in specs:
+        r = pip(PY, "download", "--quiet", "--no-deps", "--only-binary=:all:", "--python-version", "%d.%d" % TARGET_PY,
+                "--implementation", "cp", *[a for t in MANYLINUX for a in ("--platform", t)], "-d", str(opt), spec,
+                capture=True, check=False)
+        (got if r.returncode == 0 else missing).append(spec)
+    log(f"optional GPU wheels: fetched {got or 'none'}; unavailable as binary wheels: {missing or 'none'} (in {opt})")
+    return {"fetched": got, "unavailable": missing, "dir": str(opt)}
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -547,6 +566,7 @@ def main() -> None:
         "smoke": chosen["smoke"],
         "attempts": attempts,
     }
+    manifest["optional"] = fetch_optional_wheels(OUT, OPTIONAL_GPU) if OPTIONAL_GPU else {}
     (OUT / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
     (OUT / "requirements.lock.txt").write_text("".join(f"{n}=={v}\n" for n, v in chosen["bundle"]))
     size_mb = sum(w.stat().st_size for w in wheels) / 1e6

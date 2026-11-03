@@ -9,7 +9,7 @@ from pipeline.multi_lora_sft.config import load_config
 
 
 def test_12h_budget_deadlines_add_up() -> None:
-    cfg = load_config(set_overrides=["eval.smoke_tasks=true"])
+    cfg = load_config(set_overrides=["eval.smoke_tasks=true", "budget.eval_min=60"])
     now_val = 1_000_000.0
     clock = SessionClock(cfg, t0=now_val, now_fn=lambda: now_val)
 
@@ -26,11 +26,11 @@ def test_12h_budget_deadlines_add_up() -> None:
 @pytest.mark.parametrize(
     ("sets", "eval_min"),
     [
-        ([], 20.0),  # default: smoke tasks off -> vLLM start-up + parity only (budget.eval_parity_min)
-        (["eval.smoke_tasks=true"], 60.0),  # smoke tasks on -> the full budget.eval_min
-        (["parity.enabled=false"], 0.0),  # nothing to run -> nothing reserved
+        ([], 90.0),  # default: smoke tasks on -> the full budget.eval_min
+        (["eval.smoke_tasks=false"], 20.0),  # smoke tasks off -> vLLM start-up + parity only (budget.eval_parity_min)
+        (["eval.smoke_tasks=false", "parity.enabled=false"], 0.0),  # nothing to run -> nothing reserved
         (["eval.enabled=false", "eval.smoke_tasks=true"], 0.0),
-        (["budget.eval_min=10"], 10.0),  # the parity reserve never exceeds eval_min
+        (["eval.smoke_tasks=false", "budget.eval_min=10"], 10.0),  # the parity reserve never exceeds eval_min
     ],
 )
 def test_eval_reserve_follows_smoke_tasks_switch(sets: list[str], eval_min: float) -> None:
@@ -46,6 +46,7 @@ def test_leftover_time_redistribution_between_adapters() -> None:
         set_overrides=[
             "adapters=[{name: main_lora, roles: [root]}, {name: tool_lora, roles: [code_analyzer]}]",
             "eval.smoke_tasks=true",  # the 60-min eval reserve the numbers below assume
+            "budget.eval_min=60",
         ]
     )
     cur = [0.0]

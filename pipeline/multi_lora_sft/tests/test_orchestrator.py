@@ -164,3 +164,73 @@ def test_subprocess_phase_log_lines_not_duplicated_and_fsdp_launch_flags(
     for h in logging.getLogger().handlers:
         h.flush()
     assert inproc_log.read_text(encoding="utf-8").count("INPROC_MARKER_99") == 1
+
+
+def test_preflight_failure_skips_eval_instead_of_serving_the_bare_model(tmp_path: Path, repo_root: Path) -> None:
+    """2026-11-03: preflight rejected every record, yet eval spent ~6 min starting vLLM to score 0 tasks."""
+    sample_tpl = repo_root / "build" / "gemma-4-developer-agent" / "sample_submission"
+    cfg = load_config(
+        set_overrides=[
+            f"run.output_root={(tmp_path / 'runs').as_posix()}",
+            "run.run_id=orch_preflight_fail",
+            "model.served_model_id=gemma-4-e4b-it-qat-w4a16-ct",
+            f"submission.template_dir={sample_tpl.as_posix()}",
+            "submission.working_zip_path=null",
+            "output.bundle_dir=null",
+        ]
+    )
+    real_builder = default_phase_command_builder(cfg)
+    launched: list[str] = []
+
+    def _cmd_builder(phase: str, ctx: RunContext, deadline: float, extra: dict[str, Any] | None = None) -> list[str]:
+        launched.append(phase)
+        if phase == "setup":
+            return [sys.executable, "-c", "print('ok')"]
+        if phase == "preflight":
+            return [sys.executable, "-c", "import sys; sys.exit(1)"]
+        return real_builder(phase, ctx, deadline, extra)
+
+    orch = Orchestrator(cfg, command_builder=_cmd_builder, poll_interval_sec=0.05)
+    res = orch.run()
+    assert res.exit_code == 1
+    assert "eval" not in launched
+    statuses = {s["phase"]: s for s in orch.ctx.read_all_statuses()}
+    assert statuses["eval"]["state"] == "skipped"
+    assert "No trained adapter" in statuses["eval"]["notes"][0]
+    log = orch.ctx.log_path("orchestrator").read_text(encoding="utf-8")
+    assert "RUN FAILED before training: preflight did not pass" in log
+
+
+def test_checkpoint_cleanup_only_deletes_what_the_bundle_holds(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    cfg = load_config(
+        set_overrides=[
+            f"run.output_root={(tmp_path / 'runs').as_posix()}",
+            "run.run_id=orch_cleanup",
+            "model.served_model_id=gemma-4-e4b-it-qat-w4a16-ct",
+            f"output.bundle_dir={bundle.as_posix()}",
+            "adapters=[{name: main_lora, roles: [root]}, {name: tool_lora, roles: [code_analyzer]}]",
+        ]
+    )
+    orch = Orchestrator(cfg, poll_interval_sec=0.05)
+    orch.ctx.ensure_dirs()
+
+    def make_ckpt(root: Path, step: int) -> Path:
+        d = root / f"step_{step:06d}"
+        d.mkdir(parents=True)
+        (d / "optimizer.pt").write_bytes(b"x" * 4096)
+        (d / "trainer_resume.json").write_text(json.dumps({"global_step": step}), encoding="utf-8")
+        (d / "adapter").mkdir()
+        (d / "adapter" / "adapter_model.safetensors").write_bytes(b"y" * 16)
+        return d
+
+    main_root = orch.ctx.checkpoints_dir / "main_lora"
+    tool_root = orch.ctx.checkpoints_dir / "tool_lora"
+    for st in (10, 20):
+        make_ckpt(main_root, st)
+    newest_tool = make_ckpt(tool_root, 5)
+    (bundle / "main_lora" / "step_000020").mkdir(parents=True)  # bundle holds main_lora's newest; nothing for tool_lora
+
+    orch._free_disk_before_eval()
+    assert not list(main_root.glob("step_*"))
+    assert newest_tool.is_dir()

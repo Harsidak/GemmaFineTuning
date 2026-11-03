@@ -1,10 +1,10 @@
-"""Phase 6 (`eval`): final-hour vLLM parity check + 3-task `swegemma` smoke evaluation.
+"""Phase 6 (`eval`): final-hour vLLM parity check + `eval.num_tasks`-task `swegemma` smoke evaluation (default 5).
 
 Implements design_doc.md §6.2 and §9.1–§9.4:
 - Non-fatal to `submission.zip` (which is already built and verified in Phase 5).
 - Starts `adk_submission.VllmServer` on staged `runs/<run_id>/submission/`.
 - Runs vLLM `/v1/completions` greedy parity check against `parity/<adapter>_hf.json` first (§9.3).
-- Runs 3-task smoke eval (1 task in `calibration` mode) via `swegemma.evaluate.Evaluator` with
+- Runs the smoke eval on `eval.num_tasks` competition tasks (1 in `calibration` mode) via `swegemma.evaluate.Evaluator` with
   `sandbox='subprocess'` and `EventsCompactionConfig`, printing the §9.2 report block and saving `eval/score.json`.
 """
 
@@ -316,6 +316,58 @@ def _start_server_failing_fast(server: Any, logger: Any, poll_sec: float = 5.0) 
         watcher.join(timeout=poll_sec + 1.0)
 
 
+def smoke_task_count(cfg: PipelineConfig) -> int:
+    """Number of smoke tasks: 1 in calibration mode, else `eval.num_tasks`."""
+    return 1 if cfg.run.mode == "calibration" else max(0, int(cfg.eval.num_tasks))
+
+
+def choose_smoke_task_ids(tasks: dict[str, Any], configured: list[str], count: int) -> list[str]:
+    """`configured` ids first (unknown ids are kept so they fail loudly), then deterministic picks from repos not yet
+    covered (sorted ids, one per repo), then any remaining ids, until `count` tasks."""
+    chosen = list(dict.fromkeys(configured))[:count]
+    repos = {getattr(tasks[t], "repo", None) for t in chosen if t in tasks}
+    for tid in sorted(tasks):
+        if len(chosen) >= count:
+            break
+        repo = getattr(tasks[tid], "repo", None)
+        if tid not in chosen and repo not in repos:
+            chosen.append(tid)
+            repos.add(repo)
+    for tid in sorted(tasks):
+        if len(chosen) >= count:
+            break
+        if tid not in chosen:
+            chosen.append(tid)
+    return chosen
+
+
+def format_task_row(idx: int, total: int, row: dict[str, Any]) -> str:
+    """One readable result line per task for the eval log (instead of a raw dict)."""
+    pa = {True: "yes", False: "no"}.get(row.get("patch_applied"), "?")
+    parts = [
+        f"[{idx}/{total}] {row.get('task_id')}: {row.get('result')}",
+        f"patch_applied={pa}",
+        f"turns={row.get('turns') if row.get('turns') is not None else '?'}",
+        f"tool_calls={row.get('tool_calls') if row.get('tool_calls') is not None else '?'}",
+        f"tool_errors={row.get('tool_call_errors') if row.get('tool_call_errors') is not None else '?'}",
+        f"time={_format_duration_mmss(float(row.get('duration_sec') or 0.0))}",
+    ]
+    line = " | ".join(parts)
+    if row.get("error"):
+        line += "\n        error: " + str(row["error"])[:300]
+    return line
+
+
+def write_eval_progress(ctx: RunContext, payload: dict[str, Any]) -> None:
+    """`eval/progress.json`: read by the orchestrator heartbeat to show which task is running. Never raises."""
+    try:
+        path = ctx.eval_score_path.parent / "progress.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({**payload, "ts": time.time()}, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _build_smoke_evaluator(
     ctx: RunContext,
     cfg: PipelineConfig,
@@ -333,17 +385,8 @@ def _build_smoke_evaluator(
     from swegemma.models import load_tasks as load_swe_tasks  # type: ignore[import-not-found]
 
     swe_tasks = {t.instance_id: t for t in load_swe_tasks(Path(cfg.data.tasks_file))}
-    target_count = 1 if cfg.run.mode == "calibration" else 3
-    chosen_ids = list(cfg.eval.task_ids[:target_count])
-    if not chosen_ids:
-        # Deterministic tasks from distinct repos when none are configured
-        seen_repos: set[str] = set()
-        for tid in sorted(swe_tasks):
-            if swe_tasks[tid].repo not in seen_repos:
-                chosen_ids.append(tid)
-                seen_repos.add(swe_tasks[tid].repo)
-                if len(chosen_ids) >= target_count:
-                    break
+    target_count = smoke_task_count(cfg)
+    chosen_ids = choose_smoke_task_ids(swe_tasks, cfg.eval.task_ids, target_count)
 
     sub_eval: dict[str, Any] = {}
     eval_cfg_yaml = ctx.submission_dir / "eval_config.yaml"
@@ -394,18 +437,32 @@ def run_eval_phase(
     cfg: PipelineConfig | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
-    """Runs the final-hour vLLM parity check when `eval.enabled` is True, plus the 3-task smoke eval when
-    `eval.smoke_tasks` is also True."""
+    """Runs the final-hour vLLM parity check when `eval.enabled` is True, plus the `eval.num_tasks`-task smoke eval
+    when `eval.smoke_tasks` is also True."""
     logger = configure_phase_logging(ctx.log_path("eval"))
     t_start = time.time()
     cfg = cfg or load_config(ctx.resolved_config_path)
     smoke = cfg.eval.smoke_tasks
+    notes: list[str] = []
+    if smoke and cfg.eval.enabled:
+        # Only the smoke tasks need the task list and repo snapshots; parity runs without them. Missing inputs
+        # downgrade to parity-only (loudly) instead of losing the parity check too.
+        missing = []
+        if not cfg.data.tasks_file or not Path(cfg.data.tasks_file).is_file():
+            missing.append(f"data.tasks_file not found: {cfg.data.tasks_file}")
+        if not cfg.eval.snapshots_dir or not Path(cfg.eval.snapshots_dir).is_dir():
+            missing.append(f"eval.snapshots_dir not found: {cfg.eval.snapshots_dir}")
+        if missing:
+            smoke = False
+            notes.append("SMOKE TASKS NOT RUN (" + "; ".join(missing) + "): parity check only. Attach the "
+                         "competition data (tasks.jsonl + snapshots/) to score tasks.")
+            logger.error(notes[-1])
 
     skip_reason = None
     if not cfg.eval.enabled:
         skip_reason = "eval.enabled is False"
     elif not smoke and not cfg.parity.enabled:
-        skip_reason = "eval.smoke_tasks and parity.enabled are both False: nothing to run"
+        skip_reason = "no smoke tasks to run and parity.enabled is False: nothing to run"
     if skip_reason is not None:
         t_end = time.time()
         status = PhaseStatus(
@@ -418,13 +475,12 @@ def run_eval_phase(
             planned_deadline=utc_iso(deadline) if deadline else None,
             planned_deadline_ts=deadline,
             actual_duration_sec=round(t_end - t_start, 2),
-            notes=[skip_reason],
+            notes=[*notes, skip_reason],
         )
         ctx.write_status(status)
         logger.info("Eval phase skipped (%s)", skip_reason)
         return status.to_dict()
 
-    notes: list[str] = []
     parity_results: dict[str, dict[str, Any]] = {}
     task_rows: list[dict[str, Any]] = []
     server = None
@@ -440,13 +496,7 @@ def run_eval_phase(
         litellm.drop_params = True
         served_id = cfg.effective_served_model_id()
         served_model_path = cfg.model.served_path or served_id
-        if smoke:
-            # Only the smoke tasks need the task list and repo snapshots; parity runs without them.
-            if not cfg.data.tasks_file or not Path(cfg.data.tasks_file).is_file():
-                raise FileNotFoundError(f"data.tasks_file not found: {cfg.data.tasks_file}")
-            if not cfg.eval.snapshots_dir or not Path(cfg.eval.snapshots_dir).is_dir():
-                raise FileNotFoundError(f"eval.snapshots_dir not found: {cfg.eval.snapshots_dir}")
-        else:
+        if not smoke:
             notes.append("Smoke tasks skipped (eval.smoke_tasks=false): vLLM start-up + parity check only")
             logger.info(notes[-1])
 
@@ -510,9 +560,14 @@ def run_eval_phase(
         if hasattr(adk_submission, "install_litellm_reasoning_patch"):
             adk_submission.install_litellm_reasoning_patch()
 
+        write_eval_progress(ctx, {"stage": "vllm_start", "current": 0, "total": len(chosen_ids)})
+        t_vllm = time.time()
         logger.info("Starting VllmServer for %s (adapters=%s)", served_id, sorted(served_adapters))
         _start_server_failing_fast(server, logger)
         api_base = f"http://{cfg.eval.vllm.host}:{cfg.eval.vllm.port}/v1"
+        vllm_ready_sec = round(time.time() - t_vllm, 1)
+        logger.info("vLLM ready after %.0f s", vllm_ready_sec)
+        write_eval_progress(ctx, {"stage": "parity", "current": 0, "total": len(chosen_ids)})
 
         # 1. Parity check (§9.3 — runs first before tasks)
         if cfg.parity.enabled:
@@ -562,8 +617,18 @@ def run_eval_phase(
                     notes.append(f"PARITY SUSPECT on {spec.name}: {pres['recommendation']}")
                     logger.warning("PARITY SUSPECT on %s: %s", spec.name, pres)
 
-        # 2. Smoke evaluation on 3 fixed tasks (1 task in calibration mode) (§9.2)
+        # 2. Smoke evaluation on `eval.num_tasks` fixed tasks (1 task in calibration mode) (§9.2)
+        if chosen_ids:
+            logger.info(
+                "Smoke eval: %d task(s) from %s (NOT a leaderboard estimate): %s",
+                len(chosen_ids), cfg.data.tasks_file, ", ".join(chosen_ids),
+            )
         for idx, tid in enumerate(chosen_ids, start=1):
+            write_eval_progress(ctx, {
+                "stage": "tasks", "current": idx, "total": len(chosen_ids), "task_id": tid,
+                "task_started_ts": time.time(),
+                "done": {k: sum(1 for r in task_rows if r["result"] == k) for k in ("PASS", "FAIL", "TIMEOUT")},
+            })
             if deadline is not None and time.time() >= deadline:
                 task_rows.append(
                     {
@@ -600,8 +665,13 @@ def run_eval_phase(
                     "duration_sec": round(time.time() - t0_task, 2),
                     "error": f"{type(task_exc).__name__}: {task_exc}",
                 }
-            logger.info("  -> %s", row)
+            logger.info("%s", format_task_row(idx, len(chosen_ids), row))
+            logger.debug("raw task row: %s", row)
             task_rows.append(row)
+        write_eval_progress(ctx, {
+            "stage": "done", "current": len(task_rows), "total": len(chosen_ids),
+            "done": {k: sum(1 for r in task_rows if r["result"] == k) for k in ("PASS", "FAIL", "TIMEOUT")},
+        })
 
         banner = format_smoke_eval_banner(
             served_model_id=served_id,
@@ -617,7 +687,9 @@ def run_eval_phase(
         n_tasks = len(task_rows)
         cp_lo, cp_hi = clopper_pearson_interval(passed_cnt, n_tasks)
         score_payload = {
-            "disclaimer": "Smoke eval verifies adapter loading, end-to-end execution, and patch application; a 3-task sample cannot rank models.",
+            "disclaimer": f"Smoke eval verifies adapter loading, end-to-end execution, and patch application; a {n_tasks}-task sample cannot rank models.",
+            "tasks_file": cfg.data.tasks_file,
+            "vllm_ready_sec": vllm_ready_sec,
             "served_model_id": served_id,
             "smoke_tasks": smoke,
             "tasks_evaluated": n_tasks,

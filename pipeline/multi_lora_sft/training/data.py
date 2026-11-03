@@ -95,7 +95,7 @@ def normalize_patch_diff(patch: str) -> str:
 def extract_trajectory_patches(traj: dict[str, Any]) -> list[str]:
     """Extracts candidate final unified diffs from a trajectory record and its messages."""
     patches: list[str] = []
-    for key in ("patch", "submitted_patch", "agent_patch", "git_diff", "diff"):
+    for key in ("patch", "final_patch", "submitted_patch", "agent_patch", "git_diff", "diff"):
         val = traj.get(key)
         if isinstance(val, str) and val.strip():
             patches.append(val)

@@ -131,6 +131,7 @@ def test_orchestrator_heartbeat_system_samples_and_health_report(tmp_path: Path,
     assert len(sys_rows) >= 2 and all("disk_free_gib" in r for r in sys_rows)
 
     report = res.report_path.read_text(encoding="utf-8")
-    assert "## 5. Training Health & Resources" in report
+    assert "## 6. Training Health & Resources" in report
+    assert "## Diagnosis & Next Steps" in report and "## 4. Learning Curves" in report
     assert "2.5000 → 1.9000 ↓" in report
     assert "**Resources**" in report

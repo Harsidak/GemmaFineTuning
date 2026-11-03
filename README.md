@@ -1,154 +1,301 @@
 # GemmaFineTuning
 
-**An autonomous software engineering developer agent and post-training pipeline powered by Google's Gemma 4 model family for the [Kaggle Gemma 4 Developer Agent Competition](https://www.kaggle.com/competitions/gemma-4-developer-agent/overview).**
+Fine-tune Gemma 4 into a SWE-bench-style coding agent and package it for the
+[Kaggle Gemma 4 Developer Agent competition](https://www.kaggle.com/competitions/gemma-4-developer-agent/overview).
 
-`GemmaFineTuning` provides a unified, production-grade workspace to train, evaluate, and package autonomous coding agents under strict competition constraints: declarative ADK schemas, closed host registries, 1-GPU offline inference, and Pass@1 resolution benchmarks.
+You give the pipeline **agent trajectories** (JSONL conversations in which an agent fixes a bug with the competition's 9
+tools). In one time-budgeted session it trains LoRA adapters on them, exports them for the served model, builds a
+validated **`submission.zip`** (declarative ADK agent: YAML + prompts + `.safetensors`), scores it on a few competition
+tasks, and writes a **`REPORT.md`** that says what happened and what to do next.
+
+```
+setup -> preflight -> train:<adapter>... -> export -> package -> eval -> report
+ deps     data +       LoRA / QLoRA          bf16      zip +     vLLM +    REPORT.md
+ GPUs     leakage      (OOM fallbacks,       safe-     3 vali-   parity +  diagnosis,
+ models   gate         resume, best ckpt)    tensors   dators    5 tasks   curves
+```
+
+Every phase runs in its own subprocess under a hard deadline counted from the session start, so a hang or crash in
+one phase never costs the zip: `package` and `report` always run.
 
 ---
 
-## ⚡ Quickstart
+## 1. Quick start
+
+### Local machine (one CUDA GPU, >= 16 GiB)
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-# 1. Sync the environment and install dependencies
-uv sync
+uv sync                                                    # dependencies (+ dev: pytest, ruff)
+uv run python -m pytest                                    # ~3 min, CPU only: the whole pipeline on a tiny Gemma-4 fixture
 
-# 2. Check workspace readiness & status
-uv run python pipeline/main.py --action status
+# 1. Check your data (no GPU needed). Fix every ERROR before training.
+uv run python pipeline/main.py --action validate-data --preset local_single_gpu --train-data data/my_trajectories.jsonl
 
-# 3. Evaluate baseline zero-shot agent on validation tasks
-uv run python pipeline/main.py --action evaluate --tasks data/val_tasks.jsonl
+# 2. Validate the full config without starting anything.
+uv run python pipeline/main.py --action train --preset local_single_gpu --dry-run --train-data data/my_trajectories.jsonl
 
-# 4. Package declarative submission bundle
-uv run python pipeline/main.py --action package --model gemma-4-12b-it
+# 3. Train -> export -> package -> eval -> report.
+uv run python pipeline/main.py --action train --preset local_single_gpu \
+  --train-data data/my_trajectories.jsonl \
+  --base-model /models/gemma-4-e4b-it-qat-q4_0-unquantized \
+  --set model.served_path=/models/gemma-4-e4b-it-qat-w4a16-ct
 ```
 
----
+Results land in `runs/<UTC date>_<name>/` (`REPORT.md`, `submission.zip`, logs, metrics). Paths that default to
+`/kaggle/...` are rewritten to repo-local ones automatically when not on Kaggle (`runs/`, `build/submission.zip`,
+`build/gemma-4-developer-agent/tasks.jsonl`); set `MLSFT_PLATFORM=kaggle|local` to force either.
 
-## 📁 Repository Architecture
+The eval phase needs vLLM and the competition harness (`swegemma`, `adk_submission`; offline wheels in
+`build/gemma-4-developer-agent/wheels/`). Without them, add `--set eval.enabled=false`.
 
-```text
-GemmaFineTuning/
-├── .agents/                              # Competition rules, scoring criteria & ADK constraints
-│   └── rules.md                          # Official technical spec, tool schemas & winning playbook
-├── resources/                            # Research knowledge base & paper index (clean in Git)
-│   ├── INDEX.md                          # Literature catalogue (arXiv IDs, priorities & takeaways)
-│   ├── initial_data_inspection.md        # Comprehensive dataset EDA & SWE-bench analysis
-│   ├── _TEMPLATE.meta.yaml               # Sibling metadata schema for papers, blogs & repos
-│   ├── papers/                           # Local PDF storage (gitignored)
-│   ├── web/                              # Scraped reference guides & blogs (gitignored)
-│   └── repos/                            # Cloned reference implementations (gitignored)
-├── planning/                             # Competition roadmaps & failure post-mortems (gitignored)
-│   ├── MISTAKES.md                       # Root Cause Analysis log & pre-flight checklist
-│   └── ROADMAP.md                        # Milestone gates (baseline -> multi-agent -> scaling)
-├── scripts/                              # Top-level engineering utilities & automation helpers
-│   └── README.md                         # Guide for custom CLI and Kaggle automation scripts
-├── kaggle/                               # Interactive launcher notebooks (run locally or on Kaggle)
-│   ├── 00_master_pipeline_launcher.ipynb # Central controller (status, train, eval, package)
-│   ├── 01_dataset_and_model_card.ipynb   # Dataset inspection & Gemma 4 Model Card launcher
-│   ├── 02_agent_evaluation.ipynb         # Local simulation harness & Pass@1 evaluation launcher
-│   └── 03_vllm_submission_packager.ipynb # vLLM offline serving & submission packaging launcher
-├── pipeline/                             # Complete modular engine (uploadable as a Kaggle Dataset)
-│   ├── main.py                           # Unified pipeline coordinator & CLI entrypoint
-│   ├── configs/                          # Training & evaluation configuration files
-│   │   ├── train_lora_sft.yaml           # SFT LoRA fine-tuning hyperparameters
-│   │   └── train_dpo_rl.yaml             # Trajectory preference optimization config
-│   ├── multi_lora_sft/                   # Time-budgeted multi-LoRA SFT pipeline (see design_doc.md)
-│   └── src/                              # Core engine implementation
-│       ├── agent/                        # Declarative ADK builder, prompts & tool interfaces
-│       ├── data/                         # Trajectory loaders, task samplers & processors
-│       ├── eval/                         # Local sandbox evaluator & Pass@1 metric calculator
-│       ├── models/                       # Gemma 4 QLoRA loaders & PEFT configs
-│       ├── training/                     # SFT and DPO training loops
-│       └── utils/                        # Packager validator & vLLM server helpers
-├── experiments/                          # Strict empirical experiment tracking
-│   ├── tracker.md                        # Master experiment leaderboard and run index
-│   ├── template.yaml                     # Machine-readable experiment schema
-│   ├── template.md                       # Human-readable experiment review (hypothesis, RCA, verdict)
-│   └── exp_000_baseline/                 # Zero-shot baseline reference run
-│       ├── config.yaml                   # Frozen baseline configuration
-│       └── notes.md                      # Baseline execution review & Pass@1 result
-├── data/                                 # Evaluation benchmark and training datasets
-│   ├── val_tasks.jsonl                   # Held-out validation benchmark tasks (SWE-bench format)
-│   └── train_trajectories.jsonl          # Fine-tuning trajectory samples
-├── build/                                # Staging directories and compiled artifacts
-│   ├── submission_staging/               # Scaffolding directory for declarative ADK files
-│   └── gemma-4-developer-agent/          # Competition harness snapshots and sample submissions
-├── submission.zip                        # Packaged competition submission bundle (gitignored)
-├── CLAUDE.md                             # Agent operating spec & engineering rules
-├── LICENSE                               # Apache License 2.0
-├── pyproject.toml                        # Project dependencies and uv environment specification
-├── uv.lock                               # Exact locked dependency tree (gitignored)
-├── requirements.txt                      # Alternative pip-compatible dependency file
-├── .gitignore                            # Clean Git exclusion rules
-└── README.md                             # Master repository documentation
+### Kaggle (the real runs)
+
+The notebook `kaggle/multi_lora_sft.ipynb` is the launcher. It detects the hardware, finds the attached models and
+data under `/kaggle/input`, applies the preset, validates the config in-process and only then starts the
+orchestrator. Edit the `RUN` cell (`preset`, `clock_hours`, `smoke_tasks`, ...) and run all cells, or push it from your
+machine:
+
+```bash
+uv run scripts/kaggle_push.py -multi_lora_sft --hours 11      # 31B on 4x L4 (internet off)
+uv run scripts/kaggle_push.py -tpu --hours 2                  # E4B on TPU v5e-8
 ```
 
----
+Kaggle imports this repo from a Kaggle **dataset**, not from git: publish a new version of the repo dataset before every
+launch. `pipeline/multi_lora_sft/README.md` covers `kaggle_push.py`, wheelhouses, and carrying checkpoints across
+sessions.
 
-## 🎯 Competition Constraints & Principles
+### Presets
 
-1. **Strictly Declarative (`adk-submission`)**:  
-   Submissions must feature `agent.yaml` at the root of `submission.zip`. **No arbitrary Python entrypoints** (`agent.py`) are permitted. Custom multi-turn workflows operate via the **Agent-as-a-Tool** (`agent_tool`) sub-agent pattern.
-2. **Model Consistency Rule**:  
-   All root agents and sub-agents in a single package **must target the identical Gemma 4 base variant** (e.g. `gemma-4-31b-it-qat-w4a16-ct` or `gemma-4-12b-it`).
-3. **Closed Tool Registries**:  
-   Tools are restricted to host primitives: `run_command`, `read_file`, `edit_file`, `write_file`, `get_status`, `code_graph_search`, and `submit_patch`.
-4. **"Seeing Before Patching"**:  
-   The primary failure mode of LLM agents is hallucinating edit locations. The agent utilizes dedicated sub-agents:
-   * **`code_localizer`**: AST & graph search to identify exact fault lines before modifying code.
-   * **`patch_engineer`**: Minimal diff synthesis avoiding unintended refactors.
-   * **`test_verifier`**: Targeted unit test execution and regression checking.
-5. **Offline & Budget Guardrails**:  
-   Evaluation runs strictly offline on a single Kaggle GPU with a 9–12 hour wall-clock budget. All tests enforce strict timeouts to prevent command hangs.
+| `--preset` | Config | Model / method | Hardware |
+| :--- | :--- | :--- | :--- |
+| `31b_4x_l4` (default) | `configs/31b_full.yaml` | 31B NF4 QLoRA, FSDP: all 4 GPUs train at once | Kaggle 4x L4 |
+| `e4b_4x_l4` | `configs/e4b_full.yaml` | E4B bf16 LoRA, DDP | Kaggle 4x L4 |
+| `e4b_tpu` | `configs/e4b_tpu.yaml` | E4B bf16 LoRA, Tunix (JAX) | Kaggle TPU v5e-8 |
+| `e4b_calibration` | `configs/e4b_calibration.yaml` | 30-min E4B speed / memory check | 4x L4 |
+| `local_single_gpu` | `configs/local_single_gpu.yaml` | E4B NF4 QLoRA, one GPU, 4 h | your workstation |
 
----
-
-## 🔬 Experimentation Workflow
-
-To iterate rapidly and maintain scientific rigor:
-
-1. **Plan & State Hypothesis**: Create a new experiment folder `experiments/exp_<ID>_<name>/`.
-   * Fill out `hypothesis.md` with the mechanism, predicted Pass@1 delta, and explicit kill criteria before running code.
-2. **Fine-Tune Adapter**:
-   ```bash
-   uv run python pipeline/main.py --action train --mode sft --config pipeline/configs/train_lora_sft.yaml
-   ```
-3. **Evaluate on Held-Out Tasks**:
-   ```bash
-   uv run python pipeline/main.py --action evaluate --tasks data/val_tasks.jsonl
-   ```
-4. **Log Root Cause Analysis & Verdict**:
-   * Record failure modes and tool error breakdowns in `notes.md`.
-   * Update the master leaderboard in [experiments/tracker.md](experiments/tracker.md).
-   * Document any unexpected runtime hangs or crashes in [planning/MISTAKES.md](planning/MISTAKES.md).
-5. **Package & Validate**:
-   ```bash
-   uv run python pipeline/main.py --action package --model gemma-4-12b-it
-   ```
+Configs live in `pipeline/multi_lora_sft/configs/`; every key not set there comes from `base.yaml` / `config.py`
+defaults. (The notebook calls `31b_4x_l4` `31b_gpu_full` and `e4b_4x_l4` `e4b_gpu_full`.)
 
 ---
 
-## 🚀 Kaggle Launcher Pattern
+## 2. Training data format
 
-When submitting or iterating on Kaggle, upload the `pipeline/` directory as a Kaggle Dataset (e.g., `/kaggle/input/gemma-agent-pipeline/pipeline`). The launcher automatically detects the pipeline location and exposes the API:
+One JSON object per line (`.jsonl`); any number of files. Each record is **one agent run on one task**, in the
+OpenAI chat format with tool calls. Check files with `scripts/validate_dataset.py` (or `--action validate-data`): it
+lists every problem, shows what each adapter would train on, and runs the same benchmark-leakage gate as preflight.
 
-```python
-from pipeline.main import PipelineRunner
-
-runner = PipelineRunner()
-runner.status()                                    # Inspect environment & datasets
-runner.evaluate(tasks_path="data/val_tasks.jsonl") # Test agent and calculate Pass@1
-runner.package(model_name="gemma-4-12b-it")       # Generate validated submission.zip
-```
-
-## Citation:
-@misc{harsidak_singh_2026,
-	title={GemmaFineTuning},
-	url={https://www.kaggle.com/dsv/21381276},
-	DOI={10.34740/KAGGLE/DSV/21381276},
-	publisher={Kaggle},
-	author={Harsidak Singh},
-	year={2026}
+```json
+{
+  "task_id": "fastapi__fastapi-1365",
+  "agent": "root",
+  "repo": "fastapi/fastapi",
+  "resolved": true,
+  "final_patch": "diff --git a/fastapi/routing.py b/fastapi/routing.py\n...",
+  "messages": [
+    {"role": "system", "content": "You are a software engineering agent ..."},
+    {"role": "user", "content": "<issue text>"},
+    {"role": "assistant", "reasoning": "The traceback points at routing.py ...", "content": "",
+     "tool_calls": [{"id": "call_1", "type": "function",
+                     "function": {"name": "read_file", "arguments": {"path": "fastapi/routing.py"}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": "<file contents>"},
+    {"role": "assistant", "content": "",
+     "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "submit_patch", "arguments": {}}}]},
+    {"role": "tool", "tool_call_id": "call_2", "name": "submit_patch", "content": "{\"ok\": true}"}
+  ]
 }
+```
+
+| Field | Required | Meaning |
+| :--- | :--- | :--- |
+| `task_id` (or `instance_id`) | **yes** | Task identifier. The train/val split is by task, so all runs of one task stay on one side. |
+| `messages` | **yes** | Non-empty list. Roles: `system`, `user`, `assistant` (or `model`), `tool` (`developer` also accepted). |
+| `agent` | **yes** | Which agent of the submission produced this run: `root` (main agent) or a sub-agent name such as `code_analyzer`. Each adapter trains only on records whose `agent` is in its `roles` (`main_lora` → `[root]`). A record without it is never trained on. |
+| `resolved` | no (default `true`) | `false` records are dropped while `data.successful_only=true`. |
+| `repo`, `base_commit` | no | Used by the leakage gate: a training run on the same repo **and** commit as a held-out task fails preflight. |
+| `final_patch` / `patch` | no | The submitted diff; a diff identical to a held-out task's gold patch fails preflight. |
+| `tools` | no | Tool schemas shown to the model; default = the tools the template gives that agent role. |
+| anything else | no | Kept in your files, ignored by training (`split`, `teacher`, `verification`, ...). |
+
+**Messages**
+
+* `assistant` turns are what the model learns (only their tokens carry loss; the rest is context). A record needs at
+  least one. `reasoning` (or `reasoning_content`) is the thinking text; it is rendered before the tool call.
+* `tool_calls[i].function.name` should be one of the 9 harness tools: `run_command`, `submit_patch`, `get_status`,
+  `read_file`, `edit_file`, `write_file`, `search_similar_code`, `get_code_neighbors`, `get_code_subgraph`.
+  `arguments` is a JSON object (or a JSON string of one).
+* `tool` messages carry the tool's output, with `name` and the `tool_call_id` of the call they answer.
+
+**What preflight does to your data** (counts are in `REPORT.md` §2)
+
+* Renders each record with the served model's chat template and tokenizes it. Records longer than
+  `train.max_seq_length` (16,384 tokens on 31B) are **dropped, not truncated**, as are records that do not render, have
+  no trainable tokens, or are exact duplicates.
+* Splits off ~5 % of tasks (`data.val_fraction`, max `data.val_max_examples`) as validation.
+* **Fails the run** if any record is a held-out competition task (`task_id`, `repo`+`base_commit`, or gold patch match
+  against `tasks.jsonl`). Same repo at a different commit is only a warning.
+* An adapter with 0 matching records is skipped and its submission slot ships the bare base model; if **no** adapter
+  has data, preflight fails and nothing is trained.
+
+**Common errors**
+
+| Validator / preflight message | Fix |
+| :--- | :--- |
+| `missing 'agent'` / `record(s) are missing the required 'agent' field and 0 matched` | Add `"agent": "root"` to each record produced by the main agent. |
+| `adapter 'tool_lora' ... matches 0 records` | No `code_analyzer` data: fine (slot ships bare), or remove the adapter from the config. |
+| `BENCHMARK LEAKAGE` | Remove those records. Never train on the competition's `tasks.jsonl` tasks. |
+| `no assistant/model turn` | The record has nothing to learn from. |
+| `tool_call arguments are not a JSON object` | Write `arguments` as an object (or a valid JSON string). |
+
+---
+
+## 3. What a run produces
+
+```
+runs/<run_id>/
+  REPORT.md               start here (section 4 below)
+  submission.zip          the deliverable (also copied to submission.working_zip_path)
+  submission/             the unzipped submission: agent.yaml, sub_agents/, configs/, adapters/<slot>/
+  manifest.json           everything machine-readable: config hash, git sha, phase outputs, eval score
+  resolved_config.yaml    the exact config this run used
+  logs/<phase>.log        full output of each phase subprocess (orchestrator.log = the notebook stream)
+  status/<phase>.json     state, timings, error and notes per phase
+  metrics/<adapter>.jsonl       one row per logged optimizer step: loss, grad_norm, lr, tokens/s, memory
+  metrics/<adapter>_val.jsonl   validation loss per evaluation
+  metrics/system.jsonl          CPU / RAM / disk / GPU (or TPU) samples every 30 s
+  plots/<adapter>_curves.png    loss + val loss, grad norm, lr, tokens/s
+  preflight/report.json   data counts, token stats, leakage report
+  checkpoints/<adapter>/  step_N (resumable), best_adapter/, final_adapter/  (removed before eval once bundled)
+  adapters/<adapter>/     exported, served-model-ready LoRA
+  eval/score.json         smoke-eval tasks, Pass@1, per-task rows; eval/results/ = harness transcripts
+```
+
+Exit code: `0` = zip built and setup + preflight passed (eval failures do not fail the run), `1` = setup or preflight
+failed (a bare-model zip is still built), `2` = packaging failed.
+
+---
+
+## 4. Reading the results
+
+**While it runs**, the notebook / terminal prints a heartbeat every 3 minutes: phase and session time left, step /
+epoch / ETA, loss with its trend, grad norm, lr, tokens/s, GPU utilisation and memory, free disk. During eval it shows
+`task 2/5 <task_id> running 4:10 | done PASS 1 FAIL 0 TIMEOUT 0`. A failure before training ends the run with a boxed
+`RUN FAILED before training` message naming the phase and error.
+
+**`REPORT.md`**
+
+| Section | Answers |
+| :--- | :--- |
+| Diagnosis & Next Steps | Everything that went wrong or is worth acting on, most severe first, each with a concrete next step (over-fitting, unused time budget, failed phase, patches not applying, disk, W&B offline, ...). |
+| 1. Phase Timeline | Each phase's state, actual vs planned seconds, notes (e.g. base-model load time). |
+| 2. Preflight & Data Contract | Records loaded / dropped and why, train/val split, token lengths, leakage result. |
+| 3. Adapter Training, Export & Packaging | Steps, epochs, train / val loss, dead-LoRA check, parity, which source each zip slot used. |
+| 4. Learning Curves | Validation loss per evaluation next to the train loss, best point marked, plus the PNG. |
+| 5. Smoke Evaluation | Pass@1, patch-applied rate, timeouts, tool-call errors, turns, per-task table. |
+| 6. Training Health & Resources | Loss first → last, grad-norm range, NaN skips, tokens/s, peak memory, CPU/RAM/GPU/disk peaks. |
+
+**Smoke eval.** After packaging, the eval phase serves the zip with vLLM exactly as the scorer does, checks that the
+LoRA changes greedy outputs the way the HF model did (parity), then runs `eval.num_tasks` (default **5**) tasks from
+the competition `tasks.jsonl` through the official `swegemma` harness. It catches broken adapters, tool-call format
+problems and patches that do not apply. Five tasks cannot rank two models (95 % interval on 2/5 is 5-85 %): compare
+models on validation loss and larger evaluation runs. Choose tasks with `eval.task_ids`; the rest are picked
+deterministically from distinct repos. Eval is skipped (with the reason in the report) when no adapter was trained
+(`eval.allow_bare=true` to evaluate the base model anyway) or less than `eval.min_free_disk_gib` is free.
+
+**W&B** logs online when a `WANDB_API_KEY` Kaggle Secret exists and the machine has internet, else offline into the
+run directory (`kaggle_push.py ... -output` uploads it). The key is only read from the environment.
+
+---
+
+## 5. Configuration
+
+Precedence: `config.py` defaults < `base.yaml`-style preset YAML < `--set key=value` (YAML-parsed, repeatable).
+
+```bash
+--set train.lr=2e-4 --set 'data.train_files=["a.jsonl","b.jsonl"]' --set 'adapters=[{name: main_lora, roles: [root]}]'
+```
+
+| Key | Default (31B) | What it does |
+| :--- | :--- | :--- |
+| `budget.session_hours` | 12 | Wall clock for the whole session; training gets what export / package / eval / safety margin leave. Notebook: `RUN["clock_hours"]`. |
+| `train.max_epochs` / `train.max_steps` | 2 / none | Stop conditions (the time budget also stops training, with a proper LR decay). |
+| `train.lr`, `lora.r`, `lora.alpha` | 1e-4, 32, 64 | Optimiser and adapter size. |
+| `train.max_seq_length` | 16384 | Longer records are dropped. OOM fallbacks (`train.oom_fallbacks`) retry shorter / other parallelism. |
+| `train.val_every_steps` | 8 | Validate every N optimizer steps (plus every `train.val_every_min`). The best-val checkpoint is shipped (`train.select_best`). |
+| `train.log_every_steps` | 1 | Metrics row frequency. |
+| `adapters` | `main_lora` → `[root]` | One LoRA per entry, trained on records whose `agent` is in `roles`; `overrides` change lora/train per adapter. |
+| `eval.smoke_tasks`, `eval.num_tasks`, `eval.task_ids` | true, 5, [] | Competition tasks scored after packaging. |
+| `eval.enabled` | true | false = no vLLM step at all (TPU / no harness). |
+| `submission.generation.*`, `submission.eval_budget.*` | | Decoding settings and per-task budgets written into the zip. |
+| `run.resume_from`, `resume.*`, `output.bundle_dir` | | Continue from a checkpoint / a previous session's bundle. |
+| `tuning.enabled` | false | Optuna search over short real trials instead of a training run. |
+
+Every key, its validation and its default is in `pipeline/multi_lora_sft/config.py`; the design rationale is in
+`pipeline/multi_lora_sft/design_doc.md`.
+
+---
+
+## 6. Troubleshooting
+
+| Symptom | Cause / fix |
+| :--- | :--- |
+| `RUN FAILED before training: preflight did not pass` | Data contract: run `scripts/validate_dataset.py` on the same files; see `logs/preflight.log`. |
+| `train:<adapter>` failed with OOM after all fallbacks | Lower `train.max_seq_length`, or `train.parallelism=model_split` on 31B. |
+| Loss NaN / run aborted to last checkpoint | Lower `train.lr`; check for corrupt records. |
+| `Eval skipped: No trained adapter was exported` | Something earlier failed; the report's diagnosis names it. |
+| `SMOKE TASKS NOT RUN (... snapshots_dir not found)` | Attach the competition dataset (it provides `tasks.jsonl` and `snapshots/`). |
+| vLLM fails at startup on 31B | Keep `eval.vllm.max_num_seqs` at 32 and `gpu_memory_utilization` <= 0.90. |
+| Free disk low | `train.keep_checkpoints=1`; checkpoints already in the bundle are deleted before eval. |
+| Kaggle run uses old code | Publish a new version of the repo dataset; the run's git sha is in `REPORT.md`. |
+
+---
+
+## 7. Competition rules that shape the pipeline
+
+From `build/gemma-4-developer-agent/HARNESS_README.md` (authoritative):
+
+* The submission is **declarative**: root `agent.yaml`, prompts, sub-agents via `agent_tool`, optional LoRA
+  `.safetensors`. No Python entrypoints; allowed extensions `.yaml .yml .md .txt .json .safetensors` (`.py` only in skills).
+* Allowed models: `gemma-4-{31b,12b,e4b,e2b}-it-qat-w4a16-ct`, **one** model for the root and every sub-agent.
+* Tools: the 9 listed in section 2. Unpacked submission < 3 GiB; `max_output_tokens`, `thinking_budget` <= 32,768.
+* Score: Pass@1, the patch is applied to a clean clone and hidden tests must pass.
+
+---
+
+## 8. Development
+
+```bash
+uv run python -m pytest                      # pipeline/multi_lora_sft/tests + tpu_training/tests (configured in pyproject.toml)
+uv run python -m pytest -k orchestrator      # a subset
+uv run ruff check pipeline tpu_training
+```
+
+The tests run every phase for real on CPU with a tiny Gemma-4 checkpoint (FSDP on gloo, export, packaging with the
+real validators, eval against a fake harness), so most changes can be verified without a GPU.
+
+| Path | Contents |
+| :--- | :--- |
+| `pipeline/main.py` | CLI: `status`, `train` (orchestrator by default; legacy `--mode sft/dpo`), `validate-data`, `evaluate`, `package`. |
+| `pipeline/multi_lora_sft/` | The orchestrated pipeline: `run.py` (orchestrator), `phases/`, `training/`, `shared/`, `configs/`, `tests/`. |
+| `tpu_training/` | Tunix (JAX) trainer for TPU, same checkpoints / reports as the PyTorch path. |
+| `kaggle/` | `multi_lora_sft.ipynb` launcher, `build_train_wheels.py` (offline wheelhouses). |
+| `scripts/` | `kaggle_push.py` (push / run / download), `validate_dataset.py`. |
+| `build/gemma-4-developer-agent/` | Competition harness docs, sample submission, tasks, wheels (not in git). |
+| `experiments/` | One folder per experiment with hypothesis and kill criteria; `tracker.md` is the index. |
+
+Never commit weights, `submission.zip`, `runs/` or `logs/`.
+
+## Citation
+
+```bibtex
+@misc{harsidak_singh_2026,
+  title     = {GemmaFineTuning},
+  url       = {https://www.kaggle.com/dsv/21381276},
+  DOI       = {10.34740/KAGGLE/DSV/21381276},
+  publisher = {Kaggle},
+  author    = {Harsidak Singh},
+  year      = {2026}
+}
+```

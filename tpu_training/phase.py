@@ -237,7 +237,7 @@ def run_tunix_adapter_phase(
                 pad_multiple=pad_multiple, remaining_steps=remaining, step_offset=resumed_step, r=eff.lora.r,
                 alpha=float(eff.lora.alpha), use_rslora=bool(eff.lora.use_rslora),
                 base_model_id=cfg.effective_served_model_id(), log_every=eff.train.log_every_steps,
-                val_every_sec=eff.train.val_every_min * 60.0, ckpt_every_sec=eff.train.checkpoint_every_min * 60.0,
+                val_every_sec=eff.train.val_every_min * 60.0, val_every_steps=eff.train.val_every_steps, ckpt_every_sec=eff.train.checkpoint_every_min * 60.0,
                 keep_checkpoints=eff.train.keep_checkpoints, min_free_disk_gib=eff.train.min_free_disk_gib,
                 dead_check_step=eff.train.dead_check_step, throughput_project_step=eff.train.throughput_project_step,
                 emergency_checkpoint=eff.train.emergency_checkpoint,

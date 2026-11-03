@@ -16,6 +16,7 @@ import argparse
 import contextlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -47,6 +48,8 @@ from .shared.bundle import (
     sync_bundle,
     tuning_source,
 )
+from .shared.checkpoints import find_latest_checkpoint, list_checkpoints
+from .shared.fsio import safe_rmtree
 from .shared.sysmon import SystemMonitor, format_system, read_latest, tail_line
 from .shared.tuning import apply_best_params
 from .training.device import OOM_SIGNATURES, is_oom_text
@@ -280,6 +283,9 @@ class Orchestrator:
                 else:
                     lines.append("  status   : no optimizer step logged yet (loading model / compiling); last log: "
                                  + tail_line(self.ctx.log_path(phase))[-160:])
+            elif phase == "eval" and (prog := self._eval_progress_line(now)):
+                lines.append("  eval     : " + prog)
+                lines.append("  last log : " + tail_line(self.ctx.log_path(phase))[-160:])
             else:
                 lines.append("  last log : " + tail_line(self.ctx.log_path(phase))[-160:])
             if self.monitor is not None:
@@ -287,6 +293,90 @@ class Orchestrator:
             self.logger.info("\n".join(p for p in lines if p))
         except Exception as exc:  # noqa: BLE001 - feedback only
             self.logger.debug("heartbeat failed: %s", exc)
+
+    def _eval_progress_line(self, now: float) -> str | None:
+        """'task 2/5 <id> running 4:10 | done PASS 1 FAIL 0 TIMEOUT 0' from eval/progress.json."""
+        try:
+            prog = json.loads((self.ctx.eval_dir / "progress.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        stage = prog.get("stage")
+        done = prog.get("done") or {}
+        tally = " ".join(f"{k} {done.get(k, 0)}" for k in ("PASS", "FAIL", "TIMEOUT"))
+        if stage == "vllm_start":
+            return f"starting vLLM (then parity, then {prog.get('total', 0)} task(s))"
+        if stage == "parity":
+            return f"vLLM up; parity check running (then {prog.get('total', 0)} task(s))"
+        if stage == "tasks":
+            run_s = max(0, int(now - float(prog.get("task_started_ts") or now)))
+            return (f"task {prog.get('current')}/{prog.get('total')} {prog.get('task_id')} running "
+                    f"{run_s // 60}:{run_s % 60:02d} | done {tally}")
+        if stage == "done":
+            return f"all {prog.get('total')} task(s) finished | {tally}"
+        return None
+
+    def _trained_adapter_names(self) -> list[str]:
+        """Adapters export actually wrote (non-empty adapter weights in runs/<id>/adapters/<name>/)."""
+        names = []
+        for spec in self.cfg.adapters:
+            f = self.ctx.adapters_dir / spec.name / "adapter_model.safetensors"
+            if f.is_file() and f.stat().st_size > 0:
+                names.append(spec.name)
+        return names
+
+    def _free_disk_before_eval(self) -> float:
+        """Deletes run checkpoints (step_N with optimizer state) once the adapter's newest one is in the bundle.
+
+        vLLM and the repo checkouts need room: on 2026-11-03 the 31B run reached eval with 6 GiB free. The bundle keeps
+        the resumable checkpoint and the best/final adapters, and the exported adapters stay in runs/<id>/adapters.
+        Returns the GiB freed and never raises."""
+        bundle = self.cfg.output.bundle_dir
+        if not self.cfg.eval.cleanup_checkpoints or not bundle or self.cfg.tuning.active:
+            return 0.0
+        freed = 0
+        for spec in self.cfg.adapters:
+            try:
+                src = self.ctx.checkpoints_dir / spec.name
+                latest = find_latest_checkpoint(src)
+                if latest is None or not (Path(bundle) / spec.name / latest.name).is_dir():
+                    continue  # the bundle does not hold this adapter's newest checkpoint: keep everything
+                for ck in list_checkpoints(src):
+                    freed += sum(f.stat().st_size for f in ck.rglob("*") if f.is_file())
+                    safe_rmtree(ck)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("checkpoint cleanup for %s failed: %s", spec.name, exc)
+        gib = freed / 1024**3
+        if gib > 0:
+            self.logger.info("Freed %.1f GiB of run checkpoints before eval (copies are in %s)", gib, bundle)
+        return gib
+
+    def _eval_skip_reason(self) -> str | None:
+        """Why the eval phase should not start (checked after package succeeded), or None."""
+        if not self._trained_adapter_names() and not self.cfg.eval.allow_bare:
+            return ("No trained adapter was exported (the submission is the bare base model), so eval was skipped to "
+                    "save time. Fix the earlier failure (train/preflight logs) or set eval.allow_bare=true for a baseline.")
+        self._free_disk_before_eval()
+        out = Path(self.cfg.run.output_root)
+        probe = out if out.exists() else next((p for p in out.parents if p.exists()), Path("."))
+        free_gib = shutil.disk_usage(probe).free / 1024**3
+        if free_gib < self.cfg.eval.min_free_disk_gib:
+            return (f"Only {free_gib:.1f} GiB free on {probe} (< eval.min_free_disk_gib="
+                    f"{self.cfg.eval.min_free_disk_gib}), so eval was skipped before vLLM could fill the disk")
+        return None
+
+    def _log_failure_box(self, title: str, lines: list[str]) -> None:
+        bar = "!" * 100
+        body = "\n".join(f"!!   {ln}" for ln in lines)
+        self.logger.error("\n%s\n!! %s\n%s\n%s", bar, title, body, bar)
+
+    def _relay_eval_banner(self) -> None:
+        """Copies the smoke-eval score table into the orchestrator log, so the notebook shows it."""
+        try:
+            score = json.loads(self.ctx.eval_score_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if score.get("banner"):
+            self.logger.info("\n%s", score["banner"])
 
     def _run_subprocess_phase(
         self,
@@ -630,8 +720,12 @@ class Orchestrator:
                 self._write_skipped_status("eval", "Skipped because package failed")
             elif self.clock.remaining_until(self.clock.phase_deadline("eval")) <= 5.0:
                 self._write_skipped_status("eval", "Skipped because eval deadline already passed")
+            elif (why := self._eval_skip_reason()) is not None:
+                self.logger.warning(why)
+                self._write_skipped_status("eval", why)
             else:
                 self._run_subprocess_phase("eval", self.clock.phase_deadline("eval"))
+                self._relay_eval_banner()
 
             # 7. Report — ALWAYS runs last
             if self.monitor is not None:
@@ -644,6 +738,19 @@ class Orchestrator:
         # Exit code policy (§6.2):
         # - Non-zero if package failed (`2`) or setup / global preflight hard-failed (`1`).
         # - Zero if setup + preflight passed and a valid submission.zip was packaged (even if eval failed).
+        if not setup_ok or not preflight_ok:
+            failed = [st for st in self.ctx.read_all_statuses() if st.get("state") in {"failed", "timeout"}]
+            self._log_failure_box(
+                "RUN FAILED before training: " + ("setup" if not setup_ok else "preflight") + " did not pass",
+                [f"{st.get('phase')}: {str(st.get('error') or '')[:400]}" for st in failed]
+                + [f"logs: {self.ctx.logs_dir}", f"report: {self.ctx.report_path}"],
+            )
+        elif not self.cfg.tuning.active and not self._trained_adapter_names():
+            self._log_failure_box(
+                "NO ADAPTER TRAINED: submission.zip contains the bare base model",
+                [f"logs: {self.ctx.logs_dir}", f"report: {self.ctx.report_path}"],
+            )
+
         if not pkg_ok:
             exit_code = 2
         elif not setup_ok or not preflight_ok:

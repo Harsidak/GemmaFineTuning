@@ -11,6 +11,7 @@ Can be imported directly into Kaggle launcher notebooks or executed via CLI:
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -34,6 +35,29 @@ from pipeline.src.utils.packager import (
 )
 
 logger = logging.getLogger("PipelineRunner")
+
+
+# Named configs for `--preset` (the names the README uses). The Kaggle notebook keeps its own preset table.
+PRESETS: dict[str, str] = {
+    "31b_4x_l4": "pipeline/multi_lora_sft/configs/31b_full.yaml",  # main submission: 31B NF4 QLoRA, FSDP on 4x L4
+    "e4b_4x_l4": "pipeline/multi_lora_sft/configs/e4b_full.yaml",  # E4B bf16 LoRA, DDP on 4x L4
+    "e4b_tpu": "pipeline/multi_lora_sft/configs/e4b_tpu.yaml",  # E4B on a TPU v5e-8 (Tunix / JAX)
+    "e4b_calibration": "pipeline/multi_lora_sft/configs/e4b_calibration.yaml",  # 30-min E4B speed / memory check
+    "local_single_gpu": "pipeline/multi_lora_sft/configs/local_single_gpu.yaml",  # E4B NF4 on one local GPU
+}
+DEFAULT_PRESET = "31b_4x_l4"
+
+
+def resolve_preset_config(root_dir: Path, preset: str | None, config_path: str | Path | None) -> Path:
+    """`--config` wins, then `--preset`, then the default (31B on 4x L4). Relative paths are repo-relative."""
+    if config_path:
+        p = Path(config_path)
+    else:
+        name = preset or DEFAULT_PRESET
+        if name not in PRESETS:
+            raise SystemExit(f"unknown preset {name!r}; choose one of {sorted(PRESETS)}")
+        p = Path(PRESETS[name])
+    return p if p.is_absolute() else Path(root_dir) / p
 
 
 class PipelineRunner:
@@ -99,13 +123,13 @@ class PipelineRunner:
 
     def train(
         self,
-        mode: str = "sft",
+        mode: str = "multi_lora_sft",
         config_path: str | Path | None = None,
         train_data: str | Path | None = None,
         base_model: str | Path | None = None,
         output_dir: str | Path | None = None,
     ):
-        """Runs Supervised Fine-Tuning (SFT), Direct Preference Optimization (DPO), or Multi-LoRA SFT.
+        """Runs the Multi-LoRA SFT orchestrator (default) or the legacy single-run SFT / DPO trainers.
 
         train_data, base_model and output_dir override the config (SFT only), so private datasets and
         attached models are passed per run instead of being hardcoded in the public repo.
@@ -113,7 +137,8 @@ class PipelineRunner:
         if mode == "multi_lora_sft":
             overrides: list[str] = []
             if train_data:
-                overrides.append(f"data.train_files=[{train_data}]")
+                files = [str(f) for f in (train_data if isinstance(train_data, (list, tuple)) else [train_data])]
+                overrides.append("data.train_files=" + json.dumps(files))
             if base_model:
                 overrides.append(f"model.train_base_path={base_model}")
             if output_dir:
@@ -147,22 +172,29 @@ class PipelineRunner:
         self,
         config_path: str | Path | None = None,
         set_overrides: list[str] | None = None,
-    ):
-        """Runs the time-budgeted Multi-LoRA SFT orchestrator (`pipeline.multi_lora_sft`)."""
-        from pipeline.multi_lora_sft.config import load_config
-        from pipeline.multi_lora_sft.run import Orchestrator
+        preset: str | None = None,
+        dry_run: bool = False,
+    ) -> int:
+        """Runs the 7-phase Multi-LoRA SFT orchestrator (`pipeline.multi_lora_sft.run`), exactly as the Kaggle notebook
+        does: setup -> preflight -> train -> export -> package -> eval -> report. Returns its exit code."""
+        cfg_path = resolve_preset_config(self.root_dir, preset, config_path)
+        sets = list(set_overrides or [])
+        print(f"\n[PIPELINE] Multi-LoRA SFT orchestrator | config: {cfg_path}" + (f" | --set {sets}" if sets else ""))
+        if dry_run:
+            from pipeline.multi_lora_sft.config import load_config
 
-        if not config_path:
-            cfg_path = self.pipeline_dir / "multi_lora_sft" / "configs" / "31b_full.yaml"
-        else:
-            cfg_path = Path(config_path)
-            if not cfg_path.is_absolute():
-                cfg_path = self.root_dir / cfg_path
+            cfg = load_config(cfg_path, sets)
+            n_tasks = cfg.eval.num_tasks if cfg.eval.smoke_tasks else 0
+            print(f"[PIPELINE] dry run: config valid. served={cfg.effective_served_model_id()} "
+                  f"adapters={[a.name for a in cfg.adapters]} output_root={cfg.run.output_root} "
+                  f"train_files={len(cfg.data.train_files)} eval={cfg.eval.enabled} smoke_tasks={n_tasks}")
+            return 0
+        from pipeline.multi_lora_sft.run import main as run_main
 
-        print(f"\n[PIPELINE] Starting Multi-LoRA SFT Orchestrator with config: {cfg_path}")
-        cfg = load_config(cfg_path, set_overrides or [])
-        orch = Orchestrator(cfg)
-        return orch.run()
+        argv = ["--config", str(cfg_path)]
+        for expr in sets:
+            argv += ["--set", expr]
+        return int(run_main(argv))
 
     def evaluate(
         self,
@@ -230,7 +262,7 @@ def status(root_dir=None):
     return PipelineRunner(root_dir).status()
 
 
-def train(mode="sft", config_path=None, root_dir=None, train_data=None, base_model=None, output_dir=None):
+def train(mode="multi_lora_sft", config_path=None, root_dir=None, train_data=None, base_model=None, output_dir=None):
     return PipelineRunner(root_dir).train(
         mode=mode,
         config_path=config_path,
@@ -252,66 +284,94 @@ def package(model_name="gemma-4-12b-it", output_zip=None, adapter_path=None, roo
     )
 
 
-def multi_lora_sft(config_path=None, set_overrides=None, root_dir=None):
+def multi_lora_sft(config_path=None, set_overrides=None, root_dir=None, preset=None, dry_run=False):
     return PipelineRunner(root_dir).multi_lora_sft(
-        config_path=config_path,
-        set_overrides=set_overrides,
+        config_path=config_path, set_overrides=set_overrides, preset=preset, dry_run=dry_run
     )
 
 
+def validate_data(files, config_path=None, set_overrides=None, tasks=None):
+    """Checks trajectory JSONL files against the data contract (see README "Training data format")."""
+    from pipeline.multi_lora_sft.validate_data import main as validate_main
+
+    argv = [str(f) for f in files]
+    if config_path:
+        argv += ["--config", str(config_path)]
+    for expr in set_overrides or []:
+        argv += ["--set", expr]
+    if tasks:
+        argv += ["--tasks", str(tasks)]
+    return validate_main(argv)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Gemma 4 Developer Agent Pipeline Controller")
+    parser = argparse.ArgumentParser(
+        description="Gemma 4 Developer Agent pipeline. `--action train` runs the 7-phase Multi-LoRA SFT orchestrator "
+        "(setup -> preflight -> train -> export -> package -> eval -> report).",
+        epilog="presets: " + ", ".join(f"{k} = {v}" for k, v in PRESETS.items()),
+    )
     parser.add_argument(
         "--action",
-        choices=["status", "train", "multi_lora_sft", "evaluate", "package"],
+        choices=["status", "train", "multi_lora_sft", "validate-data", "evaluate", "package"],
         default="status",
         help="Action to perform",
     )
     parser.add_argument(
         "--mode",
-        choices=["sft", "dpo", "multi_lora_sft"],
-        default="sft",
-        help="Training mode",
+        choices=["multi_lora_sft", "sft", "dpo"],
+        default="multi_lora_sft",
+        help="Training mode: multi_lora_sft (default, the orchestrator) or the legacy sft / dpo trainers",
     )
-    parser.add_argument("--config", type=str, default=None, help="Path to config file")
+    parser.add_argument("--preset", choices=sorted(PRESETS), default=None, help="Named config (listed below)")
+    parser.add_argument("--config", type=str, default=None, help="Path to a config YAML (wins over --preset)")
     parser.add_argument(
         "--set",
         dest="set_overrides",
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Dotted config overrides for multi_lora_sft (repeatable)",
+        help="Dotted config override, YAML-parsed (repeatable), e.g. --set train.lr=2e-4",
     )
-    parser.add_argument("--train-data", type=str, default=None, help="Training JSONL (overrides config)")
-    parser.add_argument("--base-model", type=str, default=None, help="Base model path or id (overrides config)")
-    parser.add_argument("--output-dir", type=str, default=None, help="Checkpoint output dir (overrides config)")
-    parser.add_argument("--tasks", type=str, default=None, help="Tasks JSONL file for eval")
-    parser.add_argument("--model", type=str, default="gemma-4-12b-it", help="Target model variant")
-    parser.add_argument("--output-zip", type=str, default="submission.zip", help="Target zip file")
-    parser.add_argument("--adapter-path", type=str, default=None, help="Trained LoRA adapter path")
+    parser.add_argument("--dry-run", action="store_true", help="Validate the config and stop (train)")
+    parser.add_argument("--train-data", type=str, nargs="+", default=None,
+                        help="Training JSONL file(s) (train) or the files to check (validate-data)")
+    parser.add_argument("--base-model", type=str, default=None, help="Base model path (overrides config)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Run output root (overrides config)")
+    parser.add_argument("--tasks", type=str, default=None, help="Tasks JSONL (evaluate; leakage gate for validate-data)")
+    parser.add_argument("--model", type=str, default="gemma-4-12b-it", help="Target model variant (package)")
+    parser.add_argument("--output-zip", type=str, default="submission.zip", help="Target zip file (package)")
+    parser.add_argument("--adapter-path", type=str, default=None, help="Trained LoRA adapter path (package)")
     args = parser.parse_args()
 
     runner = PipelineRunner()
+    orchestrated = args.action == "multi_lora_sft" or (args.action == "train" and args.mode == "multi_lora_sft")
 
     if args.action == "status":
         runner.status()
+    elif orchestrated:
+        sets = list(args.set_overrides)
+        if args.train_data:
+            sets.insert(0, "data.train_files=" + json.dumps(args.train_data))
+        if args.base_model:
+            sets.insert(0, f"model.train_base_path={args.base_model}")
+        if args.output_dir:
+            sets.insert(0, f"run.output_root={args.output_dir}")
+        rc = runner.multi_lora_sft(config_path=args.config, set_overrides=sets, preset=args.preset, dry_run=args.dry_run)
+        if rc != 0:
+            raise SystemExit(rc)
     elif args.action == "train":
-        if args.mode == "multi_lora_sft" and args.set_overrides:
-            res = runner.multi_lora_sft(config_path=args.config, set_overrides=args.set_overrides)
-            if res.exit_code != 0:
-                raise SystemExit(res.exit_code)
-        else:
-            runner.train(
-                mode=args.mode,
-                config_path=args.config,
-                train_data=args.train_data,
-                base_model=args.base_model,
-                output_dir=args.output_dir,
-            )
-    elif args.action == "multi_lora_sft":
-        res = runner.multi_lora_sft(config_path=args.config, set_overrides=args.set_overrides)
-        if res.exit_code != 0:
-            raise SystemExit(res.exit_code)
+        runner.train(
+            mode=args.mode,
+            config_path=args.config,
+            train_data=args.train_data[0] if args.train_data else None,
+            base_model=args.base_model,
+            output_dir=args.output_dir,
+        )
+    elif args.action == "validate-data":
+        if not args.train_data:
+            parser.error("validate-data needs --train-data FILE [FILE ...]")
+        cfg = resolve_preset_config(runner.root_dir, args.preset, args.config) if (args.preset or args.config) else None
+        raise SystemExit(validate_data(args.train_data, cfg, args.set_overrides, args.tasks))
     elif args.action == "evaluate":
         runner.evaluate(tasks_path=args.tasks)
     elif args.action == "package":

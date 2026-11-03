@@ -4,7 +4,7 @@ Implements design_doc.md §7.8 and §7.9:
 - Appends structured JSONL metrics to `runs/<run_id>/metrics/<adapter>.jsonl` every `log_every_steps`.
 - Emits throughput projection at `throughput_project_step` (default step 10).
 - Runs dead-adapter check (`‖lora_B‖ == 0`) at `dead_check_step` (default step 50) without aborting.
-- Triggers validation every `val_every_min` wall-clock minutes.
+- Triggers validation every `val_every_steps` optimizer steps and/or every `val_every_min` wall-clock minutes.
 - Saves resumable wall-clock checkpoints every `checkpoint_every_min` minutes under
   `runs/<run_id>/checkpoints/<adapter>/step_<n>/`, retaining the last `keep_checkpoints`.
   Step numbers are *global* (resumed offset + segment step), so checkpoints written after a resume sort
@@ -283,6 +283,7 @@ class MultiLoraTrainingCallback(TrainerCallback):
         samples_per_step: int,
         log_every_steps: int = 5,
         val_every_min: float = 60.0,
+        val_every_steps: int = 0,
         checkpoint_every_min: float = 45.0,
         keep_checkpoints: int = 2,
         dead_check_step: int = 50,
@@ -318,6 +319,7 @@ class MultiLoraTrainingCallback(TrainerCallback):
         self.samples_per_step = max(1, int(samples_per_step))
         self.log_every_steps = max(1, int(log_every_steps))
         self.val_every_sec = max(1.0, float(val_every_min) * 60.0)
+        self.val_every_steps = max(0, int(val_every_steps))
         self.ckpt_every_sec = max(1.0, float(checkpoint_every_min) * 60.0)
         self.keep_checkpoints = max(1, int(keep_checkpoints))
         self.dead_check_step = max(1, int(dead_check_step))
@@ -474,8 +476,10 @@ class MultiLoraTrainingCallback(TrainerCallback):
                     max(0.0, proj_t_end - now) / 60.0,
                 )
 
-        # Wall-clock validation trigger
-        if self.has_eval_dataset and (now - self._last_val_ts) >= self.val_every_sec:
+        # Validation trigger: every `val_every_steps` optimizer steps (same step on every rank) or every
+        # `val_every_min` minutes (rank-0 clock, broadcast), whichever comes first.
+        by_steps = self.val_every_steps > 0 and state.global_step > 0 and state.global_step % self.val_every_steps == 0
+        if self.has_eval_dataset and (by_steps or (now - self._last_val_ts) >= self.val_every_sec):
             control.should_evaluate = True
             self._last_val_ts = now
 
@@ -549,13 +553,18 @@ class MultiLoraTrainingCallback(TrainerCallback):
 
         now = self.wsd.now()
         if "eval_loss" in logs:
-            self.val_losses.append(
-                {
-                    "step": state.global_step,
-                    "elapsed_sec": round(self.wsd.total_elapsed_sec(now), 2),
-                    "eval_loss": float(logs["eval_loss"]),
-                }
-            )
+            val_row = {
+                "step": self.global_step(state),
+                "elapsed_sec": round(self.wsd.total_elapsed_sec(now), 2),
+                "eval_loss": float(logs["eval_loss"]),
+            }
+            self.val_losses.append(val_row)
+            # metrics/<adapter>_val.jsonl: the validation-loss curve for REPORT.md (the train rows stay separate).
+            val_path = self.metrics_jsonl_path.with_name(f"{self.metrics_jsonl_path.stem}_val.jsonl")
+            val_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(val_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(val_row) + "\n")
+            logger.info("[%s] val_loss=%.5f @ step %d", self.adapter_name, val_row["eval_loss"], val_row["step"])
 
         if "loss" not in logs:
             return

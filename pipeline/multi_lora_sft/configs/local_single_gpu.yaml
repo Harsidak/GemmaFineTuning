@@ -1,0 +1,74 @@
+# Gemma 4 E4B, NF4 QLoRA on ONE local CUDA GPU (>= 16 GiB, e.g. RTX 4090 / L4 / A10). The way to try the pipeline
+# end-to-end on a workstation before spending a Kaggle session. Paths under /kaggle/... in base.yaml are rewritten to
+# repo-local ones automatically off Kaggle (runs/, build/submission.zip, build/gemma-4-developer-agent/tasks.jsonl).
+#
+#   uv run python pipeline/main.py --action train --preset local_single_gpu \
+#     --set 'data.train_files=["data/my_trajectories.jsonl"]' \
+#     --set model.train_base_path=<dir of gemma-4-e4b-it-qat-q4_0-unquantized> \
+#     --set model.served_path=<dir of gemma-4-e4b-it-qat-w4a16-ct>
+
+run:
+  name: local_single_gpu
+  mode: full
+
+budget:
+  session_hours: 4.0
+  safety_margin_min: 5.0
+  eval_min: 60.0
+
+setup:
+  require_gpu: true
+  expected_gpu_count: null
+
+model:
+  served_model_id: gemma-4-e4b-it-qat-w4a16-ct
+  quantization: nf4                       # bf16 E4B needs ~2x the memory; switch when the GPU has >= 40 GiB
+  attn_implementation: sdpa
+  skip_multimodal_towers: true
+
+data:
+  successful_only: true
+  val_fraction: 0.05
+  val_max_examples: 64
+
+train:
+  backend: trl
+  accelerator: cuda
+  parallelism: single
+  lr: 1.0e-4
+  max_epochs: 2.0
+  max_seq_length: 8192
+  per_device_batch: 1
+  grad_accum: 16
+  checkpoint_every_min: 30.0
+  keep_checkpoints: 1
+  val_every_min: 30.0
+  val_every_steps: 10
+  log_every_steps: 1
+  oom_fallbacks:
+    - {max_seq_length: 6144}
+    - {max_seq_length: 4096}
+
+loss:
+  impl: selective
+  chunk_rows: 2048
+
+adapters:
+  - name: main_lora
+    roles: [root]
+
+submission:
+  served_model_id: gemma-4-e4b-it-qat-w4a16-ct
+  adapter_map:
+    main_lora: main_lora
+
+eval:
+  enabled: true                           # needs vLLM + the swegemma harness installed locally; else set false
+  smoke_tasks: true
+  num_tasks: 5
+  snapshots_dir: build/gemma-4-developer-agent/snapshots
+  vllm:
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    max_model_len: 32768
+    max_num_seqs: 8

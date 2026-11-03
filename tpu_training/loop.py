@@ -7,6 +7,7 @@ same time-aware WSD learning rate, same NaN / divergence guards, same checkpoint
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -53,6 +54,7 @@ class LoopSettings:
     target_regex: str | None = None
     log_every: int = 5
     val_every_sec: float = 3600.0
+    val_every_steps: int = 0  # also validate every N optimizer steps (0 = wall-clock only)
     ckpt_every_sec: float = 2700.0
     keep_checkpoints: int = 2
     min_free_disk_gib: float = 2.0
@@ -183,9 +185,13 @@ class TrainLoop:
         if loss is None:
             return False
         decision = self.session.on_eval(self._global_step, float(loss), lambda tmp: self._write_adapter(Path(tmp)))
-        self.res.val_losses.append(
-            {"step": self._global_step, "elapsed_sec": round(self.wsd.total_elapsed_sec(now), 2), "eval_loss": float(loss)}
-        )
+        val_row = {"step": self._global_step, "elapsed_sec": round(self.wsd.total_elapsed_sec(now), 2), "eval_loss": float(loss)}
+        self.res.val_losses.append(val_row)
+        with contextlib.suppress(OSError):  # metrics/<adapter>_val.jsonl: the validation curve for REPORT.md
+            val_path = self.metrics_path.with_name(f"{self.metrics_path.stem}_val.jsonl")
+            val_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(val_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(val_row) + "\n")
         logger.info("[%s] val_loss=%.5f @ step %d", self.session.adapter, loss, self._global_step)
         return bool(decision.should_stop)
 
@@ -282,7 +288,8 @@ class TrainLoop:
                     logger.info("[%s] throughput: %s", self.session.adapter, res.throughput_projection)
 
                 healthy = bool(step_res["applied"])  # no checkpoint / best-adapter bookkeeping in the middle of a NaN streak
-                if healthy and self.val_rows and now - last_val >= s.val_every_sec:
+                by_steps = s.val_every_steps > 0 and res.segment_steps > 0 and self._global_step % s.val_every_steps == 0
+                if healthy and self.val_rows and (by_steps or now - last_val >= s.val_every_sec):
                     last_val = now
                     if self._validate(now):
                         res.stopped_early = True

@@ -26,3 +26,7 @@ dev = [
     "ipykernel>=6.29.0",
     "ruff>=0.3.0"
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["pipeline/multi_lora_sft/tests", "tpu_training/tests"]
+addopts = "-v --import-mode=importlib"

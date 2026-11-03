@@ -37,7 +37,7 @@ One Kaggle notebook run, started with a config file:
 
 1. trains LoRA adapters for **one** base model for most of the 12-hour session (about 10 h of actual training);
 2. writes `submission.zip` that passes every validation check;
-3. in the final hour, runs the real agent on **3 fixed tasks** from the competition's 129 build tasks, with the same vLLM stack the scorer uses, and prints the exact score;
+3. in the final hour, runs the real agent on **`eval.num_tasks` (default 5) fixed tasks** from the competition's 129 build tasks, with the same vLLM stack the scorer uses, and prints the exact score;
 4. leaves a report and manifest that say what was trained, on what data, with what result, and what went wrong if anything did.
 
 If the run crashes, runs out of time or hits a bad config, it must **still** produce a valid `submission.zip`, using the best adapter it has. The report must say which one it used.

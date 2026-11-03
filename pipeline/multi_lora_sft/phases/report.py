@@ -19,6 +19,7 @@ from typing import Any
 from ..config import PipelineConfig, load_config
 from ..runctx import PhaseStatus, RunContext, configure_phase_logging, utc_iso
 from ..shared.sysmon import summarize as summarize_system
+from .report_insights import diagnosis_lines, learning_curve_lines, smoke_eval_lines
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -168,33 +169,29 @@ def build_report_markdown(
         )
     lines.append("")
 
-    # Smoke eval section + §9.4 1-line statistical meaning note
-    lines.append("## 4. Smoke Evaluation")
-    lines.append("")
-    lines.append(
-        "> Smoke eval proves only that the adapter loads, the agent runs end-to-end, and generated patches apply; "
-        "a 3-task score cannot rank models—use validation loss, the parity check, and larger Evaluation-track runs."
-    )
-    lines.append("")
-    if ctx.eval_score_path.is_file():
-        ev = json.loads(ctx.eval_score_path.read_text(encoding="utf-8"))
-        if ev.get("banner"):
-            lines.extend(["```text", ev["banner"], "```", ""])
-    else:
-        lines.append("_Smoke evaluation did not run or was disabled._")
-        lines.append("")
-
+    for section in (learning_curve_lines, smoke_eval_lines):
+        try:
+            lines.extend(section(ctx, cfg))
+        except Exception as exc:  # noqa: BLE001 - the report must always be written
+            lines.extend([f"_{section.__name__} not available: {type(exc).__name__}: {exc}_", ""])
     try:
         lines.extend(training_health_lines(ctx, cfg, manifest))
     except Exception as exc:  # noqa: BLE001 - the report must always be written
-        lines.extend(["## 5. Training Health & Resources", "", f"_Not available: {type(exc).__name__}: {exc}_", ""])
+        lines.extend(["## 6. Training Health & Resources", "", f"_Not available: {type(exc).__name__}: {exc}_", ""])
+    try:
+        diag = diagnosis_lines(ctx, cfg, manifest)
+    except Exception as exc:  # noqa: BLE001
+        diag = ["## Diagnosis & Next Steps", "", f"_Not available: {type(exc).__name__}: {exc}_", ""]
+    # Diagnosis goes right after the header: it is what someone opening the report needs first.
+    head_end = lines.index("## 1. Phase Timeline") if "## 1. Phase Timeline" in lines else len(lines)
+    lines[head_end:head_end] = diag
     return "\n".join(lines)
 
 
 def training_health_lines(ctx: RunContext, cfg: PipelineConfig, manifest: dict[str, Any]) -> list[str]:
     """Section 5: did training actually learn (loss trend, gradients), how fast, W&B mode, and resource peaks."""
     lines = [
-        "## 5. Training Health & Resources",
+        "## 6. Training Health & Resources",
         "",
         "| Adapter | Loss first → last logged | Grad norm min / max | Zero-grad logs | Skipped NaN steps | Mean tok/s | Peak mem MiB | W&B |",
         "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | :--- |",

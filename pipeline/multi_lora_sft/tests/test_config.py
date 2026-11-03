@@ -43,7 +43,7 @@ def test_unknown_keys_rejected_in_yaml_and_set(tmp_path: Path) -> None:
 
 def test_set_overrides_and_per_adapter_deep_merge(repo_root: Path) -> None:
     cfg = load_config(
-        repo_root / "pipeline" / "multi_lora_sft" / "configs" / "31b_full.yaml",
+        repo_root / "pipeline" / "multi_lora_sft" / "configs" / "e4b_full.yaml",
         set_overrides=[
             "run.mode=calibration",
             "run.calibration_minutes=25",

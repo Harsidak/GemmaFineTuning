@@ -293,7 +293,12 @@ def run_train_adapter_phase(
         if tokenizer.pad_token_id is None:
             raise ValueError("Tokenizer has neither pad_token nor eos_token; cannot pad batches")
 
+        t_load = time.time()
         base_model = load_base_model_for_training(cfg, eff, tiny_fallback_dir=tiny_dir)
+        load_sec = time.time() - t_load
+        # Measured every run (REPORT timeline notes): the target is < 2 min; on 31B FSDP each rank reads + quantizes.
+        notes.append(f"Base model loaded in {load_sec:.0f} s ({eff.model_quantization}, {parallelism})")
+        logger.info("[%s] base model loaded in %.1f s", adapter_name, load_sec)
         base_model.config.get_text_config().pad_token_id = tokenizer.pad_token_id
         if hasattr(base_model, "generation_config") and base_model.generation_config is not None:
             base_model.generation_config.pad_token_id = tokenizer.pad_token_id
@@ -500,6 +505,7 @@ def run_train_adapter_phase(
             samples_per_step=samples_per_step,
             log_every_steps=eff.train.log_every_steps,
             val_every_min=eff.train.val_every_min,
+            val_every_steps=eff.train.val_every_steps,
             checkpoint_every_min=eff.train.checkpoint_every_min,
             keep_checkpoints=eff.train.keep_checkpoints,
             dead_check_step=eff.train.dead_check_step,

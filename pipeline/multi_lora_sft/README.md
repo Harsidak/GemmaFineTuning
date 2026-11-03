@@ -13,14 +13,14 @@ Each phase runs in an isolated subprocess under a hard wall-clock deadline from 
 3. **`train:<adapter>`** — sequential per-adapter LoRA/QLoRA training with selective-logits softcapped cross-entropy, longest-first length-grouped sampling, time-aware WSD LR decay, OOM fallback retries, wall-clock checkpointing/resume, and HF greedy parity reference generation.
 4. **`export`** — CPU `bfloat16` cast, strict `language_model`-only safetensors key & rank sanity checks, and `adapter_config.json` rewrite targeting the served `-qat-w4a16-ct` model.
 5. **`package`** *(always runs)* — stages `agent.yaml` + `sub_agents/`, resolves `submission.adapter_map` with 4-tier fallback down to bare base model, runs all 3 submission validators, and builds `submission.zip`.
-6. **`eval`** — starts `VllmServer`, runs greedy parity against HF references (`vllm#50059` guard), and executes a 3-task `swegemma` smoke evaluation.
+6. **`eval`** — starts `VllmServer`, runs greedy parity against HF references (`vllm#50059` guard), and scores `eval.num_tasks` (default 5) competition tasks with `swegemma` (smoke evaluation; skipped when no adapter was trained).
 7. **`report`** *(always runs)* — writes `manifest.json` and `REPORT.md`.
 
 ## Hardware
 
 | `train.accelerator` | `train.parallelism` | Use for |
 | :--- | :--- | :--- |
-| `cuda` | `model_split` | 31B NF4 QLoRA split across 4×L4 (`configs/31b_full.yaml`) |
+| `cuda` | `fsdp` | 31B NF4 QLoRA sharded over 4×L4, all GPUs train at once (`configs/31b_full.yaml`; `model_split` is its OOM fallback) |
 | `cuda` | `ddp` | E4B bf16 LoRA, one replica per GPU (`configs/e4b_full.yaml`) |
 | `tpu` | `spmd` | E4B bf16 LoRA sharded over all TPU chips: **Tunix (JAX)** via `train.backend=auto` (`configs/e4b_tpu.yaml`, code in `tpu_training/`); `train.backend=trl` selects the older torch_xla FSDPv2 path |
 | `tpu` / `cuda` / `cpu` | `single` | one device (TPU single core, one GPU, or CPU smoke tests) |

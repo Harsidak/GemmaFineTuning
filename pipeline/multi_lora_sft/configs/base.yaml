@@ -18,7 +18,7 @@ resume:
 budget:
   session_hours: 12.0
   safety_margin_min: 20.0
-  eval_min: 60.0                          # eval reserve with eval.smoke_tasks on
+  eval_min: 90.0                          # eval reserve with eval.smoke_tasks on (vLLM + parity + eval.num_tasks tasks)
   eval_parity_min: 20.0                   # eval reserve with eval.smoke_tasks off (vLLM start-up + parity only)
   package_min: 5.0
   export_min: 10.0
@@ -81,6 +81,7 @@ train:
   checkpoint_every_min: 45.0
   keep_checkpoints: 2
   val_every_min: 60.0
+  val_every_steps: 0                      # also validate every N optimizer steps (0 = wall-clock only)
   log_every_steps: 5
   dead_check_step: 50
   throughput_project_step: 10
@@ -129,8 +130,12 @@ submission:
 
 eval:
   enabled: true                           # vLLM start-up + adapter parity check on the packaged submission
-  smoke_tasks: false                      # true = also run the 3 swegemma smoke tasks (needs tasks_file + snapshots)
+  smoke_tasks: true                       # run eval.num_tasks competition tasks (needs tasks_file + snapshots, else parity only)
+  num_tasks: 5                            # tasks scored by the smoke eval (1 in calibration mode); task_ids first
   task_ids: []
+  min_free_disk_gib: 8.0                  # skip eval when less disk is free (after deleting checkpoints already bundled)
+  cleanup_checkpoints: true
+  allow_bare: false                       # true = evaluate even when no adapter trained (bare-model baseline)
   snapshots_dir: null
   graphs_dir: null
   embeddings_dir: null

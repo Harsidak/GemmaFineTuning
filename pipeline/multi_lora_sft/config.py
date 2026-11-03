@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,7 +68,7 @@ class ResumeSection:
 class BudgetSection:
     session_hours: float = 12.0
     safety_margin_min: float = 20.0
-    eval_min: float = 60.0  # eval reserve with the smoke tasks on (vLLM start-up + parity + 3 tasks)
+    eval_min: float = 90.0  # eval reserve with the smoke tasks on (vLLM start-up + parity + eval.num_tasks tasks)
     eval_parity_min: float = 20.0  # eval reserve with the smoke tasks off (vLLM start-up + parity only)
     package_min: float = 5.0
     export_min: float = 10.0
@@ -147,6 +148,7 @@ class TrainSection:
     checkpoint_every_min: float = 45.0
     keep_checkpoints: int = 2
     val_every_min: float = 60.0
+    val_every_steps: int = 0  # also validate every N optimizer steps (0 = wall-clock only); gives a real val-loss curve
     log_every_steps: int = 5
     dead_check_step: int = 50
     throughput_project_step: int = 10
@@ -257,8 +259,12 @@ class VllmEvalSection:
 @dataclass
 class EvalSection:
     enabled: bool = True  # vLLM start-up + adapter parity check on the packaged submission
-    smoke_tasks: bool = False  # also run the 3 swegemma smoke tasks (1 in calibration); needs tasks_file + snapshots
+    smoke_tasks: bool = True  # also run `num_tasks` swegemma tasks from data.tasks_file (1 in calibration); needs snapshots
+    num_tasks: int = 5  # how many of the competition tasks the smoke eval runs (task_ids first, then distinct repos)
     task_ids: list[str] = field(default_factory=list)
+    min_free_disk_gib: float = 8.0  # skip eval (vLLM + repo checkouts) when less disk than this is free after cleanup
+    cleanup_checkpoints: bool = True  # before eval, delete run checkpoints already copied into output.bundle_dir
+    allow_bare: bool = False  # also evaluate when no adapter was trained (bare base model); off = skip, saves ~10 min
     snapshots_dir: str | None = None
     graphs_dir: str | None = None
     embeddings_dir: str | None = None
@@ -693,6 +699,8 @@ def _validate_train_section(train: TrainSection, label: str, quantization: str |
         raise ConfigError(f"{label}.max_nonfinite_logs must be >= 1")
     if train.sigterm_grace_sec < 0 or train.min_free_disk_gib < 0:
         raise ConfigError(f"{label}.sigterm_grace_sec and min_free_disk_gib must be >= 0")
+    if train.val_every_steps < 0:
+        raise ConfigError(f"{label}.val_every_steps must be >= 0 (0 = wall-clock validation only)")
     if train.checkpoint_every_min <= 0 or train.val_every_min <= 0:
         raise ConfigError(f"{label}.checkpoint_every_min and val_every_min must be > 0")
     if train.weight_decay < 0 or train.max_grad_norm <= 0:
@@ -916,6 +924,8 @@ def validate_config(cfg: PipelineConfig) -> None:
         )
     if not (0.0 < cfg.eval.vllm.gpu_memory_utilization <= 1.0):
         raise ConfigError("eval.vllm.gpu_memory_utilization must be in (0.0, 1.0]")
+    if cfg.eval.num_tasks < 0:
+        raise ConfigError(f"eval.num_tasks must be >= 0, got {cfg.eval.num_tasks}")
     if cfg.eval.sandbox not in {"subprocess", "docker"}:
         raise ConfigError(f"eval.sandbox must be 'subprocess' or 'docker', got {cfg.eval.sandbox!r}")
 
@@ -947,6 +957,57 @@ def apply_oom_override(eff: EffectiveAdapterConfig, override: dict[str, Any] | N
     )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_KAGGLE_DEFAULTS: dict[str, str] = {
+    "run.output_root": "/kaggle/working/runs",
+    "data.tasks_file": "/kaggle/input/gemma-4-developer-agent/tasks.jsonl",
+    "submission.working_zip_path": "/kaggle/working/submission.zip",
+    "output.bundle_dir": "/kaggle/working/lora_checkpoints",
+    "resume.input_root": "/kaggle/input",
+}
+
+
+def running_on_kaggle() -> bool:
+    """True on a Kaggle VM. `MLSFT_PLATFORM=kaggle|local` forces the answer (tests, unusual mounts)."""
+    forced = os.environ.get("MLSFT_PLATFORM", "").strip().lower()
+    if forced in {"kaggle", "local"}:
+        return forced == "kaggle"
+    if any(k in os.environ for k in ("KAGGLE_KERNEL_RUN_TYPE", "KAGGLE_URL_BASE", "KAGGLE_DATA_PROXY_TOKEN")):
+        return True
+    # POSIX only: on Windows "/kaggle/input" resolves to <current drive>:\kaggle\input, which may be a local folder.
+    return os.name == "posix" and Path("/kaggle/input").is_dir() and Path("/kaggle/working").is_dir()
+
+
+def local_default_paths(repo_root: Path = REPO_ROOT) -> dict[str, str | None]:
+    """Where the `/kaggle/...` defaults point on a workstation (everything under the repo, gitignored)."""
+    tasks = repo_root / "build" / "gemma-4-developer-agent" / "tasks.jsonl"
+    return {
+        "run.output_root": (repo_root / "runs").as_posix(),
+        "data.tasks_file": tasks.as_posix() if tasks.is_file() else None,
+        "submission.working_zip_path": (repo_root / "build" / "submission.zip").as_posix(),
+        "output.bundle_dir": (repo_root / "runs" / "lora_checkpoints").as_posix(),
+        "resume.input_root": (repo_root / "data").as_posix(),
+    }
+
+
+def resolve_default_paths(raw_cfg: dict[str, Any], *, on_kaggle: bool | None = None) -> list[str]:
+    """Off Kaggle, rewrites every path still equal to its `/kaggle/...` default to a repo-local one.
+
+    Only untouched defaults move: a path set in the YAML or with --set to anything else is kept. Returns the
+    rewritten keys (for logging)."""
+    if on_kaggle if on_kaggle is not None else running_on_kaggle():
+        return []
+    moved: list[str] = []
+    local = local_default_paths()
+    for dotted, kaggle_val in _KAGGLE_DEFAULTS.items():
+        section, key = dotted.split(".", 1)
+        sec = raw_cfg.get(section)
+        if isinstance(sec, dict) and sec.get(key) == kaggle_val:
+            sec[key] = local[dotted]
+            moved.append(dotted)
+    return moved
+
+
 def load_config(
     config_path: str | Path | None = None,
     set_overrides: list[str] | None = None,
@@ -968,6 +1029,7 @@ def load_config(
     for expr in set_overrides or []:
         key, val = parse_set_override(expr)
         apply_dotted_override(raw, key, val)
+    resolve_default_paths(raw)
 
     cfg = _build_dataclass(PipelineConfig, raw, "")
     validate_config(cfg)

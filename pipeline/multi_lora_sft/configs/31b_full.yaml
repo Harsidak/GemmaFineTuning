@@ -10,7 +10,7 @@ run:
 budget:
   session_hours: 12.0
   safety_margin_min: 20.0
-  eval_min: 60.0
+  eval_min: 100.0                         # vLLM start-up (~6 min) + parity + 5 smoke tasks
   package_min: 5.0
   export_min: 10.0
   setup_max_min: 10.0
@@ -56,7 +56,8 @@ train:
   checkpoint_every_min: 45.0
   keep_checkpoints: 2
   val_every_min: 60.0
-  log_every_steps: 5
+  val_every_steps: 8                      # ~6 val points over a 48-step run (2026-11-03: only 1 at val_every_min=60)
+  log_every_steps: 1                      # every optimizer step (a 31B step is ~3 min)
   # Tried in order after an out-of-memory crash; each entry replaces the previous one (not cumulative).
   # FSDP keeps every token's activations on each GPU; model_split spreads them, so it is the fallback that still
   # trains 16k-token examples (one GPU busy at a time, grad_accum back to 16 for the same effective batch).
@@ -79,12 +80,11 @@ adapters:
   - name: main_lora
     roles: [root]
     time_share: null
-  - name: tool_lora
-    roles: [code_analyzer]
-    time_share: null
-    overrides:
-      lora: {r: 16, alpha: 32}
-      train: {max_seq_length: 8192}
+  # tool_lora (roles: [code_analyzer]) is off: the 2026-11-03 data had no code_analyzer records, so it failed
+  # preflight and its slot shipped as the bare model. Re-add it once that data exists:
+  # - name: tool_lora
+  #   roles: [code_analyzer]
+  #   overrides: {lora: {r: 16, alpha: 32}, train: {max_seq_length: 8192}}
 
 parity:
   enabled: true
@@ -106,6 +106,8 @@ submission:
 
 eval:
   enabled: true
+  smoke_tasks: true
+  num_tasks: 5                            # competition tasks scored after packaging (task_ids first, then distinct repos)
   task_ids: []
   vllm:
     gpu_memory_utilization: 0.90

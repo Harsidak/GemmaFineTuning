@@ -153,6 +153,7 @@ def test_eval_phase_uses_official_api_and_builds_evaluator_before_vllm(tmp_path:
         "model.served_path=/models/gemma-4-31b-it-qat-w4a16-ct/2",
         "model.served_model_id=gemma-4-31b-it-qat-w4a16-ct",
         "eval.smoke_tasks=true",
+        "eval.num_tasks=3",
     ])
     ctx = RunContext.create(cfg, t0=1000.0)
     lora = ctx.submission_dir / "adapters" / "main_lora"
@@ -192,12 +193,13 @@ def test_eval_phase_uses_official_api_and_builds_evaluator_before_vllm(tmp_path:
 def test_smoke_tasks_off_runs_vllm_and_parity_without_tasks_or_snapshots(
     tmp_path: Path, fake_harness: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The default: no task list, no snapshots, and the swegemma evaluator is never built.
+    # Smoke tasks off: no task list, no snapshots, and the swegemma evaluator is never built.
     monkeypatch.delitem(sys.modules, "swegemma.evaluate")
     cfg = load_config(set_overrides=[
         f"run.output_root={(tmp_path / 'runs').as_posix()}",
         "run.run_id=eval_parity_only",
         "data.tasks_file=null",
+        "eval.smoke_tasks=false",
         "model.served_path=/models/gemma-4-31b-it-qat-w4a16-ct/2",
         "model.served_model_id=gemma-4-31b-it-qat-w4a16-ct",
     ])
@@ -222,3 +224,30 @@ def test_eval_phase_skips_when_neither_smoke_tasks_nor_parity(tmp_path: Path, fa
     st = run_eval_phase(RunContext.create(cfg, t0=1000.0), cfg=cfg, deadline=None)
     assert st["state"] == "skipped"
     assert fake_harness["events"] == []
+
+
+def test_smoke_task_selection_prefers_configured_then_distinct_repos() -> None:
+    from types import SimpleNamespace
+
+    from pipeline.multi_lora_sft.phases.evaluate import choose_smoke_task_ids
+
+    tasks = {f"{repo}-{i}": SimpleNamespace(repo=repo) for repo in ("a", "b", "c") for i in range(3)}
+    assert choose_smoke_task_ids(tasks, [], 5) == ["a-0", "b-0", "c-0", "a-1", "a-2"]
+    assert choose_smoke_task_ids(tasks, ["c-2"], 3) == ["c-2", "a-0", "b-0"]
+    assert choose_smoke_task_ids(tasks, ["c-2", "c-2"], 1) == ["c-2"]
+    assert choose_smoke_task_ids(tasks, [], 0) == []
+
+
+def test_missing_competition_data_downgrades_smoke_to_parity_only(tmp_path: Path, fake_harness: dict) -> None:
+    cfg = load_config(set_overrides=[
+        f"run.output_root={(tmp_path / 'runs').as_posix()}",
+        "run.run_id=eval_downgrade",
+        "data.tasks_file=null",
+        "model.served_path=/models/gemma-4-31b-it-qat-w4a16-ct/2",
+        "model.served_model_id=gemma-4-31b-it-qat-w4a16-ct",
+    ])
+    assert cfg.eval.smoke_tasks is True  # the default
+    st = run_eval_phase(RunContext.create(cfg, t0=1000.0), cfg=cfg, deadline=None)
+    assert st["state"] == "ok", st.get("error")
+    assert fake_harness["events"] == ["server.start", "server.stop"]
+    assert any("SMOKE TASKS NOT RUN" in n for n in st["notes"])
