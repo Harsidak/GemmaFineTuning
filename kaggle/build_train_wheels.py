@@ -37,9 +37,9 @@ CANDIDATES = [("tested-pins", TESTED + EXTRAS), ("ranges", RANGES + EXTRAS)]
 # when model.attn_implementation=flash_attention_2. Never fails the build. NOTE: Gemma 4 global-attention layers have
 # 512-wide heads and flash-attn 2 supports <= 256, so the trainer falls back to sdpa for Gemma 4 (logged); the wheel is
 # kept for models / future flash-attn releases that fit.
-FLASH_ATTN_VERSIONS = [v.strip() for v in os.environ.get("WHEEL_FLASH_ATTN", "2.8.3,2.8.2,2.7.4.post1").split(",") if v.strip()]
+FLASH_ATTN_VERSIONS = [v.strip() for v in os.environ.get("WHEEL_FLASH_ATTN", "2.8.3.post2,2.8.3,2.8.2,2.7.4.post1").split(",") if v.strip()]
 FLASH_ATTN_URL = ("https://github.com/Dao-AILab/flash-attention/releases/download/v{v}/"
-                  "flash_attn-{v}+cu12torch{t}cxx11abi{abi}-cp{py}-cp{py}-linux_x86_64.whl")
+                  "flash_attn-{v}%2B{cu}torch{t}cxx11abi{abi}-cp{py}-cp{py}-linux_x86_64.whl")
 
 # ---- TPU bundle (JAX + Tunix). google-tunix declares ~25 dependencies (tensorflow-datasets, numba, kagglehub, ...) of
 # which the trainer imports almost none; installing it with --no-deps plus the import-time set below was verified by
@@ -165,9 +165,9 @@ def make_venv(venv: Path) -> Path:
     return venv / "bin" / "python"
 
 
-def make_resolve_venv(fakes: dict) -> Path:
+def make_resolve_venv(fakes: dict, name: str = "resolve_venv") -> Path:
     """Clean venv whose 'installed' set is exactly the packages the target machine provides."""
-    py = make_venv(SCRATCH / "resolve_venv")
+    py = make_venv(SCRATCH / name)
     site = Path(subprocess.check_output([py, "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"], text=True).strip())
     for name, version in fakes.items():
         d = site / f"{name.replace('-', '_')}-{version}.dist-info"
@@ -404,9 +404,14 @@ def smoke_test_tpu(fakes: dict, bundle: list) -> dict:
     name==version from the wheelhouse (like the notebook does via requirements.lock.txt), so extra-Python wheels in the
     same folder are ignored."""
     py = make_venv(SCRATCH / "smoke_tpu_venv")
-    pins = [f"numpy=={fakes['numpy']}" if fakes.get("numpy") else "numpy",
-            f"safetensors=={fakes.get('safetensors', OFFICIAL_FALLBACK['safetensors'])}"]
-    pip(py, "install", "--quiet", *pins)
+    bundle_names = {norm(n) for n, _ in bundle}
+    pins = []
+    if "numpy" not in bundle_names:
+        pins.append(f"numpy=={fakes['numpy']}" if fakes.get("numpy") else "numpy")
+    if "safetensors" not in bundle_names:
+        pins.append(f"safetensors=={fakes.get('safetensors', OFFICIAL_FALLBACK['safetensors'])}")
+    if pins:
+        pip(py, "install", "--quiet", *pins)
     pip(py, "install", "--quiet", "--no-index", "--no-deps", "--find-links", str(OUT_TPU),
         *(f"{n}=={v}" for n, v in bundle), TUNIX_PIN)
     chk = pip(py, "check", capture=True, check=False)
@@ -512,21 +517,30 @@ def fetch_flash_attn(out: Path, torch_version: str) -> dict:
     if not tmm:
         return {"ok": False, "reason": "torch version of the target image is unknown", "tried": tried}
     py = f"{TARGET_PY[0]}{TARGET_PY[1]}"
+    cu_candidates = ["cu13", "cu12"] if ("cu13" in torch_version or "cu130" in torch_version) else ["cu12", "cu13"]
+    candidate_torches = [tmm]
+    for c in ["2.10", "2.9", "2.8", "2.7", "2.6", "2.5", "2.4"]:
+        if c not in candidate_torches:
+            candidate_torches.append(c)
+
     for v in FLASH_ATTN_VERSIONS:
-        for abi in target_cxx11_abi():
-            url = FLASH_ATTN_URL.format(v=v, t=tmm, abi=abi, py=py)
-            tried.append(url.rsplit("/", 1)[-1])
-            try:
-                with urllib.request.urlopen(url, timeout=120) as r, open(opt / "flash_attn.whl.bin", "wb") as f:
-                    shutil.copyfileobj(r, f, 1 << 20)
-            except (urllib.error.URLError, OSError) as exc:
-                log(f"  flash-attn {v} torch{tmm} abi{abi}: not available ({exc})")
-                continue
-            wheel_name = url.rsplit("/", 1)[-1]
-            info = {"ok": True, "file": "flash_attn.whl.bin", "wheel_name": wheel_name, "version": v,
-                    "torch": tmm, "cxx11abi": abi, "sha256": sha256(opt / "flash_attn.whl.bin")}
-            (opt / "FLASH_ATTN.json").write_text(json.dumps(info, indent=2))
-            return info
+        for cu in cu_candidates:
+            for t in candidate_torches:
+                for abi in target_cxx11_abi():
+                    url = FLASH_ATTN_URL.format(v=v, cu=cu, t=t, abi=abi, py=py)
+                    wheel_name = f"flash_attn-{v}+{cu}torch{t}cxx11abi{abi}-cp{py}-cp{py}-linux_x86_64.whl"
+                    tried.append(wheel_name)
+                    try:
+                        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=120) as r, open(opt / "flash_attn.whl.bin", "wb") as f:
+                            shutil.copyfileobj(r, f, 1 << 20)
+                    except (urllib.error.URLError, OSError) as exc:
+                        continue
+                    log(f"  flash-attn {v} {cu}torch{t} abi{abi}: successfully fetched")
+                    info = {"ok": True, "file": "flash_attn.whl.bin", "wheel_name": wheel_name, "version": v,
+                            "torch": t, "cuda": cu, "cxx11abi": abi, "sha256": sha256(opt / "flash_attn.whl.bin")}
+                    (opt / "FLASH_ATTN.json").write_text(json.dumps(info, indent=2))
+                    return info
     (opt / "flash_attn.whl.bin").unlink(missing_ok=True)
     return {"ok": False, "reason": f"no release wheel for torch {tmm} / cp{py}", "tried": tried}
 
@@ -570,7 +584,9 @@ def main() -> None:
     failures = []
     if "tpu" in BUNDLES:
         try:
-            build_tpu_bundle(fakes, official_versions, resolve_py)
+            tpu_fakes = {k: v for k, v in fakes.items() if norm(k) not in ("numpy", "torch", "torchvision", "torchaudio", "triton")}
+            resolve_tpu_py = make_resolve_venv(tpu_fakes, "resolve_tpu_venv")
+            build_tpu_bundle(tpu_fakes, official_versions, resolve_tpu_py)
         except (StepError, subprocess.CalledProcessError) as exc:
             failures.append(f"tpu bundle: {exc}")
             log(f"TPU BUNDLE FAILED (the core bundle is still built): {exc}")
