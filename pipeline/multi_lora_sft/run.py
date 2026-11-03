@@ -237,25 +237,54 @@ class Orchestrator:
                 sec = max(0, int(sec))
                 return f"{sec // 3600}:{sec % 3600 // 60:02d}"
 
-            parts = [(f"[heartbeat] {phase} running {hm(now - t_start)}, phase left {hm(deadline - now)}, "
+            if not getattr(self, "_legend_shown", False):
+                self._legend_shown = True
+                self.logger.info(
+                    "[heartbeat legend] time = H:MM. 'phase left' = budget before this phase is cut; 'session left' = "
+                    "before Kaggle kills the notebook. loss = training loss on the last logged step (lower is better; "
+                    "trend compares to the first and previous beat). grad_norm = gradient size (spikes >10 = unstable). "
+                    "lr = learning rate. tok/s = tokens processed per second. ETA = steps left / recent step rate.")
+            lines = [(f"[heartbeat] {phase} running {hm(now - t_start)}, phase left {hm(deadline - now)}, "
                       f"session left {hm(self.clock.plan.session_hard_limit - now)}")]
             if phase.startswith("train:"):
                 m = read_latest(self.ctx.metrics_dir / f"{phase.split(':', 1)[1]}.jsonl", max_age_sec=None)
                 if m:
+                    hist = self.__dict__.setdefault("_beat_hist", {}).setdefault(phase, {})
+                    loss = float(m.get("train_loss", float("nan")))
+                    seg = int(m.get("segment_step") or m.get("step") or 0)
+                    total = int(m.get("segment_max_steps") or 0)
+                    first = hist.setdefault("first_loss", loss)
+                    prev = hist.get("prev_loss", loss)
+                    rate = None
+                    if "prev_step" in hist and now > hist["prev_t"] and seg > hist["prev_step"]:
+                        rate = (seg - hist["prev_step"]) / (now - hist["prev_t"])
+                    if seg != hist.get("prev_step"):
+                        hist.update(prev_loss=loss, prev_step=seg, prev_t=now)
+                    if rate:
+                        hist["rate"] = rate
+                    rate = hist.get("rate")
+                    prog = f"step {seg}/{total} ({100 * seg / total:.0f}%)" if total else f"step {seg}"
+                    ep_total = m.get("num_train_epochs") or 0
+                    ep = f"epoch {float(m.get('epoch') or 0):.2f}" + (f"/{ep_total:g}" if ep_total else "")
+                    eta = f"ETA {hm((total - seg) / rate)}" if rate and total else "ETA n/a (need 2 beats)"
+                    if rate and total and now + (total - seg) / rate > deadline:
+                        eta += " (WARNING: past phase budget, will stop early)"
                     gn = m.get("grad_norm")
-                    parts.append(
-                        f"step {m.get('step')} epoch {m.get('epoch')} loss {m.get('train_loss', float('nan')):.4f} "
-                        f"grad_norm {gn if gn is None else round(float(gn), 4)} lr {float(m.get('lr') or 0):.2e} "
-                        f"tok/s {m.get('tokens_per_sec')}"
-                    )
+                    gn_s = "n/a" if gn is None else f"{float(gn):.3f}" + (" (SPIKE)" if float(gn) > 10 else "")
+                    lines.append(f"  progress : {prog} | {ep} | {eta}"
+                                 + (f" | {60 * rate:.1f} steps/min" if rate else ""))
+                    lines.append(f"  loss     : {loss:.4f} (prev {prev:.4f}, {loss - prev:+.4f}; start {first:.4f}, "
+                                 f"{loss - first:+.4f}) | grad_norm {gn_s} | lr {float(m.get('lr') or 0):.2e}")
+                    lines.append(f"  speed    : tok/s {m.get('tokens_per_sec')} (supervised "
+                                 f"{m.get('supervised_tokens_per_sec')}) | peak GPU MB {m.get('peak_gpu_mem_mb')}")
                 else:
-                    parts.append("no optimizer step logged yet (loading / compiling); last log: "
+                    lines.append("  status   : no optimizer step logged yet (loading model / compiling); last log: "
                                  + tail_line(self.ctx.log_path(phase))[-160:])
             else:
-                parts.append("last log: " + tail_line(self.ctx.log_path(phase))[-160:])
+                lines.append("  last log : " + tail_line(self.ctx.log_path(phase))[-160:])
             if self.monitor is not None:
-                parts.append(format_system(self.monitor.latest()))
-            self.logger.info(" | ".join(p for p in parts if p))
+                lines.append("  system   : " + format_system(self.monitor.latest()))
+            self.logger.info("\n".join(p for p in lines if p))
         except Exception as exc:  # noqa: BLE001 - feedback only
             self.logger.debug("heartbeat failed: %s", exc)
 

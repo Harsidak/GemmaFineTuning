@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -120,9 +121,10 @@ def test_orchestrator_heartbeat_system_samples_and_health_report(tmp_path: Path,
     assert res.report_path.is_file()
 
     log = orch.ctx.log_path("orchestrator").read_text(encoding="utf-8")
-    beats = [line for line in log.splitlines() if "[heartbeat] train:" in line]
+    # A heartbeat is a header line plus indented detail lines; group them into one block.
+    beats = [blk for blk in re.split(r"\n(?=\S)", log) if "[heartbeat] train:" in blk]
     assert beats, log[-2000:]
-    assert any("step 7" in b and "loss 1.9000" in b and "grad_norm 0.8" in b for b in beats), beats
+    assert any("step 7" in b and "loss     : 1.9000" in b and "grad_norm 0.800" in b for b in beats), beats
     assert any("session left" in b for b in beats)
 
     sys_rows = [json.loads(line) for line in (orch.ctx.metrics_dir / "system.jsonl").read_text(encoding="utf-8").splitlines()]

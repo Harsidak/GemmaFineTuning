@@ -570,6 +570,8 @@ class MultiLoraTrainingCallback(TrainerCallback):
         entry = {
             "step": self.global_step(state),
             "segment_step": state.global_step,
+            "segment_max_steps": int(state.max_steps or 0),
+            "num_train_epochs": float(getattr(state, "num_train_epochs", 0) or 0),
             "epoch": round(float(state.epoch or 0.0), 4),
             "elapsed_sec": round(self.wsd.total_elapsed_sec(now), 2),
             "lr": float(logs.get("learning_rate", 0.0)),
