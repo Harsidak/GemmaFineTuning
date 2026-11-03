@@ -43,6 +43,7 @@ Thumbs.db
 
 # Internal Planning (local only)
 planning/
+.agents/DataMiningScratch/
 
 # Checkpoints, Adapters & Large Binaries
 models/checkpoints/

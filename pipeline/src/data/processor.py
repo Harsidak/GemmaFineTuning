@@ -74,7 +74,12 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # Fold it into the reasoning, which renders before the call.
             if isinstance(msg["content"], str) and msg["content"].strip():
                 reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
-                msg["reasoning"] = f"{reasoning}\n\n{msg['content'].strip()}".strip()
+                if reasoning.strip() == msg["content"].strip():
+                    msg["reasoning"] = reasoning.strip()
+                elif reasoning.strip():
+                    msg["reasoning"] = f"{reasoning}\n\n{msg['content'].strip()}".strip()
+                else:
+                    msg["reasoning"] = msg["content"].strip()
                 msg.pop("reasoning_content", None)
                 msg["content"] = ""
         normalized.append(msg)
