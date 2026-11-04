@@ -93,7 +93,7 @@
       "run_defaults": {
         "preset": "e4b_tpu"
       },
-      "is_private": true
+      "is_private": false
     }
   },
   "checkpoint_bundle_dataset": "banwait13/gemmafinetuning-lora-bundle"
