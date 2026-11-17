@@ -1,0 +1,190 @@
+{
+  "name": "DEV-30",
+  "seed": 16,
+  "description": "Stratified 30-task evaluation subset of the 129 official tasks (evaluation only, never training).",
+  "count": 30,
+  "task_ids": [
+    "fastapi_11194",
+    "fastapi_14258",
+    "fastapi_14356",
+    "fastapi_14360",
+    "fastapi_14458",
+    "fastapi_14786",
+    "fastapi_5077",
+    "fastapi_9555",
+    "fastapi_14448",
+    "fastapi_14583",
+    "fastapi_14605",
+    "fastapi_14964",
+    "fastapi_14609",
+    "fastapi_14262",
+    "fastapi_15280",
+    "rich_2725",
+    "rich_3063",
+    "rich_3105",
+    "rich_3278",
+    "rich_3296",
+    "rich_3882",
+    "rich_3953",
+    "rich_3521",
+    "rich_4006",
+    "rich_3675",
+    "rich_3061",
+    "requests_7205",
+    "requests_7433",
+    "requests_6757",
+    "httpx_3672"
+  ],
+  "strata": [
+    {
+      "instance_id": "fastapi_11194",
+      "repo": "fastapi",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "fastapi_14258",
+      "repo": "fastapi",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "fastapi_14356",
+      "repo": "fastapi",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "fastapi_14360",
+      "repo": "fastapi",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "fastapi_14458",
+      "repo": "fastapi",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "fastapi_14786",
+      "repo": "fastapi",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "fastapi_5077",
+      "repo": "fastapi",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "fastapi_9555",
+      "repo": "fastapi",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "fastapi_14448",
+      "repo": "fastapi",
+      "tier": "B_multi"
+    },
+    {
+      "instance_id": "fastapi_14583",
+      "repo": "fastapi",
+      "tier": "B_multi"
+    },
+    {
+      "instance_id": "fastapi_14605",
+      "repo": "fastapi",
+      "tier": "B_multi"
+    },
+    {
+      "instance_id": "fastapi_14964",
+      "repo": "fastapi",
+      "tier": "B_multi"
+    },
+    {
+      "instance_id": "fastapi_14609",
+      "repo": "fastapi",
+      "tier": "C_guess_api"
+    },
+    {
+      "instance_id": "fastapi_14262",
+      "repo": "fastapi",
+      "tier": "C_new_docs_src"
+    },
+    {
+      "instance_id": "fastapi_15280",
+      "repo": "fastapi",
+      "tier": "C_new_docs_src"
+    },
+    {
+      "instance_id": "rich_2725",
+      "repo": "rich",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "rich_3063",
+      "repo": "rich",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "rich_3105",
+      "repo": "rich",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "rich_3278",
+      "repo": "rich",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "rich_3296",
+      "repo": "rich",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "rich_3882",
+      "repo": "rich",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "rich_3953",
+      "repo": "rich",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "rich_3521",
+      "repo": "rich",
+      "tier": "B_multi"
+    },
+    {
+      "instance_id": "rich_4006",
+      "repo": "rich",
+      "tier": "B_multi"
+    },
+    {
+      "instance_id": "rich_3675",
+      "repo": "rich",
+      "tier": "C_exact_output"
+    },
+    {
+      "instance_id": "rich_3061",
+      "repo": "rich",
+      "tier": "C_guess_api"
+    },
+    {
+      "instance_id": "requests_7205",
+      "repo": "requests",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "requests_7433",
+      "repo": "requests",
+      "tier": "A_local"
+    },
+    {
+      "instance_id": "requests_6757",
+      "repo": "requests",
+      "tier": "B_multi"
+    },
+    {
+      "instance_id": "httpx_3672",
+      "repo": "httpx",
+      "tier": "B_multi"
+    }
+  ]
+}

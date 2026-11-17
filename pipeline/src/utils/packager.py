@@ -104,11 +104,11 @@ def package_submission_archive(
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         for file in src.rglob("*"):
             if file.is_file():
-                # Avoid hidden files
-                if any(part.startswith(".") for part in file.parts):
-                    continue
                 arcname = file.relative_to(src)
-                zf.write(file, arcname)
+                # Avoid hidden files inside the submission directory
+                if any(part.startswith(".") for part in arcname.parts):
+                    continue
+                zf.write(file, arcname.as_posix())
 
     size_mb = out_zip.stat().st_size / (1024 * 1024)
     logger.info(f"Successfully packaged {out_zip} ({size_mb:.2f} MB)")

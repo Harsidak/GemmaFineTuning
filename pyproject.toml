@@ -28,5 +28,5 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["pipeline/multi_lora_sft/tests", "tpu_training/tests"]
+testpaths = ["pipeline/multi_lora_sft/tests", "pipeline/exp_eval/tests", "tpu_training/tests"]
 addopts = "-v --import-mode=importlib"

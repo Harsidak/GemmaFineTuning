@@ -25,6 +25,16 @@
 * A prompt policy only (`instruction_delta` in `config.yaml`).
 * **Time awareness:** the agent can't see a clock; only `budget_warning` (tool calls) reaches it. Option: calibrate `max_tool_calls` in EXP-006 so the warning arrives at about 80% of the time cap.
 
+> **2026-11-17: the baseline is already in place.**
+> * The EXP-016 prompts (0.22 control and A1) already contain the "edit a source file by call 12" rule.
+> * EXP-014 is therefore run as an ablation on the EXP-016 winner, as two overlay arms in `experiments/arms/`: rule
+>   removed, and full policy.
+> * The tally's `exp014` block measures:
+>   * `edited_by_call_12` (first edit to a non-scratch, non-test source file);
+>   * `never_edited`;
+>   * `resolved_without_submit`;
+>   * `scratch_writes_in_workspace`.
+
 ## 3. Results & Quantitative Evaluation
 
 | Metric | Control | Target | Actual | Delta |

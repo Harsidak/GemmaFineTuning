@@ -94,6 +94,42 @@
         "preset": "e4b_tpu"
       },
       "is_private": false
+    },
+    "adapter_smoke": {
+      "notebook": "kaggle/adapter_smoke.ipynb",
+      "kernel_slug": "gemmafinetuning-adapter-smoke",
+      "kernel_title": "GemmaFineTuning Adapter Smoke",
+      "wheelhouses": [
+        "metric/gemma-4-developer-agent-wheelhouse",
+        "banwait13/gemmafinetunewheels"
+      ],
+      "private_datasets": [
+        "banwait13/gemmafinetuning-adapter-smoke-data"
+      ],
+      "model_sources": [
+        "google/gemma-4/other/gemma-4-31b-it-qat-w4a16-ct/2"
+      ],
+      "machine_shape": "NvidiaL4",
+      "enable_internet": false,
+      "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
+      "is_private": true
+    },
+    "exp016_eval": {
+      "notebook": "kaggle/eval_exp016.ipynb",
+      "kernel_slug": "gemmafinetuning-exp016-eval",
+      "kernel_title": "GemmaFineTuning EXP-016 Skill-First Eval",
+      "wheelhouses": [
+        "metric/gemma-4-developer-agent-wheelhouse",
+        "banwait13/gemmafinetunewheels"
+      ],
+      "private_datasets": [],
+      "model_sources": [
+        "google/gemma-4/other/gemma-4-31b-it-qat-w4a16-ct/2"
+      ],
+      "machine_shape": "NvidiaL4",
+      "enable_internet": false,
+      "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
+      "is_private": true
     }
   },
   "checkpoint_bundle_dataset": "banwait13/gemmafinetuning-lora-bundle"

@@ -1,0 +1,14 @@
+id: exp016_a0_pruned
+experiment: EXP-016
+base: ctrl_022
+description: >
+  One variable: stop declaring the 3 dead graph tools. Drops get_code_neighbors, search_similar_code and
+  get_code_subgraph from agent.yaml (so the harness also drops their schemas and prompt section) and removes the one
+  prompt line that banned them. Budget unchanged (28 calls / 8 min).
+  Differs from the A0 built by the old eval notebook, which also raised the budget to 30 calls.
+changes:
+  files:
+    prompts/system.md: experiments/arms/exp016_a0_pruned/files/prompts/system.md
+  yaml_set:
+    agent.yaml:
+      tools: [run_command, read_file, edit_file, write_file, get_status, submit_patch]

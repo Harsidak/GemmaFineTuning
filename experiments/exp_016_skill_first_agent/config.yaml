@@ -1,0 +1,81 @@
+experiment:
+  id: "EXP-016"
+  name: "skill_first_agent"
+  date: "2026-11-05"
+  author: "Research Team"
+  status: "IMPLEMENTED"
+  priority: 0
+  depends_on: []
+  blocks: ["EXP-017", "EXP-018"]
+  costs_kaggle_submission: false
+
+objective:
+  description: >
+    Consolidate and harden ADK stdlib skills into a single unified skill (`skills/swe-kit`)
+    paired with a pruned 6-tool declarative `agent.yaml` and a pre-loaded skill-first prompt
+    built on the proven `0.22` call-plan backbone. Ships a zero-adapter submission immediately
+    while Kaggle LoRA scoring is blocked AND freezes the exact tool/skill vocabulary before
+    regenerating the 389 SFT trajectories in EXP-017.
+  target_metric: "Pass@1 (DEV-30 & 129) + Offline Localization / Patch-Audit Accuracy"
+  baseline_score: 0.22
+  expected_score: 0.30
+
+legality:
+  rule_refs:
+    - "resources/Competition.md:57-62 (ADK skills: SKILL.md + scripts executed via run_skill_script inside the task container, debiting the central budget)"
+    - "build/gemma-4-developer-agent/HARNESS_README.md §2.4 (.py allowed inside skills/ only; single base model across agents)"
+    - "build/gemma-4-developer-agent/HARNESS_README.md §5.2 (undeclared tools in agent.yaml are omitted from build_agent_prompt, including Section 6 when all 3 graph tools are pruned)"
+    - "build/gemma-4-developer-agent/HARNESS_README.md §8.1 (protected test/config stripping rules mirrored verbatim in verify_and_audit.py)"
+
+base_model:
+  name: "gemma-4-31b-it-qat-w4a16-ct"
+  applies_to_e4b: true
+
+arms:
+  CTRL_31B:
+    archive: "kaggle/submission.zip"
+    tools: 9
+    skills: []
+    notes: "Current 0.18-0.22 LB baseline (still declares 3 dead graph tools)"
+  Arm_A0:
+    archive: "runs/exp_016/submission_A0_pruned_6tools.zip"
+    tools: 6
+    skills: []
+    notes: "Ablation control: prunes get_code_neighbors, search_similar_code, get_code_subgraph; 0 skills"
+    superseded_by: "experiments/arms/exp016_a0_pruned (same pruning, but keeps the 0.22 budget of 28 calls; the zip above also raised it to 30)"
+  Arm_A1:
+    archive: "runs/exp_016/submission_A1_skill_first.zip"
+    build_copy: "build/exp_016_submission.zip"
+    template_dir: "pipeline/submission_template"
+    tools: 6
+    skills: ["skills/swe-kit"]
+    notes: "Primary EXP-016 Skill-First Agent (locate.py + read_symbol.py + verify_and_audit.py)"
+
+skill_design:
+  path: "data/Skills/swe-kit"
+  installed_path: "skills/swe-kit"
+  scripts:
+    locate.py: "BM25/IDF + AST symbol & import/parent test ranker across package .py and docs_src/ (omnivorous CLI)"
+    read_symbol.py: "1-indexed AST symbol, decorator, and enclosing-scope reader with 120-line head/tail cap"
+    verify_and_audit.py: "Pre-submit untracked-leak, HARNESS §8.1 strip-gatekeeper, ast.parse syntax check, and targeted pytest -x -q runner"
+  dropped_legacy_skills:
+    - "safe-editor (stripped blank lines and lost indentation; built-in edit_file + inline Python fallback is superior)"
+    - "separate 6-folder layout (eliminates progressive-disclosure load_skill turns)"
+
+evaluation:
+  offline_benchmarks:
+    - "MINED-389: 389 verified keep tasks in DataMining/raw_data/mined/{prewindow,postwindow,httpx,inwindow40}"
+    - "DEV-30: stratified 30-task split in experiments/exp_016_skill_first_agent/dev_30_ids.json (evaluation only, zero leakage)"
+    - "Gatekeeper-210: 30 real repo snapshots x 7 patch/corruption scenarios"
+  live_31b_eval:
+    notebook: "kaggle/eval_exp016.ipynb"
+    driver: "pipeline/exp_eval/kaggle_run.py"
+    push_flag: "-exp016_eval"
+    arms: ["ctrl_022", "exp016_a0_pruned", "exp016_a1_skill_first"]   # experiments/arms/<id>/arm.yaml
+    protocol: >
+      One shared 4xL4 VllmServer; every arm scored with its own eval_config.yaml; 4 tasks in flight, arms interleaved
+      task by task; smoke5 first, then DEV-30; scorecard = pipeline/exp_eval/tally.py (paired, McNemar, end reasons).
+
+kill_criteria:
+  - "DEV-30 live 31B: if Arm A1 gains < +1 task over Arm A0 AND broken/empty patch rate does not drop, ship Arm A0."
+  - "129 public LB: adopt permanently if gain >= +3 tasks (+0.023 LB) with zero increase in timeouts."

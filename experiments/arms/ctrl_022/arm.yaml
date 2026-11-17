@@ -1,0 +1,8 @@
+id: ctrl_022
+experiment: CTRL
+base: null
+description: >
+  The submission that scored 0.22 on the public leaderboard (kaggle/submission.zip, sha256
+  6ff73d104725cc31deadd18787f3f55e5ce534889cec82387e3b280637d34887), unpacked byte for byte into submission/.
+  9 tools (3 dead graph tools declared but banned in the prompt), no skills, no adapter,
+  28 tool calls / 8 min per task. Every other arm is built on top of this one.

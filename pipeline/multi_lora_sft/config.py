@@ -255,7 +255,7 @@ class SubmissionSection:
     # ADK skills (folders with SKILL.md) copied to `skills/` and listed under `skills:` in the root agent.yaml.
     # skills_dir None -> <repo>/data/skills if it exists; an empty `skills` list ships none.
     skills_dir: str | None = None
-    skills: list[str] = field(default_factory=lambda: ["code-locator", "repro-runner", "test-runner", "patch-auditor"])
+    skills: list[str] = field(default_factory=lambda: ["swe-kit"])
 
 
 @dataclass

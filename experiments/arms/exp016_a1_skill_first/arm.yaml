@@ -1,0 +1,17 @@
+id: exp016_a1_skill_first
+experiment: EXP-016
+base: exp016_a0_pruned
+description: >
+  The EXP-016 skill-first package as one unit on top of A0: the swe-kit skill (locate, read_symbol,
+  verify_and_audit), the skill-first prompt, and the 30-call budget that prompt states. Same files as
+  runs/exp_016/submission_A1_skill_first.zip, except locate.py no longer waits on stdin when called without a query.
+  The +2 calls are a known confound; if A1 wins, an A1 run at 28 calls separates the two.
+changes:
+  files:
+    prompts/system.md: pipeline/submission_template/prompts/system.md
+    skills/swe-kit: data/Skills/swe-kit
+  yaml_set:
+    agent.yaml:
+      skills: [skills/swe-kit]
+    eval_config.yaml:
+      evaluation.max_tool_calls: 30

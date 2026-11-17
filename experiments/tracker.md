@@ -22,6 +22,7 @@ Use this file to monitor all experiment runs, key metric changes, and decisions 
 | **EXP-013** | Planned | Repro Test First | `gemma-4-31b-it-qat` (+E4B) | Repro tests in `tests/` (stripped from the patch automatically, so no cleanup) | `--` | PLANNED | PENDING | [ ] |
 | **EXP-014** | Planned | Dirty-Tree Insurance | `gemma-4-31b-it-qat` (+E4B) | Keep the best fix applied at all times; harness scores the tree even without submit | `--` | PLANNED | PENDING | [ ] |
 | **EXP-015** | Planned | Generation Config Sweep | `gemma-4-31b-it-qat` (+E4B) | Per-role thinking budget / output cap / include_thoughts / temperature | `--` | PLANNED | PENDING | [ ] |
+| **EXP-016** | 2026-11-05 | Skill-First Agent (`swe-kit`) | `gemma-4-31b-it-qat` | Pruned 6 tools + unified stdlib `swe-kit` (`locate`, `read_symbol`, `verify_and_audit`) + skill-first prompt; offline Hit@3 `82.8%` (`MINED-389`) / `70.0%` (`DEV-30`), Gatekeeper `100.0%` (`192/192`) | `DEV-30` GPU ready | IMPLEMENTED | READY FOR 4xL4 EVAL | [x] |
 
 ---
 
@@ -40,14 +41,21 @@ Legal levers found in `HARNESS_README.md` and `resources/Competition.md`: things
 
 **Shared conventions:**
 * **CTRL-31B:** single root `LlmAgent` on `gemma-4-31b-it-qat-w4a16-ct` with the current best adapter and sample-submission prompts and sampling. Re-baseline whenever an experiment is adopted.
-* **Eval set:** `build/gemma-4-developer-agent/tasks.jsonl` (129 tasks) is for **evaluation only, never training** (and never a source for skill knowledge). **DEV-30** is a fixed 30-task subset stratified by repo, used for fast iteration; the list is still to be created.
+* **Eval set:** `build/gemma-4-developer-agent/tasks.jsonl` (129 tasks) is for **evaluation only, never training** (and never a source for skill knowledge). **DEV-30** (`experiments/exp_016_skill_first_agent/dev_30_ids.json`, `seed=16`) is a fixed 30-task subset stratified by `repo × tier`, used for fast iteration.
 * **Noise rule:** with 129 tasks, a difference of ≤ 3 tasks counts as noise unless it repeats with a second seed.
+* **Arms and eval tooling (2026-11-17):**
+  * Every arm is an overlay in `experiments/arms/` on the byte-exact 0.22 control `ctrl_022`.
+  * `kaggle/eval_exp016.ipynb` (`-exp016_eval`) runs any list of arms on `smoke5` / `dev30` / `all`, each arm with
+    its own `eval_config.yaml` and 4 tasks in flight.
+  * `pipeline/exp_eval/tally.py` writes the paired scorecard: McNemar, why each task ended, empty patches, plus the
+    EXP-014, EXP-018 W0 and EXP-005 Q2 numbers.
 * **E4B:** every experiment marked (+E4B) is re-run separately for the small-model submission. Time profiles differ, so don't transfer eval_config or N between models.
 
 ---
 
 ## Experiment Index
 
-* [EXP-000: Baseline Zero-Shot Evaluation](file:///d:/FORGE/Research/Gemma%20Fine%20Tuning/experiments/exp_000_baseline/notes.md)
-* *Template:* [experiments/template.md](file:///d:/FORGE/Research/Gemma%20Fine%20Tuning/experiments/template.md)
-* *Schema:* [experiments/template.yaml](file:///d:/FORGE/Research/Gemma%20Fine%20Tuning/experiments/template.yaml)
+* [EXP-000: Baseline Zero-Shot Evaluation](file:///d:/FORGE/Research/GemmaFineTuning/experiments/exp_000_baseline/notes.md)
+* [EXP-016: Skill-First Agent (`swe-kit`)](file:///d:/FORGE/Research/GemmaFineTuning/experiments/exp_016_skill_first_agent/notes.md)
+* *Template:* [experiments/template.md](file:///d:/FORGE/Research/GemmaFineTuning/experiments/template.md)
+* *Schema:* [experiments/template.yaml](file:///d:/FORGE/Research/GemmaFineTuning/experiments/template.yaml)

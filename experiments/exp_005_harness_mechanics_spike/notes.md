@@ -29,6 +29,14 @@
 * Read the answers from `traces/trace_<id>.json`, the tool-call counters in `task_results.jsonl`, and the vLLM server log.
 * Spike code is **not kept**. Only the answers go into this file and `config.yaml`.
 
+> **2026-11-17:**
+> * Q2 no longer needs its own spike. The tally of any run with skills (EXP-016 A1) answers it: it compares
+>   `get_status.tool_calls_used` with the calls made before it (`summary.q2_skill_calls_counted`), and allows for
+>   calls that fail argument validation before reaching the budget counter.
+> * Evidence so far (no skills involved): in the 2026-10-31 `fastapi_11194` trace, `get_status` reported 53 calls
+>   used after 55 budget-gated calls. 4 of those calls had errors, so some failed calls are not charged. Which ones
+>   is unverified; the two likeliest are the line-range `ValueError` and the read of a directory.
+
 ## 3. Results
 
 | Q | Answer | Evidence (trace / log line) |
