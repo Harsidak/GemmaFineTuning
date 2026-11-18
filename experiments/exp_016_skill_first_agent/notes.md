@@ -148,6 +148,25 @@ uv run python -m pipeline.exp_eval tally runs/kaggle/<run>/exp_eval/<label>/* --
   * EXP-018 W0 by the `w0` block.
   * EXP-014's baseline by `exp014` (edited by call 12, wins without `submit_patch`).
 
+### 4.6 Smoke run 2026-11-17 (A1 only, smoke5, 0.37 h)
+* Plumbing works end to end: vLLM ready in 338 s, about 2.7 tasks in flight, driver exit 0. A1 passed 2/5 (rich_2725,
+  rich_3063). That is too few tasks to judge, and there was no control.
+* **All 16 swe-kit calls failed.**
+  * 6 returned `SKILL_NOT_FOUND`, because Gemma copied the backticks and quotes from the prompt into the values.
+  * The other 10 ran but looked in the wrong folder: "No Python source files found", "File not found", "not a git
+    repo". In the subprocess sandbox the repo is `/tmp/swegemma_sandbox_<id>/workspace`, and only `run_command`
+    rewrites `/workspace` to it. The scripts fall back to their own cwd (`locate.py:624`). **Not fixed yet.**
+* **EXP-005 Q2.** In all 5 tasks the harness count was exactly: gated calls (errors included) + skill calls whose script
+  ran. `SKILL_NOT_FOUND` calls and `submit_patch` were not counted. So skills do **not** give free calls.
+* **`write_file` cannot write `/tmp/...`** ("Path traversal detected"), but the prompt suggested `/tmp/repro.py`.
+* **Open question.** `import requests` loaded an installed copy, not `/workspace/src`; Gemma needed `PYTHONPATH=src`.
+  Check `logs/requests_7205.log` and `logs/httpx_3672.log` to see whether the hidden tests imported the patched code.
+* **Fixed after the smoke:**
+  * A1 prompt: plain-text skill call examples, no swe-kit use after the first skill error, a heredoc for scratch code,
+    and `PYTHONPATH=src` for `src/` repos.
+  * Tally: budget errors on the row now count as caps, skill errors are counted (`SKILL_NOT_FOUND` and errors inside
+    `stdout`), Q2 uses the harness's final count on the row, and the scorecard says when the control didn't run.
+
 ## 5. Next Steps (Live 4×L4 `DEV-30` Pass@1 & Kaggle Submission)
 
 1. Run §4.4 (smoke, then 3 arms x DEV-30), one 4×L4 session at a time. `num_tasks` is no longer an override:

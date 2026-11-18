@@ -8,7 +8,7 @@ import json
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -21,7 +21,7 @@ def harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
     rec: dict[str, Any] = {"events": [], "configs": {}, "inflight": 0, "max_inflight": 0}
 
     class Manifest:
-        adapters: dict[str, Any] = {}
+        adapters: ClassVar[dict[str, Any]] = {}
 
     class VllmServer:
         def __init__(self, config: _VllmConfig, adapter_manifest: Any = None) -> None:

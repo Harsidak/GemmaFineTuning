@@ -179,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
             _start_server_failing_fast(server, _Logger())
             log(f"vLLM ready in {time.time() - t0:.0f}s")
 
-            def fn(arm_id: str):
+            def fn(arm_id: str, evaluators=evaluators):
                 ev = evaluators[arm_id]
                 return lambda tid, i, n: ev.evaluate_task(task=swe_tasks[tid], task_index=i, total_tasks=n)
 

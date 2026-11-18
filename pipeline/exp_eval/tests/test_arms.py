@@ -89,8 +89,8 @@ def test_a1_matches_the_packaged_exp016_zip(tmp_path: Path) -> None:
     with zipfile.ZipFile(A1_ZIP) as zf:
         assert sorted(zf.namelist()) == sorted(p.relative_to(sub).as_posix() for p in sub.rglob("*") if p.is_file())
         for n in zf.namelist():
-            if n == "skills/swe-kit/scripts/locate.py":
-                continue  # deliberately changed: no stdin fallback (see arm.yaml)
+            if n in ("skills/swe-kit/scripts/locate.py", "prompts/system.md"):
+                continue  # deliberately changed: no stdin fallback; prompt fixes after the 2026-11-17 smoke (arm.yaml)
             if n.endswith(".yaml"):
                 assert yaml.load(zf.read(n), Loader=yaml.BaseLoader) == yaml.load(
                     (sub / n).read_bytes(), Loader=yaml.BaseLoader), n

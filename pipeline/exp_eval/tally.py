@@ -3,6 +3,7 @@
 The harness trace (`trace_<task>.json`, ATIF-v1.7) has no "why did it end" field, so `end_reason` is inferred, in
 this order:
     context_overflow   the harness error says the prompt outgrew the 32k context
+    call/time/turn_cap the harness error names a budget (e.g. "Agent exceeded tool call budget (30 calls)")
     harness_error      any other harness error on the row
     no_trace           no trace file for the task
     submitted          submit_patch returned status ok at least once
@@ -15,7 +16,8 @@ this order:
 
 It also collects the numbers the experiments need: EXP-014 (first edit call, wins without submit_patch), EXP-018 W0
 (cap hits with an empty patch, repeated identical calls, token-limit nudges) and EXP-005 Q2 (do skill calls count
-against max_tool_calls: compares get_status' `tool_calls_used` with the calls counted before it).
+against max_tool_calls: compares get_status' `tool_calls_used`, and the harness's final per-task count on the row,
+with the calls in the trace).
 """
 
 from __future__ import annotations
@@ -40,6 +42,12 @@ HARNESS_DEFAULT_BUDGET = {"timeout_seconds": 300, "max_tool_calls": 100, "max_ti
 
 _WARN_RE = re.compile(r"Only (\d+) tool call\(s\) remaining \((\d+)/(\d+) used\)")
 _SHELL_EDIT_RE = re.compile(r"sed\s+-i|<<\s*['\"]?PY|>\s*[\w./-]+\.py\b|\btee\s+[\w./-]+\.py\b|\.write_text\(")
+# Row errors that are a budget running out, not a harness failure. Checked in this order.
+_BUDGET_ERROR_REASONS = (
+    ("call_cap", re.compile(r"tool[ -]call budget|tool[ -]calls? limit|max_tool_calls", re.IGNORECASE)),
+    ("time_cap", re.compile(r"time budget|time limit|max_time_minutes", re.IGNORECASE)),
+    ("turn_cap", re.compile(r"turn budget|turn limit|max_turns|maximum turns|iteration budget", re.IGNORECASE)),
+)
 _SCRATCH_RE = re.compile(r"(?:^|/)(?:repro|reproduce|debug|scratch|tmp|temp)[\w-]*\.py$|(?:^|/)test_[\w-]*\.py$")
 
 
@@ -60,10 +68,40 @@ def _obs_text(step: dict[str, Any]) -> str:
     return str(obs.get("content", "")) if isinstance(obs, dict) else str(obs)
 
 
+def _stdout_json(data: dict[str, Any]) -> dict[str, Any] | None:
+    """run_skill_script wraps the script's own output in `stdout`; the swe-kit scripts print a JSON object there."""
+    out = data.get("stdout")
+    if not isinstance(out, str) or not out.lstrip().startswith("{"):
+        return None
+    try:
+        inner = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    return inner if isinstance(inner, dict) else None
+
+
 def _is_error(data: dict[str, Any] | None, text: str) -> bool:
     if data is not None:
-        return data.get("status") == "error" or "error_type" in data
-    return '"status": "error"' in text or "Traceback (most recent call last)" in text
+        if data.get("status") == "error" or "error_type" in data or "error_code" in data:
+            return True
+        if data.get("error") and data.get("status") != "ok":  # e.g. {"error": "Skill ... not found", ...}
+            return True
+        if "Traceback (most recent call last)" in str(data.get("stderr") or ""):
+            return True
+        inner = _stdout_json(data)
+        return inner is not None and inner.get("status") == "error"
+    return ('"status": "error"' in text or '"error_code"' in text
+            or "Traceback (most recent call last)" in text)
+
+
+def _skill_not_run(data: dict[str, Any] | None) -> bool:
+    """A skill call rejected before its script ran (e.g. SKILL_NOT_FOUND). The 2026-11-17 smoke run showed the harness
+    does not charge these to max_tool_calls, while every skill call whose script ran was charged."""
+    if not data:
+        return False
+    if "error_code" in data:
+        return True
+    return bool(data.get("error")) and "stdout" not in data and "stderr" not in data
 
 
 def _nudge_kind(message: str) -> str | None:
@@ -122,7 +160,7 @@ def analyze_trace(trace: dict[str, Any] | None, row: dict[str, Any], budget: dic
     reported_used: int | None = None
     q2_samples: list[dict[str, int]] = []
     budget_texts: list[str] = []
-    g_before = s_before = u_before = g_err = s_err = 0
+    g_before = s_before = u_before = g_err = s_err = s_nr = 0
     first_edit_call: int | None = None
     scratch_writes = 0
     for name, args, data, text in calls:
@@ -131,13 +169,15 @@ def analyze_trace(trace: dict[str, Any] | None, row: dict[str, Any], budget: dic
             reported_used = data["tool_calls_used"]
             if s_before:
                 q2_samples.append({"used": reported_used, "gated": g_before, "gated_failed": g_err,
-                                   "skill": s_before, "skill_failed": s_err, "unknown": u_before})
+                                   "skill": s_before, "skill_failed": s_err, "skill_not_run": s_nr,
+                                   "unknown": u_before, "source": "get_status"})
         if name in GATED_TOOLS:
             g_before += 1
             g_err += int(failed)
         elif name in SKILL_TOOLS:
             s_before += 1
             s_err += int(failed)
+            s_nr += int(name == "run_skill_script" and _skill_not_run(data))
         elif name not in FREE_TOOLS:
             u_before += 1
         m = _WARN_RE.search(text or "")
@@ -168,14 +208,27 @@ def analyze_trace(trace: dict[str, Any] | None, row: dict[str, Any], budget: dic
         trailing_nudges += 1
     nudge_kinds = Counter(n for n in nudges if n != "|tool")
 
+    # The row carries the harness's own final count ("Tools N/30"), so every task with skill calls is a Q2 sample.
+    row_used = row.get("tool_calls")
+    row_used = row_used if isinstance(row_used, int) and not isinstance(row_used, bool) else None
+    if s_before and row_used is not None:
+        q2_samples.append({"used": row_used, "gated": g_before, "gated_failed": g_err, "skill": s_before,
+                           "skill_failed": s_err, "skill_not_run": s_nr, "unknown": u_before, "source": "final"})
+
     budget_err = " ".join(budget_texts).lower()
     max_calls = int(budget.get("max_tool_calls") or HARNESS_DEFAULT_BUDGET["max_tool_calls"])
     max_turns = int(budget.get("max_turns") or HARNESS_DEFAULT_BUDGET["max_turns"])
     max_sec = 60.0 * float(budget.get("max_time_minutes") or HARNESS_DEFAULT_BUDGET["max_time_minutes"])
-    used = reported_used if reported_used is not None else gated
+    if row_used is not None:
+        used = row_used
+    else:
+        used = reported_used if reported_used is not None else gated
+    budget_error = next((r for r, rx in _BUDGET_ERROR_REASONS if rx.search(error)), None)
 
     if "contextwindowexceeded" in error.lower() or "maximum context length" in error.lower():
         reason = "context_overflow"
+    elif budget_error:
+        reason = budget_error
     elif error:
         reason = "harness_error"
     elif trace is None:
@@ -207,6 +260,7 @@ def analyze_trace(trace: dict[str, Any] | None, row: dict[str, Any], budget: dic
         "reported_tool_calls_used": reported_used,
         "tool_errors": len(errors),
         "skill_errors": sum(1 for c in errors if c[0] in SKILL_TOOLS),
+        "skill_not_run": s_nr,
         "tool_counts": dict(name_counts),
         "llm_calls": llm_calls,
         "elapsed_sec": round(last_elapsed, 1),
@@ -314,8 +368,13 @@ def mcnemar_exact_p(only_a: int, only_b: int) -> float:
 def q2_verdict(tasks: list[dict[str, Any]]) -> dict[str, Any]:
     """Do skill tool calls count against max_tool_calls? Votes from every get_status seen after a skill call."""
     votes: Counter[str] = Counter()
+    exact = total = 0
     for t in tasks:
         for s in t.get("q2_samples") or []:
+            # Rule seen in the 2026-11-17 smoke: every gated call counts (errors too), a skill call counts iff its
+            # script ran, submit_patch/get_status do not.
+            total += 1
+            exact += int(s["used"] == s["gated"] + s["skill"] - s.get("skill_not_run", 0))
             # A call that fails argument validation can error before the budget gate, so each hypothesis allows a
             # range: every failed call of that kind may or may not have been counted.
             lo_not = s["gated"] - s["gated_failed"]
@@ -327,11 +386,12 @@ def q2_verdict(tasks: list[dict[str, Any]]) -> dict[str, Any]:
             votes["counted" if fits_cnt and not fits_not else
                   "not_counted" if fits_not and not fits_cnt else "inconclusive"] += 1
     decided = {k: v for k, v in votes.items() if k != "inconclusive"}
-    answer = "no evidence (no get_status call after a skill call)"
+    answer = "no evidence (no skill calls with a harness call count after them)"
     if decided:
         top = max(decided, key=decided.get)
         answer = top if len(decided) == 1 else f"mixed ({dict(votes)})"
-    return {"answer": answer, "votes": dict(votes)}
+    return {"answer": answer, "votes": dict(votes),
+            "executed_skill_rule_exact": f"{exact}/{total}" if total else None}
 
 
 def summarize(tasks: list[dict[str, Any]], budget: dict[str, Any]) -> dict[str, Any]:
@@ -364,6 +424,7 @@ def summarize(tasks: list[dict[str, Any]], budget: dict[str, Any]) -> dict[str, 
             "tasks_using_skills": len(skill_users),
             "skill_calls_total": sum(t["skill_calls"] for t in tasks),
             "skill_errors_total": sum(t["skill_errors"] for t in tasks),
+            "skill_not_run_total": sum(t.get("skill_not_run", 0) for t in tasks),
             "skill_files_in_patch": sum(1 for t in tasks if t["skill_files_in_patch"]),
         },
         "exp014": {
@@ -416,11 +477,15 @@ def scorecard(arm_dirs: list[Path], control: str | None = None) -> dict[str, Any
     arms = [analyze_arm(d) for d in arm_dirs]
     ctrl = next((x for x in arms if x["arm_id"] == control), arms[0] if arms else None)
     comps = [compare(ctrl, x) for x in arms if ctrl is not None and x is not ctrl]
-    return {"control": ctrl["arm_id"] if ctrl else None, "arms": arms, "comparisons": comps}
+    return {"control": ctrl["arm_id"] if ctrl else None, "control_requested": control, "arms": arms,
+            "comparisons": comps}
 
 
 def render_markdown(card: dict[str, Any]) -> str:
-    lines = ["# Experiment scorecard", "", f"Control: `{card['control']}`", "",
+    ctrl_line = f"Control: `{card['control']}`"
+    if card.get("control_requested") and card["control_requested"] != card["control"]:
+        ctrl_line += f" (requested control `{card['control_requested']}` was not in this run)"
+    lines = ["# Experiment scorecard", "", ctrl_line, "",
              ("| arm | tasks | pass | pass@1 | 95% CI | empty patch | submitted | call cap | time cap | turn cap | "
              "nudged out | no submit | ctx overflow | error | p50 s | p90 s | calls mean |"),
              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -453,7 +518,8 @@ def render_markdown(card: dict[str, Any]) -> str:
                   f"scratch files written in /workspace: {s['exp014']['scratch_writes_in_workspace']}"),
                   f"- W0 (EXP-018): {s['w0']}",
                   (f"- skills: {s['skills']}; Q2 skill calls counted against budget: "
-                  f"{s['q2_skill_calls_counted']['answer']}"),
+                  f"{s['q2_skill_calls_counted']['answer']} (used = gated + executed skill calls exactly: "
+                  f"{s['q2_skill_calls_counted']['executed_skill_rule_exact']})"),
                   f"- tool errors: {s['tool_errors_total']}; mean completion tokens: {s['completion_tokens_mean']}",
                   ""]
         if arm["skipped"]:

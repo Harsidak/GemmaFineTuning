@@ -62,7 +62,7 @@ class Trace:
 
 def row(tid: str = "t", resolved: bool = False, patch: int = 0, error: str | None = None, **kw: Any) -> dict:
     return {"task_id": tid, "repo": "r", "resolved": resolved, "patch_chars": patch, "error": error,
-            "duration_sec": 60.0, "patch_files": kw.get("files", [])}
+            "duration_sec": 60.0, "patch_files": kw.get("files", []), "tool_calls": kw.get("calls")}
 
 
 def test_submitted_task_and_first_source_edit_ignores_scratch_files() -> None:
@@ -204,9 +204,63 @@ def test_real_traces_match_the_hand_check() -> None:
     """Hand-checked against results/logs/*.log on 2026-11-17."""
     tasks = {t["task_id"]: t for t in analyze_arm(REAL)["tasks"]}
     assert tasks["fastapi_11194"]["end_reason"] == "submitted" and tasks["fastapi_11194"]["resolved"]
-    assert tasks["fastapi_11194"]["first_edit_call"] == 47  # 3 repro scripts first; utils.py edited at call 47
+    # 3 repro scripts first; calls 47-48 are edit_file calls rejected for a missing old_string (counted as errors
+    # since the 2026-11-18 fix), so the first edit that landed in utils.py is call 49.
+    assert tasks["fastapi_11194"]["first_edit_call"] == 49
     assert tasks["fastapi_11194"]["reported_tool_calls_used"] == 53
     assert tasks["httpx_3672"]["end_reason"] == "context_overflow"
     assert tasks["requests_6589"]["end_reason"] == "submitted"
     assert tasks["requests_6589"]["first_edit_call"] == 15
     assert tasks["requests_6589"]["scratch_writes_in_workspace"] == 2
+
+
+def test_budget_errors_on_the_row_are_caps_not_harness_errors() -> None:
+    # 2026-11-17 smoke, fastapi_11194: the row error was the call budget, and the scorecard called it "error".
+    tr = Trace().call("read_file", {"filepath": "a.py"}).build()
+    assert analyze_trace(tr, row(error="Agent exceeded tool call budget (30 calls)"), BUDGET)["end_reason"] == "call_cap"
+    assert analyze_trace(tr, row(error="Agent exceeded time budget (8 minutes)"), BUDGET)["end_reason"] == "time_cap"
+    assert analyze_trace(tr, row(error="Agent exceeded max_turns (80)"), BUDGET)["end_reason"] == "turn_cap"
+    assert analyze_trace(tr, row(error="Sandbox execution error: boom"), BUDGET)["end_reason"] == "harness_error"
+    # The harness's final count on the row also proves the cap when the error text is missing.
+    assert analyze_trace(tr, row(calls=10), BUDGET)["end_reason"] == "call_cap"
+
+
+SKILL_NOT_FOUND = {"error": "Skill '`swe-kit`' not found.", "error_code": "SKILL_NOT_FOUND"}
+SKILL_RAN_BUT_FAILED = {"skill_name": "swe-kit", "file_path": "scripts/locate.py",
+                        "stdout": json.dumps({"status": "error", "message": "No Python source files found in /x"})}
+SKILL_OK = {"skill_name": "swe-kit", "file_path": "scripts/locate.py", "stdout": json.dumps({"status": "ok"})}
+
+
+def test_skill_errors_count_not_found_and_errors_reported_inside_stdout() -> None:
+    # 2026-11-17 smoke: all 16 skill calls failed and the scorecard said skill_errors_total 0.
+    tr = (Trace().call("run_skill_script", {"skill_name": "`swe-kit`"}, SKILL_NOT_FOUND)
+          .call("run_skill_script", {"skill_name": "swe-kit"}, SKILL_RAN_BUT_FAILED)
+          .call("run_skill_script", {"skill_name": "swe-kit"}, SKILL_OK).build())
+    a = analyze_trace(tr, row(), BUDGET)
+    assert a["skill_calls"] == 3 and a["skill_errors"] == 2 and a["skill_not_run"] == 1
+    assert a["tool_errors"] == 2
+
+
+def test_q2_uses_the_harness_final_count_on_the_row() -> None:
+    from pipeline.exp_eval.tally import q2_verdict
+
+    # Shape of rich_2725: gated calls + not-found skill calls (free) + one executed skill call (charged) + submit.
+    tr = (Trace().call("run_skill_script", {"skill_name": "`swe-kit`"}, SKILL_NOT_FOUND)
+          .call("read_file", {"filepath": "a.py"})
+          .call("edit_file", {"filepath": "a.py"})
+          .call("run_skill_script", {"skill_name": "swe-kit"}, SKILL_RAN_BUT_FAILED)
+          .call("submit_patch", {}, {"status": "ok", "patch_size": 10, "files_changed": 1}).build())
+    v = q2_verdict([analyze_trace(tr, row(calls=3, patch=10), BUDGET)])
+    assert v["answer"] == "counted" and v["executed_skill_rule_exact"] == "1/1"
+    # No skill calls -> still no evidence, even with a count on the row.
+    plain = analyze_trace(Trace().call("read_file", {"filepath": "a.py"}).build(), row(calls=1), BUDGET)
+    assert q2_verdict([plain])["answer"].startswith("no evidence")
+
+
+def test_markdown_says_when_the_requested_control_did_not_run(tmp_path: Path) -> None:
+    from pipeline.exp_eval.tally import render_markdown as render
+
+    card = {"control": "a1", "control_requested": "ctrl_022", "arms": [], "comparisons": []}
+    assert "requested control `ctrl_022` was not in this run" in render(card)
+    card["control_requested"] = "a1"
+    assert "was not in this run" not in render(card)
